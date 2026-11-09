@@ -1,0 +1,16 @@
+name = "vette-telemetry"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[vars]
+# IANA zone used for human-readable times in tool output.
+LOCAL_TZ = "America/Los_Angeles"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vette"
+database_id = "REPLACE_AFTER_wrangler_d1_create"
+
+# Secrets (wrangler secret put NAME, or .dev.vars locally):
+#   DEVICE_TOKEN  bearer token the ESP32 sends on /ingest
+#   MCP_SECRET    random path segment, the connector URL is https://<host>/mcp/<MCP_SECRET>

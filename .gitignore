@@ -1,0 +1,16 @@
+# Local tool settings
+.claude/
+
+# Build output
+firmware/.pio/
+backend/node_modules/
+backend/.wrangler/
+
+# Secrets
+firmware/include/secrets.h
+backend/.dev.vars
+
+# OS / editor
+.vscode/
+Thumbs.db
+.DS_Store
