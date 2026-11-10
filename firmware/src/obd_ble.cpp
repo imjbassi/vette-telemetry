@@ -93,12 +93,23 @@ bool connect(uint32_t scanSeconds) {
   Serial.printf("[ble] scanning %us for \"%s*\"\n", scanSeconds, OBD_NAME_PREFIX);
   NimBLEScanResults res = scan->start(scanSeconds, false);
 
+  // Match on name prefix (case-insensitive) or the advertised FFF0 service, since some
+  // adapters only put the name in the scan response or not at all.
+  static const NimBLEUUID kSvc(OBD_SERVICE_UUID);
   NimBLEAdvertisedDevice* target = nullptr;
   for (auto it = res.begin(); it != res.end(); ++it) {
     std::string name = (*it)->getName();
-    if (name.empty()) continue;
-    Serial.printf("  seen %s \"%s\" rssi %d\n", (*it)->getAddress().toString().c_str(), name.c_str(), (*it)->getRSSI());
-    if (!target && name.rfind(OBD_NAME_PREFIX, 0) == 0) target = *it;
+    std::string lower = name;
+    for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
+    std::string prefix = OBD_NAME_PREFIX;
+    for (auto& ch : prefix) ch = (char)tolower((unsigned char)ch);
+    bool svc = (*it)->isAdvertisingService(kSvc);
+    bool match = svc || (!name.empty() && lower.rfind(prefix, 0) == 0);
+    if (!name.empty() || svc) {
+      Serial.printf("  seen %s \"%s\" rssi %d%s\n", (*it)->getAddress().toString().c_str(), name.c_str(),
+                    (*it)->getRSSI(), svc ? " [FFF0]" : "");
+    }
+    if (!target && match) target = *it;
   }
   if (!target) {
     Serial.println("[ble] OBDLink not found");

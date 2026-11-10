@@ -7,6 +7,7 @@
 namespace storage {
 
 static SemaphoreHandle_t s_mtx;
+static bool s_ok = false;  // false = no filesystem, records are dropped (logged once)
 static File s_cur;
 static uint32_t s_curSeg = 0;
 static uint32_t s_unflushed = 0;
@@ -63,7 +64,17 @@ static void enforceCap() {
 
 bool begin() {
   s_mtx = xSemaphoreCreateMutex();
-  if (!LittleFS.begin(true)) { Serial.println("[fs] mount failed"); return false; }
+  // A fresh board still holds the factory firmware's data in this partition, which
+  // LittleFS reports as a corrupted dir pair. begin(true) does not always recover from
+  // that, so format explicitly and retry.
+  if (!LittleFS.begin(false)) {
+    Serial.println("[fs] mount failed, formatting partition (normal on first boot)");
+    if (!LittleFS.format() || !LittleFS.begin(false)) {
+      Serial.println("[fs] format failed, running without flash buffering");
+      return false;
+    }
+  }
+  s_ok = true;
   LittleFS.mkdir("/q");
   auto segs = listSegs();
   s_curSeg = segs.empty() ? 0 : segs.back();
@@ -75,6 +86,7 @@ bool begin() {
 }
 
 void append(const Record& r) {
+  if (!s_ok) return;
   Lock l;
   if (!s_cur) openNext();
   s_cur.write(reinterpret_cast<const uint8_t*>(&r), sizeof(r));
@@ -82,6 +94,7 @@ void append(const Record& r) {
 }
 
 void rotate() {
+  if (!s_ok) return;
   Lock l;
   if (s_cur) {
     size_t sz = s_cur.size();
@@ -93,9 +106,10 @@ void rotate() {
 }
 
 size_t readBatch(uint8_t* buf, size_t cap, uint32_t& lastSeg) {
-  Lock l;
   size_t used = 0;
   lastSeg = 0;
+  if (!s_ok) return 0;
+  Lock l;
   for (auto n : listSegs()) {
     if (n >= s_curSeg) break;
     File f = LittleFS.open(segPath(n));
@@ -113,6 +127,7 @@ size_t readBatch(uint8_t* buf, size_t cap, uint32_t& lastSeg) {
 }
 
 void ack(uint32_t lastSeg) {
+  if (!s_ok) return;
   Lock l;
   for (auto n : listSegs()) {
     if (n > lastSeg || n >= s_curSeg) break;
@@ -122,6 +137,7 @@ void ack(uint32_t lastSeg) {
 
 size_t pendingBytes() {
   size_t total = 0;
+  if (!s_ok) return 0;
   for (auto n : listSegs()) {
     File f = LittleFS.open(segPath(n));
     if (f) total += f.size();
