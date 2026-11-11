@@ -1,4 +1,4 @@
-# vette-telemetry
+﻿# vette-telemetry
 
 C8 Stingray logger. OBDLink CX (BLE) -> ESP32-S3 -> LTE -> Cloudflare Worker + D1 -> MCP -> Claude.
 
@@ -26,7 +26,7 @@ Copy `firmware/include/secrets.example.h` to `secrets.h` first (gitignored).
 - The link must be encrypted. Unpaired, the CX accepts writes and silently drops them. Pairing uses passkey 123456 and is only possible for 5 minutes after the CX powers up. The pairing then persists on both sides, so each ESP32 board needs this once.
 - Notifications must be enabled with an acknowledged write (`subscribe(true, cb, true)`). NimBLE's default unacknowledged write is ignored.
 - The CX distributes an all-zero identity address. If NimBLE stores it (host-based privacy peer record), every later scan reports the CX as `00:00:00:00:00:00` and `deleteAllBonds()` does not clear it. The firmware pairs with encryption keys only and can erase the `nimble_bond` NVS namespace.
-- The protocol is fixed to 6 (CAN 11-bit 500k). With `ATSP0` and the engine off, every request starts a multi-second `SEARCHING...` pass that a 1 Hz poller keeps aborting (`STOPPED`).
+- The 2024 C8 answers on protocol 7 (CAN 29-bit 500k), not 6. The protocol is fixed to that. With `ATSP0` and the engine off, every request starts a multi-second `SEARCHING...` pass that a 1 Hz poller keeps aborting (`STOPPED`).
 
 ### Design notes
 

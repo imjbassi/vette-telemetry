@@ -315,6 +315,31 @@ String cmd(const char* c, uint32_t timeoutMs) {
   return String();
 }
 
+static char s_proto = 0;
+
+static bool validProto(char p) { return (p >= '1' && p <= '9') || (p >= 'A' && p <= 'C'); }
+
+char protocol() {
+  if (!s_proto) {
+    Preferences p;
+    p.begin("vette", false);
+    s_proto = (char)p.getUChar("proto", (uint8_t)OBD_PROTOCOL[0]);
+    p.end();
+    if (!validProto(s_proto)) s_proto = OBD_PROTOCOL[0];
+  }
+  return s_proto;
+}
+
+void setProtocol(char c) {
+  if (!validProto(c) || c == protocol()) return;
+  s_proto = c;
+  Preferences p;
+  p.begin("vette", false);
+  p.putUChar("proto", (uint8_t)c);
+  p.end();
+  Serial.printf("[obd] protocol %c saved as the default\n", c);
+}
+
 // Adapter setup only. Nothing here talks to the car: ECU traffic starts in pids::probe()
 // once the engine is known to be running.
 bool initElm() {
@@ -322,7 +347,8 @@ bool initElm() {
   String r = cmd("ATZ", OBD_INIT_TIMEOUT_MS);
   Serial.printf("[obd] ATZ -> %s\n", r.c_str());
   bool alive = r.indexOf("ELM") >= 0;
-  const char* setup[] = {"ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP" OBD_PROTOCOL};
+  String sp = String("ATSP") + protocol();
+  const char* setup[] = {"ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", sp.c_str()};
   for (auto* s : setup) {
     r = cmd(s, OBD_CMD_TIMEOUT_MS);
     Serial.printf("[obd] %s -> %s\n", s, r.c_str());

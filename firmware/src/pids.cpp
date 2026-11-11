@@ -131,7 +131,7 @@ bool probe(bool allowSearch) {
   String why;
   if (readMasks(OBD_PROBE_TIMEOUT_MS, why)) { report(); return true; }
   why.replace("\n", " / ");
-  Serial.printf("[pid] no answer to 0100 on protocol %s (%s)\n", OBD_PROTOCOL, why.c_str());
+  Serial.printf("[pid] no answer to 0100 on protocol %c (%s)\n", obd::protocol(), why.c_str());
 
   // Fallback: let the adapter search every protocol, at most once a minute.
   if (!allowSearch || (s_lastSearchMs && millis() - s_lastSearchMs < 60000)) return false;
@@ -140,16 +140,19 @@ bool probe(bool allowSearch) {
   obd::cmd("ATSP0", OBD_CMD_TIMEOUT_MS);
   bool ok = readMasks(OBD_SEARCH_TIMEOUT_MS, why);
   if (ok) {
-    // ATDPN answers like "A6": automatic, protocol 6. Lock that protocol in.
+    // ATDPN answers like "A7": automatic, protocol 7. Lock it in and remember it.
     String p = obd::cmd("ATDPN", OBD_CMD_TIMEOUT_MS);
-    Serial.printf("[pid] search found protocol %s\n", p.c_str());
-    p.replace("A", "");
     p.trim();
-    if (p.length() == 1) obd::cmd((String("ATSP") + p).c_str(), OBD_CMD_TIMEOUT_MS);
+    Serial.printf("[pid] search found protocol %s\n", p.c_str());
+    if (p.length() == 2 && p[0] == 'A') p = p.substring(1);
+    if (p.length() == 1) {
+      obd::setProtocol(p[0]);
+      obd::cmd((String("ATSP") + p).c_str(), OBD_CMD_TIMEOUT_MS);
+    }
     report();
     return true;
   }
-  obd::cmd("ATSP" OBD_PROTOCOL, OBD_CMD_TIMEOUT_MS);
+  obd::cmd((String("ATSP") + obd::protocol()).c_str(), OBD_CMD_TIMEOUT_MS);
   return false;
 }
 

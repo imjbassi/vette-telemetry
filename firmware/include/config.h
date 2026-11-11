@@ -11,9 +11,11 @@
 #define OBD_INIT_TIMEOUT_MS  6000   // ATZ
 #define OBD_PROBE_TIMEOUT_MS 3000   // 0100 on the fixed protocol
 #define OBD_SEARCH_TIMEOUT_MS 12000 // 0100 with automatic protocol search (fallback only)
-// ISO 15765-4 CAN, 11-bit, 500 kbaud. Fixed so the adapter never runs its multi-second
-// "SEARCHING..." pass, which a 1 Hz poller would keep interrupting.
-#define OBD_PROTOCOL         "6"
+// Default ELM protocol: 7 = ISO 15765-4 CAN, 29-bit IDs, 500 kbaud. This is what the 2024
+// C8 answered on (6, the 11-bit variant, got NO DATA). Fixed so the adapter never runs its
+// multi-second "SEARCHING..." pass, which a 1 Hz poller would keep interrupting. If a
+// search ever finds a different protocol, that one is saved in NVS and used instead.
+#define OBD_PROTOCOL         "7"
 
 // ---- Polling ----
 #define POLL_PERIOD_MS       1000   // fast PIDs

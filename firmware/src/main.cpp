@@ -109,6 +109,7 @@ static void printLine(const Record& r, float v) {
   s += has(V_THROTTLE) ? String("  thr ") + r.throttle_pct + "%" : String("  thr --");
   s += has(V_FUEL) ? String("  fuel ") + String(r.fuel_raw * 100.0 / 255.0, 1) + "%" : String("  fuel --");
   s += String("  ") + String(v, 2) + "V";
+  if (has(V_ODO)) s += String("  odo ") + String(r.odo_hm * 0.0621371, 1) + "mi";  // 0.1 km units
   if (has(V_SPEED) && has(V_MAF)) s += String("  mpg ") + String(pids::instantMpg(maf, r.speed_kph), 1);
   Serial.printf("%s  trip %.2fmi %.3fgal  gps %d\n", s.c_str(), s_tripMiles, s_tripGal,
                 (r.valid & V_GPS) ? r.sats : -1);
