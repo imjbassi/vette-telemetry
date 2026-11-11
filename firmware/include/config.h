@@ -8,14 +8,21 @@
 #define OBD_NOTIFY_UUID      "FFF1"
 #define OBD_WRITE_UUID       "FFF2"
 #define OBD_CMD_TIMEOUT_MS   1500
-#define OBD_INIT_TIMEOUT_MS  6000   // ATZ / protocol search
+#define OBD_INIT_TIMEOUT_MS  6000   // ATZ
+#define OBD_PROBE_TIMEOUT_MS 3000   // 0100 on the fixed protocol
+#define OBD_SEARCH_TIMEOUT_MS 12000 // 0100 with automatic protocol search (fallback only)
+// ISO 15765-4 CAN, 11-bit, 500 kbaud. Fixed so the adapter never runs its multi-second
+// "SEARCHING..." pass, which a 1 Hz poller would keep interrupting.
+#define OBD_PROTOCOL         "6"
 
 // ---- Polling ----
 #define POLL_PERIOD_MS       1000   // fast PIDs
 #define SLOW_EVERY_N         10     // fuel level, odometer, module voltage every N fast cycles
-#define ENGINE_ON_VOLTS      13.0f  // ATRV threshold. Below this, stop querying ECUs.
-#define ENGINE_OFF_GRACE_MS  20000  // engine-off must persist this long before we go quiet
-#define IDLE_PROBE_MS        10000  // ATRV probe interval while quiet (adapter-local, no CAN traffic)
+#define ENGINE_ON_VOLTS      13.0f  // ATRV at or above this means the alternator is charging
+#define ENGINE_OFF_GRACE_MS  20000  // no RPM and no charging for this long before going quiet
+#define QUIET_TICK_MS        2000   // ATRV interval while quiet (adapter-local, no CAN traffic)
+#define CHARGING_PROBE_MS    5000   // while quiet and charging: how often to try the ECU
+#define QUIET_RPM_PROBE_MS   30000  // while quiet and not charging: one RPM request this often
 
 // ---- Fuel math ----
 #define AFR_STOICH           14.7f

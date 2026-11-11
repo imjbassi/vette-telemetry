@@ -46,8 +46,9 @@ static void netTask(void*) {
 enum class Link { Down, Up };
 static Link s_link = Link::Down;
 static uint32_t s_backoffMs = 2000;
-static bool s_quiet = false;
-static uint32_t s_lastOnMs = 0;
+static bool s_quiet = true;        // quiet = adapter-only traffic, nothing sent to the car
+static uint32_t s_lastOnMs = 0;    // last time the engine was seen running or charging
+static uint32_t s_lastProbeMs = 0; // last ECU probe while quiet. 0 = probe on next tick
 static uint32_t s_lastTick = 0;
 static uint32_t s_cycle = 0;
 static uint8_t s_atrvFails = 0;
@@ -73,17 +74,49 @@ static void tryConnect() {
     return;
   }
   s_backoffMs = 2000;
-  obd::initElm();
+  if (!obd::initElm()) {
+    Serial.println("[obd] adapter did not answer setup commands, reconnecting");
+    obd::disconnect();
+    return;
+  }
   pids::reset();
   s_link = Link::Up;
+  s_quiet = true;       // start quiet. The first tick decides whether the engine is running.
+  s_lastProbeMs = 0;
+  s_atrvFails = 0;
+}
+
+static void goActive(float v, const char* why) {
+  Serial.printf("[obd] %.2fV %s, polling\n", v, why);
   s_quiet = false;
   s_lastOnMs = millis();
-  s_atrvFails = 0;
+  s_cycle = 0;  // read the slow PIDs on the first pass
+}
+
+static void printLine(const Record& r, float v) {
+  if (r.flags & F_QUIET) {
+    Serial.printf("quiet  %.2fV  (engine off, not querying the car)\n", v);
+    return;
+  }
+  auto has = [&](uint16_t bit) { return (r.valid & bit) != 0; };
+  float maf = r.maf_cgs / 100.0f;
+  String s;
+  s += has(V_RPM) ? String("rpm ") + r.rpm : String("rpm --");
+  s += has(V_SPEED) ? String("  ") + r.speed_kph + " kph" : String("  -- kph");
+  s += has(V_COOLANT) ? String("  ect ") + String(r.coolant_dc / 10.0, 0) + "C" : String("  ect --");
+  s += has(V_INTAKE) ? String("  iat ") + String(r.intake_dc / 10.0, 0) + "C" : String("  iat --");
+  s += has(V_MAF) ? String("  maf ") + String(maf, 2) : String("  maf --");
+  s += has(V_THROTTLE) ? String("  thr ") + r.throttle_pct + "%" : String("  thr --");
+  s += has(V_FUEL) ? String("  fuel ") + String(r.fuel_raw * 100.0 / 255.0, 1) + "%" : String("  fuel --");
+  s += String("  ") + String(v, 2) + "V";
+  if (has(V_SPEED) && has(V_MAF)) s += String("  mpg ") + String(pids::instantMpg(maf, r.speed_kph), 1);
+  Serial.printf("%s  trip %.2fmi %.3fgal  gps %d\n", s.c_str(), s_tripMiles, s_tripGal,
+                (r.valid & V_GPS) ? r.sats : -1);
 }
 
 static void tick() {
   uint32_t now = millis();
-  uint32_t period = s_quiet ? IDLE_PROBE_MS : POLL_PERIOD_MS;
+  uint32_t period = s_quiet ? QUIET_TICK_MS : POLL_PERIOD_MS;
   if (now - s_lastTick < period) return;
   float dt = s_lastTick ? (now - s_lastTick) / 1000.0f : 0;
   s_lastTick = now;
@@ -98,27 +131,41 @@ static void tick() {
   r.adapter_mv = (uint16_t)(v * 1000);
   r.valid |= V_ADAPTER_V;
 
-  // Battery guard: only talk to ECUs while the alternator is charging. ATRV itself is
-  // answered by the adapter and creates no CAN traffic.
+  // Battery guard. ATRV is answered by the adapter and creates no CAN traffic, so it runs
+  // always. The car is only queried while the engine runs. Voltage alone cannot decide
+  // that: GM's charging control lets the alternator drop below 13 V while cruising. So
+  // charging voltage wakes us up, and RPM keeps us awake.
   bool charging = v >= ENGINE_ON_VOLTS;
-  if (charging) {
-    s_lastOnMs = now;
-    if (s_quiet) { Serial.printf("[obd] %.2fV engine on, polling\n", v); pids::reset(); }
-    s_quiet = false;
-  } else if (!s_quiet && now - s_lastOnMs > ENGINE_OFF_GRACE_MS) {
-    Serial.printf("[obd] %.2fV engine off, going quiet\n", v);
-    s_quiet = true;
+  if (s_quiet) {
+    uint32_t every = charging ? CHARGING_PROBE_MS : QUIET_RPM_PROBE_MS;
+    if (s_lastProbeMs == 0 || now - s_lastProbeMs >= every) {
+      s_lastProbeMs = now;
+      uint16_t rpm = 0;
+      if (charging) {
+        if (pids::probe(true)) goActive(v, "charging and ECU answering");
+      } else if (pids::engineRpm(rpm) && rpm > 0 && pids::probe(false)) {
+        goActive(v, "engine running");
+      }
+    }
   }
 
   if (!s_quiet) {
     pids::pollFast(r);
     if (s_cycle++ % SLOW_EVERY_N == 0) pids::pollSlow(r);
     else pids::carrySlow(r);
+    bool running = (r.valid & V_RPM) && r.rpm > 0;
+    if (running || charging) {
+      s_lastOnMs = now;
+      r.flags |= F_ENGINE_ON;
+    } else if (now - s_lastOnMs > ENGINE_OFF_GRACE_MS) {
+      Serial.printf("[obd] %.2fV no RPM and not charging, going quiet\n", v);
+      s_quiet = true;
+      s_lastProbeMs = now;
+    }
   } else {
     pids::carrySlow(r);
     r.flags |= F_QUIET;
   }
-  if (charging) r.flags |= F_ENGINE_ON;
   fillCommon(r);
   record_seal(r);
   storage::append(r);
@@ -128,10 +175,7 @@ static void tick() {
     s_tripMiles += r.speed_kph * 0.621371 * dt / 3600.0;
     s_tripGal += pids::gallonsFromMaf(maf, dt);
   }
-  Serial.printf("rpm %u  %u kph  ect %.0fC  iat %.0fC  maf %.2f  thr %u%%  fuel %.1f%%  %.2fV  mpg %.1f  trip %.2fmi %.3fgal  gps %d\n",
-                r.rpm, r.speed_kph, r.coolant_dc / 10.0, r.intake_dc / 10.0, maf, r.throttle_pct,
-                r.fuel_raw * 100.0 / 255.0, v, pids::instantMpg(maf, r.speed_kph), s_tripMiles, s_tripGal,
-                (r.valid & V_GPS) ? r.sats : -1);
+  printLine(r, v);
 }
 
 // Serial console. ">010C" sends a raw command to the adapter (handy for Mode 22 research).

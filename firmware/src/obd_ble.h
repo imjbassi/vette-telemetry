@@ -15,7 +15,8 @@ void forgetBonds();                 // delete stored pairings (serial command "u
 // lines joined with '\n'. Empty string on timeout.
 String cmd(const char* c, uint32_t timeoutMs);
 
-// Runs ATZ / ATE0 / ATL0 / ATS0 / ATH0 / ATSP0 / ATAT1 and a 0100 probe.
+// Adapter setup: ATZ, echo/linefeed/spaces/headers off, adaptive timing, fixed protocol.
+// Sends nothing to the car. True if the adapter answered.
 bool initElm();
 
 }  // namespace obd

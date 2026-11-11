@@ -264,50 +264,73 @@ static String clean(const char* raw, size_t n) {
   return out;
 }
 
+// True while a command that timed out may still be running inside the adapter.
+static bool s_awaitingPrompt = false;
+
 String cmd(const char* c, uint32_t timeoutMs) {
   if (!connected()) return String();
-  portENTER_CRITICAL(&s_mux);
-  s_len = 0;
-  portEXIT_CRITICAL(&s_mux);
-  xSemaphoreTake(s_prompt, 0);  // clear stale signal
+
+  // Let a timed-out command finish first. Otherwise its late reply would be read as the
+  // answer to this command and every later reply would be off by one.
+  if (s_awaitingPrompt && xSemaphoreTake(s_prompt, pdMS_TO_TICKS(2500)) == pdTRUE) s_awaitingPrompt = false;
 
   String line = String(c) + "\r";
-  // OBDLink's reference code uses acknowledged writes. Use them when available.
-  bool withRsp = s_tx->canWrite();
-  if (!s_tx->writeValue((const uint8_t*)line.c_str(), line.length(), withRsp)) {
-    Serial.printf("[obd] write failed for %s\n", c);
-    return String();
-  }
+  for (int attempt = 0; attempt < 2; attempt++) {
+    portENTER_CRITICAL(&s_mux);
+    s_len = 0;
+    portEXIT_CRITICAL(&s_mux);
+    xSemaphoreTake(s_prompt, 0);  // clear stale signal
 
-  if (xSemaphoreTake(s_prompt, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
-    // Byte count separates "adapter silent" from "replied without a prompt".
-    Serial.printf("[obd] timeout on %s (%u bytes received)\n", c, (unsigned)s_len);
-    return String();
+    // OBDLink's reference code uses acknowledged writes. Use them when available.
+    bool withRsp = s_tx->canWrite();
+    if (!s_tx->writeValue((const uint8_t*)line.c_str(), line.length(), withRsp)) {
+      Serial.printf("[obd] write failed for %s\n", c);
+      return String();
+    }
+
+    if (xSemaphoreTake(s_prompt, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
+      // Byte count separates "adapter silent" from "replied without a prompt".
+      Serial.printf("[obd] timeout on %s (%u bytes received)\n", c, (unsigned)s_len);
+      s_awaitingPrompt = true;
+      return String();
+    }
+    s_awaitingPrompt = false;
+
+    char local[sizeof(s_buf)];
+    size_t n;
+    portENTER_CRITICAL(&s_mux);
+    n = s_len;
+    memcpy(local, s_buf, n);
+    portEXIT_CRITICAL(&s_mux);
+    String r = clean(local, n);
+
+    // STOPPED means our write interrupted a command that was still running, and the
+    // adapter threw this one away. Let it settle, then send once more.
+    if (attempt == 0 && r.endsWith("STOPPED")) {
+      vTaskDelay(pdMS_TO_TICKS(150));
+      continue;
+    }
+    return r;
   }
-  char local[sizeof(s_buf)];
-  size_t n;
-  portENTER_CRITICAL(&s_mux);
-  n = s_len;
-  memcpy(local, s_buf, n);
-  portEXIT_CRITICAL(&s_mux);
-  return clean(local, n);
+  return String();
 }
 
+// Adapter setup only. Nothing here talks to the car: ECU traffic starts in pids::probe()
+// once the engine is known to be running.
 bool initElm() {
+  s_awaitingPrompt = false;
   String r = cmd("ATZ", OBD_INIT_TIMEOUT_MS);
   Serial.printf("[obd] ATZ -> %s\n", r.c_str());
-  const char* setup[] = {"ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP0"};
+  bool alive = r.indexOf("ELM") >= 0;
+  const char* setup[] = {"ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP" OBD_PROTOCOL};
   for (auto* s : setup) {
     r = cmd(s, OBD_CMD_TIMEOUT_MS);
     Serial.printf("[obd] %s -> %s\n", s, r.c_str());
+    if (r.indexOf("OK") >= 0) alive = true;
   }
   Serial.printf("[obd] STI -> %s\n", cmd("STI", OBD_CMD_TIMEOUT_MS).c_str());
   Serial.printf("[obd] ATRV -> %s\n", cmd("ATRV", OBD_CMD_TIMEOUT_MS).c_str());
-  // 0100 forces protocol detection. Fails with engine/ignition off, which is fine.
-  r = cmd("0100", OBD_INIT_TIMEOUT_MS);
-  Serial.printf("[obd] 0100 -> %s\n", r.c_str());
-  Serial.printf("[obd] ATDPN -> %s\n", cmd("ATDPN", OBD_CMD_TIMEOUT_MS).c_str());
-  return r.indexOf("4100") >= 0;
+  return alive;
 }
 
 }  // namespace obd

@@ -13,22 +13,28 @@ Build: `pio run -e atoms3` or `pio run -e sim7670g`. Flash and monitor: `pio run
 
 Copy `firmware/include/secrets.example.h` to `secrets.h` first (gitignored).
 
-### Step 1 checklist (AtomS3 + CX, Nov 9)
+### Step 1 checklist (AtomS3 + CX)
 
-1. Flash `atoms3`, open the monitor, car in run or engine running.
-2. It scans for `OBDLink*`, connects, and prints the full GATT table. Expect service `fff0` with `fff1 N` and `fff2 W WnR`. If the CX uses something else the code falls back to the first notify+write pair, but update `config.h` to match.
-3. Init log shows `ATZ`, `STI` (STN firmware id), `ATRV`, `0100`, `ATDPN`. Expect protocol 6 (CAN 11-bit 500k).
-4. Then one line per second: rpm, speed, temps, MAF, throttle, fuel, volts, instant MPG, trip totals.
-5. If subscribe fails, pairing was rejected. Press the CX button and reset the AtomS3.
-6. Raw console: type `>22xxxx` or `>ATSH7E0` etc. in the monitor to send anything to the adapter. Use this for Mode 22 research. `q` prints queue size.
+1. Unplug the CX for 10 s and plug it back in. It only accepts a new pairing during the first 5 minutes after power-up. Start the engine.
+2. Flash `atoms3` and open the monitor. It scans for `OBDLink*` (or the `FFF0` service), connects, pairs, and prints the GATT table. Expect `security: encrypted=1 bonded=1`, service `fff0` with `fff1 N` and `fff2 W WnR`, then `notifications enabled`.
+3. Init log shows `ATZ -> ELM327 v1.4b`, `STI -> STN2310 ...`, `ATRV`. Nothing is sent to the car yet.
+4. With the engine running: `[pid] ECU supports: ...`, then one line per second: rpm, speed, temps, MAF, throttle, fuel, volts, instant MPG, trip totals. `--` means no value for that field.
+5. Raw console: type `>22xxxx` or `>ATSH7E0` etc. in the monitor to send anything to the adapter. Use this for Mode 22 research. `q` prints queue size. `unpair` erases stored pairings and reboots.
+
+### OBDLink CX notes (learned the hard way)
+
+- The link must be encrypted. Unpaired, the CX accepts writes and silently drops them. Pairing uses passkey 123456 and is only possible for 5 minutes after the CX powers up. The pairing then persists on both sides, so each ESP32 board needs this once.
+- Notifications must be enabled with an acknowledged write (`subscribe(true, cb, true)`). NimBLE's default unacknowledged write is ignored.
+- The CX distributes an all-zero identity address. If NimBLE stores it (host-based privacy peer record), every later scan reports the CX as `00:00:00:00:00:00` and `deleteAllBonds()` does not clear it. The firmware pairs with encryption keys only and can erase the `nimble_bond` NVS namespace.
+- The protocol is fixed to 6 (CAN 11-bit 500k). With `ATSP0` and the engine off, every request starts a multi-second `SEARCHING...` pass that a 1 Hz poller keeps aborting (`STOPPED`).
 
 ### Design notes
 
-- **Battery guard.** Every cycle starts with `ATRV`, which the adapter answers itself with no CAN traffic. Below 13.0 V for 20 s (engine not charging) the firmware stops querying ECUs and only probes `ATRV` every 10 s, so retained accessory power never keeps modules awake.
+- **Battery guard.** Every cycle starts with `ATRV`, which the adapter answers itself with no CAN traffic. The car is only queried while the engine runs. Charging voltage (13.0 V or more) plus an answering ECU starts polling. RPM above zero keeps it going, because GM's charging control can drop below 13 V while cruising. No RPM and no charging for 20 s goes quiet. While quiet and not charging, one RPM request every 30 s checks for a running engine.
 - **Power-loss safety.** Fixed 48-byte CRC'd records (`include/record.h`) appended to LittleFS segments, fsync every 5 records. A new segment every boot and every upload cycle, so a torn record can only be at the tail of a closed file. Backend drops it. Worst case loss on power cut: ~5 s logged plus whatever was not uploaded yet (that uploads next drive).
 - **Upload.** Raw binary records every 30 s, oldest first, deleted only after a 2xx. Re-uploads are idempotent on `(boot, ms)`. Queue capped at 4 MB.
 - **Time.** Records carry `boot` + `millis`. Epoch comes from GNSS or NITZ (`AT+CCLK`) when available. The backend backfills times for records written before the clock was known.
-- **Speed.** PID requests are sent as `010C1`. The trailing `1` tells the STN to return after the first ECU reply instead of waiting out the timeout. Slow PIDs (fuel, ECU volts, odometer A6) every 10th cycle. PIDs that return NO DATA 3 times are skipped for the session.
+- **Speed.** PID requests are sent as `010C1`. The trailing `1` tells the STN to return after the first ECU reply instead of waiting out the timeout. Slow PIDs (fuel, ECU volts, odometer A6) every 10th cycle. The ECU's supported-PID bitmasks (`0100`, `0120`, ...) decide what gets asked. A supported PID that still returns NO DATA 3 times is skipped for the session.
 - **MPG** = speed / (MAF x 3600 / (14.7 x 2798.7 g/gal)). LT2 runs stoich in cruise, so this tracks well except under power enrichment.
 
 ### sim7670g bring-up (Nov 10)
