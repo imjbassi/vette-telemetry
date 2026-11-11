@@ -1,5 +1,6 @@
 #include "obd_ble.h"
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include "config.h"
 
 namespace obd {
@@ -28,6 +29,9 @@ static void onNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, boo
 // OBDLink CX: link is always encrypted, bonding is only accepted during the first
 // 5 minutes after the adapter powers on, legacy pairing PIN is 123456.
 static const uint32_t kLegacyPin = 123456;
+static const uint8_t kBondVersion = 2;  // bump to force a one-time bond wipe
+
+void disconnect();
 
 class ClientCb : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient*) override { s_connected = true; }
@@ -60,7 +64,27 @@ bool begin() {
   // otherwise falls back to Just Works.
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
+  // Exchange encryption keys only. The CX hands out an all-zero identity address, and
+  // storing it makes later scans report the adapter as 00:00:00:00:00:00.
+  NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
+  NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
+
+  // Bonds made by earlier firmware carry that bad identity. Drop them once.
+  Preferences p;
+  p.begin("vette", false);
+  if (p.getUChar("bondv", 0) != kBondVersion) {
+    Serial.println("[ble] clearing old bonds (pair again within 5 min of plugging in the CX)");
+    NimBLEDevice::deleteAllBonds();
+    p.putUChar("bondv", kBondVersion);
+  }
+  p.end();
   return true;
+}
+
+void forgetBonds() {
+  disconnect();
+  NimBLEDevice::deleteAllBonds();
+  Serial.println("[ble] bonds deleted. Replug the CX, then it will pair again.");
 }
 
 bool connected() { return s_connected && s_client && s_client->isConnected(); }
@@ -136,6 +160,14 @@ bool connect(uint32_t scanSeconds) {
     return false;
   }
 
+  // Self-heal: a null address means a stored bond has a bad identity for this adapter.
+  if (target->getAddress().toString() == "00:00:00:00:00:00") {
+    Serial.println("[ble] adapter resolved to a null address, deleting bonds and rescanning");
+    scan->clearResults();
+    NimBLEDevice::deleteAllBonds();
+    return false;
+  }
+
   if (!s_client) {
     s_client = NimBLEDevice::createClient();
     s_client->setClientCallbacks(&s_cb, false);
@@ -161,11 +193,14 @@ bool connect(uint32_t scanSeconds) {
   dumpGatt(s_client);
   if (!pickChars(s_client)) { Serial.println("[ble] no usable chars"); disconnect(); return false; }
   Serial.printf("[ble] rx %s  tx %s\n", s_rx->getUUID().toString().c_str(), s_tx->getUUID().toString().c_str());
-  if (!s_rx->subscribe(true, onNotify)) {
-    Serial.println("[ble] subscribe failed (pairing rejected? press the CX button and retry)");
+  // response=true: enable notifications with an acknowledged write. The library default
+  // is an unacknowledged write, which the CX ignores, so no replies ever arrive.
+  if (!s_rx->subscribe(true, onNotify, true)) {
+    Serial.println("[ble] subscribe failed (notifications not enabled)");
     disconnect();
     return false;
   }
+  Serial.println("[ble] notifications enabled");
   return true;
 }
 
@@ -207,7 +242,8 @@ String cmd(const char* c, uint32_t timeoutMs) {
   }
 
   if (xSemaphoreTake(s_prompt, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
-    Serial.printf("[obd] timeout on %s\n", c);
+    // Byte count separates "adapter silent" from "replied without a prompt".
+    Serial.printf("[obd] timeout on %s (%u bytes received)\n", c, (unsigned)s_len);
     return String();
   }
   char local[sizeof(s_buf)];

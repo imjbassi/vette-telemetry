@@ -145,6 +145,8 @@ static void console() {
     if (line.startsWith(">")) {
       String rsp = obd::cmd(line.substring(1).c_str(), 5000);
       Serial.printf("[raw] %s -> %s\n", line.c_str() + 1, rsp.c_str());
+    } else if (line == "unpair") {
+      obd::forgetBonds();
     } else if (line == "q") {
       Serial.printf("[fs] pending %u bytes, epochBase %lu\n", (unsigned)storage::pendingBytes(),
                     (unsigned long)net::epochBase());

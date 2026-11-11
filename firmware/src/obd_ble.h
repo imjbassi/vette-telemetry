@@ -9,6 +9,7 @@ bool begin();                       // init NimBLE stack
 bool connect(uint32_t scanSeconds); // scan, connect, subscribe. Prints GATT table.
 bool connected();
 void disconnect();
+void forgetBonds();                 // delete stored pairings (serial command "unpair")
 
 // Send one command (CR appended). Returns cleaned response text without the prompt,
 // lines joined with '\n'. Empty string on timeout.
