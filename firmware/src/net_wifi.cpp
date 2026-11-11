@@ -31,6 +31,18 @@ void service() {
   state::csq = ready() ? (uint8_t)constrain((rssi + 113) / 2, 0, 31) : 99;
 }
 
+int checkBackend() {
+  if (!ready()) return -1;
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  if (!http.begin(tls, String("https://") + INGEST_HOST + "/health")) return -2;
+  http.setTimeout(15000);
+  int code = http.GET();
+  http.end();
+  return code;
+}
+
 int post(const uint8_t* body, size_t len) {
   if (!ready()) return -1;
   WiFiClientSecure tls;

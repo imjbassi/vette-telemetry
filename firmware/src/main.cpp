@@ -30,9 +30,15 @@ static void uploadAll() {
 static void netTask(void*) {
   bool up = net::begin();
   uint32_t lastUpload = 0;
+  bool checked = false;
   for (;;) {
     if (up) {
       net::service();
+      if (!checked && net::ready()) {
+        checked = true;
+        int code = net::checkBackend();
+        Serial.printf("[up] backend %s (HTTP %d)\n", code == 200 ? "reachable" : "NOT reachable", code);
+      }
       if (net::ready() && millis() - lastUpload > UPLOAD_PERIOD_MS) {
         lastUpload = millis();
         uploadAll();

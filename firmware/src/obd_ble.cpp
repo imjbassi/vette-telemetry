@@ -221,8 +221,8 @@ bool connect(uint32_t scanSeconds) {
   // The CX drops traffic on an unencrypted link. Start encryption ourselves: this
   // pairs on first contact and re-encrypts with the stored bond afterwards.
   if (!s_client->secureConnection()) {
-    Serial.println("[ble] pairing/encryption failed. The CX only accepts new bonds for 5 min after");
-    Serial.println("      power-up: unplug it for 10 s, plug it back in, then reset the AtomS3.");
+    Serial.println("[ble] pairing failed. The CX only accepts a new pairing for 5 min after it powers");
+    Serial.println("      up: unplug it for 10 s and plug it back in. This board keeps retrying.");
     disconnect();
     return false;
   }

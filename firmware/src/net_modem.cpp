@@ -260,5 +260,25 @@ int post(const uint8_t* body, size_t len) {
   return code;
 }
 
+// GET /health over the same HTTPS path the uploads use. Lets a desk test prove the TLS
+// and backend side before any car data exists.
+int checkBackend() {
+  if (!s_ready) return -1;
+  at("AT+HTTPTERM");
+  if (!atOk("AT+HTTPINIT", 5000)) return -2;
+  int code = -3;
+  do {
+    atOk("AT+HTTPPARA=\"SSLCFG\",0");
+    if (!atOk(String("AT+HTTPPARA=\"URL\",\"https://") + INGEST_HOST + "/health\"")) break;
+    if (!atOk("AT+HTTPACTION=0", 5000)) { code = -6; break; }
+    String urc = waitUrc("+HTTPACTION:", 60000);  // +HTTPACTION: 0,200,11
+    String st;
+    if (!urc.length() || field(urc, ',', 1, st) < 0) { code = -7; break; }
+    code = st.toInt();
+  } while (false);
+  at("AT+HTTPTERM");
+  return code;
+}
+
 }  // namespace net
 #endif

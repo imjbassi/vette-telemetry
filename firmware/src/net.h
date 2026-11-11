@@ -14,6 +14,7 @@ bool begin();              // blocking bring-up, called from the net task
 bool ready();              // data link up
 void service();            // periodic housekeeping (GNSS, CSQ, reconnect). Net task only.
 int  post(const uint8_t* body, size_t len);  // HTTP status, or negative on transport error
+int  checkBackend();       // GET /health, HTTP status or negative. Run once when the link comes up.
 
 Fix  fix();
 uint8_t csq();             // 0..31, 99 unknown
