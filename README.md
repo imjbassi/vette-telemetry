@@ -48,7 +48,7 @@ Copy `firmware/include/secrets.example.h` to `secrets.h` first (gitignored).
 ### Not done yet
 
 - GM Mode 22 PIDs (oil life, trans fluid/filter life). Codes need research. The `>` console is the tool for it.
-- Odometer: PID A6 may not be supported on the C8 ECM. The firmware detects and skips it.
+- Not yet verified on the road: speed, MPG, trip totals, quiet mode after shutdown, upload.
 - Boot counter lives in NVS. Erasing flash restarts it at 1 and new trips would overwrite old ones in D1. Do not erase NVS once deployed (or bump the counter manually).
 
 ## Backend
@@ -56,14 +56,13 @@ Copy `firmware/include/secrets.example.h` to `secrets.h` first (gitignored).
 ```bash
 cd backend
 npm install
-npx wrangler d1 create vette            # paste database_id into wrangler.toml
-npm run db:init:remote
-npx wrangler secret put DEVICE_TOKEN    # same value as DEVICE_TOKEN in secrets.h
-npx wrangler secret put MCP_SECRET      # long random string
-npm run deploy
+npx wrangler login
+npm run setup
 ```
 
-Set `LOCAL_TZ` in `wrangler.toml` to your zone.
+`npm run setup` is safe to re-run. It finds or creates the D1 database, loads the schema, deploys the Worker, generates `DEVICE_TOKEN` and `MCP_SECRET` once and stores them as Worker secrets, fills `INGEST_HOST` and `DEVICE_TOKEN` into `firmware/include/secrets.h`, writes the connector URL to `backend/.secrets/connector-url.txt`, and checks the live Worker. Account-specific files (`wrangler.local.toml`, `.secrets/`) are gitignored. Later code changes: `npm run deploy`.
+
+Set `LOCAL_TZ` in `wrangler.toml` to your zone, then run setup again.
 
 Local test without hardware:
 

@@ -6,9 +6,11 @@ firmware/.pio/
 backend/node_modules/
 backend/.wrangler/
 
-# Secrets
+# Secrets and account-specific config
 firmware/include/secrets.h
 backend/.dev.vars
+backend/.secrets/
+backend/wrangler.local.toml
 
 # OS / editor
 .vscode/

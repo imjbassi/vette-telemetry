@@ -80,7 +80,8 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
 
   // D1 batches run as a single transaction.
   for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));
-  await mergeLatest(env, latestPatch, learned, now);
+  // An empty or fully rejected upload must not count as "the car just reported in".
+  if (samples.length) await mergeLatest(env, latestPatch, learned, now);
 
   return Response.json({ ok: true, records: samples.length, rejected });
 }

@@ -4,9 +4,10 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "setup": "node scripts/setup.mjs",
+    "deploy": "wrangler deploy --config wrangler.local.toml",
     "db:init:local": "wrangler d1 execute vette --local --file=schema.sql",
-    "db:init:remote": "wrangler d1 execute vette --remote --file=schema.sql",
+    "db:init:remote": "wrangler d1 execute vette --remote --file=schema.sql --config wrangler.local.toml",
     "typecheck": "tsc --noEmit",
     "fake": "node scripts/fake-device.mjs"
   },
