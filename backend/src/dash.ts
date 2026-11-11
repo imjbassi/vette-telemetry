@@ -1,7 +1,7 @@
 // Dashboard: one HTML page plus a small JSON API, all under /dash/<DASH_SECRET>/.
 import page from "./dash.html";
 import { Env, getLatest } from "./ingest";
-import { CAR, recentTripAggs, tripAgg, tripAggsSince, tripNumbers } from "./queries";
+import { CAR, recentTripAggs, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching, tripNumbers } from "./queries";
 
 const json = (data: unknown, status = 200) =>
   Response.json(data, { status, headers: { "Cache-Control": "no-store", "X-Robots-Tag": "noindex" } });
@@ -121,6 +121,98 @@ async function logs(env: Env, limit: number) {
   };
 }
 
+// Everything about an arbitrary time window: totals, bucketed metric series, trips, routes.
+const BUCKETS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+const MAX_BUCKETS = 400;
+
+async function history(env: Env, from: number, to: number) {
+  const span = Math.max(1, to - from);
+  const bucket = BUCKETS.find((b) => span / b <= MAX_BUCKETS) ?? 86400;
+
+  const [series, extremes, clipped, touching, geo] = await Promise.all([
+    // D1 binds JS numbers as REAL, so a bound divisor would not truncate. `bucket` always comes
+    // from the BUCKETS list above, so it is safe to inline as an integer literal.
+    env.DB.prepare(
+      `SELECT (ts / ${bucket | 0}) * ${bucket | 0} AS t,
+              AVG(speed_kph) AS spd, MAX(speed_kph) AS spd_max,
+              AVG(CASE WHEN rpm > 0 THEN rpm END) AS rpm, MAX(rpm) AS rpm_max,
+              AVG(coolant_c) AS cool, MAX(coolant_c) AS cool_max,
+              AVG(fuel_pct) AS fuel, AVG(adapter_v) AS volt, MIN(adapter_v) AS volt_min,
+              AVG(throttle_pct) AS thr, MAX(throttle_pct) AS thr_max,
+              AVG(intake_c) AS iat, AVG(maf_gs) AS maf, MAX(maf_gs) AS maf_max,
+              COUNT(*) AS n
+       FROM samples WHERE ts BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`,
+    ).bind(from, to).all<Record<string, number | null>>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n, MAX(speed_kph) AS spd_max, MAX(rpm) AS rpm_max, MAX(coolant_c) AS cool_max,
+              AVG(CASE WHEN flags & 1 THEN coolant_c END) AS cool_avg, MIN(fuel_pct) AS fuel_min, MAX(fuel_pct) AS fuel_max,
+              MIN(adapter_v) AS volt_min, MAX(adapter_v) AS volt_max, MAX(throttle_pct) AS thr_max,
+              MIN(intake_c) AS iat_min, MAX(intake_c) AS iat_max, SUM(lat IS NOT NULL) AS gps
+       FROM samples WHERE ts BETWEEN ? AND ?`,
+    ).bind(from, to).first<Record<string, number | null>>(),
+    tripAggsBetween(env, from, to),
+    tripAggsTouching(env, from, to),
+    env.DB.prepare(
+      `SELECT boot, lat, lon, speed_kph FROM samples
+       WHERE ts BETWEEN ? AND ? AND lat IS NOT NULL ORDER BY boot, ms`,
+    ).bind(from, to).all<{ boot: number; lat: number; lon: number; speed_kph: number | null }>(),
+  ]);
+
+  // Clipped totals for exactly this window.
+  const parts = clipped.map(tripNumbers);
+  const sum = (k: "miles" | "gallons" | "engine_s" | "moving_s") => parts.reduce((a, t) => a + t[k], 0);
+  const miles = sum("miles"), gallons = sum("gallons");
+
+  const mph = (k: number | null) => (k == null ? null : Math.round(k * CAR.KM_TO_MI * 10) / 10);
+  const fF = (c: number | null) => (c == null ? null : Math.round((c * 1.8 + 32) * 10) / 10);
+  const r1 = (x: number | null) => (x == null ? null : Math.round(x * 10) / 10);
+  const rows = series.results;
+
+  // Routes, one polyline per session, thinned to keep the payload small.
+  const step = Math.max(1, Math.ceil(geo.results.length / 2500));
+  const routes: Record<number, [number, number, number | null][]> = {};
+  geo.results.forEach((r, i) => {
+    if (i % step && i !== geo.results.length - 1) return;
+    (routes[r.boot] ??= []).push([Math.round(r.lat * 1e5) / 1e5, Math.round(r.lon * 1e5) / 1e5, mph(r.speed_kph)]);
+  });
+
+  const e = extremes ?? {};
+  return {
+    from, to, bucket,
+    totals: {
+      samples: e.n ?? 0,
+      miles: Math.round(miles * 10) / 10,
+      gallons: Math.round(gallons * 100) / 100,
+      mpg: gallons > 0.05 ? Math.round((miles / gallons) * 10) / 10 : null,
+      engine_s: Math.round(sum("engine_s")),
+      moving_s: Math.round(sum("moving_s")),
+      idle_s: Math.max(0, Math.round(sum("engine_s") - sum("moving_s"))),
+      max_mph: e.spd_max == null ? null : Math.round(e.spd_max * CAR.KM_TO_MI),
+      max_rpm: e.rpm_max ?? null,
+      max_coolant_f: fF(e.cool_max ?? null),
+      avg_coolant_f: fF(e.cool_avg ?? null),
+      fuel_min: e.fuel_min ?? null, fuel_max: e.fuel_max ?? null,
+      volt_min: r1(e.volt_min ?? null), volt_max: r1(e.volt_max ?? null),
+      max_throttle: e.thr_max ?? null,
+      iat_min_f: fF(e.iat_min ?? null), iat_max_f: fF(e.iat_max ?? null),
+      gps_points: e.gps ?? 0,
+    },
+    series: {
+      t: rows.map((r) => r.t),
+      speed: rows.map((r) => mph(r.spd)), speed_max: rows.map((r) => mph(r.spd_max)),
+      rpm: rows.map((r) => (r.rpm == null ? null : Math.round(r.rpm))), rpm_max: rows.map((r) => r.rpm_max),
+      coolant: rows.map((r) => fF(r.cool)), coolant_max: rows.map((r) => fF(r.cool_max)),
+      fuel: rows.map((r) => r1(r.fuel)),
+      battery: rows.map((r) => (r.volt == null ? null : Math.round(r.volt * 100) / 100)),
+      throttle: rows.map((r) => r1(r.thr)), throttle_max: rows.map((r) => r.thr_max),
+      intake: rows.map((r) => fF(r.iat)),
+      airflow: rows.map((r) => (r.maf == null ? null : Math.round(r.maf * 100) / 100)), airflow_max: rows.map((r) => r.maf_max),
+    },
+    trips: touching.map(tripNumbers),
+    routes,
+  };
+}
+
 // Every column of one trip as CSV, times in ISO UTC.
 async function tripCsv(env: Env, id: number) {
   const rows = (await env.DB.prepare(
@@ -177,6 +269,16 @@ export async function handleDash(req: Request, env: Env, rest: string, base: str
   if (rest === "/api/trips") return json(await trips(env, num("limit", 25, 100)));
   if (rest === "/api/economy") return json(await economy(env, num("days", 30, 365)));
   if (rest === "/api/live") return json(await live(env, num("minutes", 10, 60)));
+  if (rest === "/api/history") {
+    const nowS = Math.floor(Date.now() / 1000);
+    let to = parseInt(url.searchParams.get("to") ?? "", 10);
+    let from = parseInt(url.searchParams.get("from") ?? "", 10);
+    if (!Number.isFinite(to)) to = nowS;
+    if (!Number.isFinite(from)) from = to - 86400;
+    if (from > to) [from, to] = [to, from];
+    if (to - from > 366 * 86400) from = to - 366 * 86400;
+    return json(await history(env, from, to));
+  }
   if (rest === "/api/logs") return json(await logs(env, num("limit", 150, 500)));
   const csv = rest.match(/^\/api\/trip\/(\d+)\.csv$/);
   if (csv) {

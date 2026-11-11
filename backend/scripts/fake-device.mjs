@@ -1,8 +1,9 @@
 // Simulates a drive and uploads it like the ESP32 would. Encodes the same 48-byte Record.
-// Usage: node scripts/fake-device.mjs [baseUrl] [token] [boot]
+// Usage: node scripts/fake-device.mjs [baseUrl] [token] [boot] [daysAgo]
 const base = process.argv[2] ?? "http://127.0.0.1:8787";
 const token = process.argv[3] ?? "dev-device-token";
 const boot = Number(process.argv[4] ?? 1);
+const daysAgo = Number(process.argv[5] ?? 0);
 
 function crc16(b, n) {
   let c = 0xffff;
@@ -37,9 +38,10 @@ function encode(r) {
 }
 
 // 20 minute drive starting 25 minutes ago. Clock unknown for the first 60 s (no GNSS/NITZ yet).
-const start = Math.floor(Date.now() / 1000) - 25 * 60;
+const start = Math.floor(Date.now() / 1000) - 25 * 60 - Math.round(daysAgo * 86400);
 const recs = [];
-let lat = 37.7749, lon = -122.4194, fuel = 62;
+// Vary the start point per session so multi-day tests draw separate routes.
+let lat = 37.7749 + (boot % 5) * 0.03, lon = -122.4194 + (boot % 3) * 0.04, fuel = 62 - daysAgo;
 for (let s = 0; s < 20 * 60; s++) {
   const phase = s / 60;
   const kph = s < 30 ? 0 : Math.round(Math.max(0, 70 + 40 * Math.sin(phase / 2) + (Math.random() - 0.5) * 10));

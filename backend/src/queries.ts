@@ -136,6 +136,23 @@ export async function tripAggsSince(env: Env, since: number): Promise<TripAgg[]>
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
 }
 
+// Aggregates clipped to [from, to]: distance, fuel and time only count samples inside it.
+export async function tripAggsBetween(env: Env, from: number, to: number): Promise<TripAgg[]> {
+  const rows = await env.DB.prepare(TRIP_AGG_SQL("ts BETWEEN ? AND ?")).bind(from, to).all<TripAgg>();
+  return rows.results.sort((a, b) => b.start_ts - a.start_ts);
+}
+
+// Whole trips (not clipped) that have any sample in [from, to].
+export async function tripAggsTouching(env: Env, from: number, to: number): Promise<TripAgg[]> {
+  const boots = await env.DB.prepare(`SELECT DISTINCT boot FROM samples WHERE ts BETWEEN ? AND ?`)
+    .bind(from, to).all<{ boot: number }>();
+  const ids = boots.results.map((b) => b.boot);
+  if (!ids.length) return [];
+  const rows = await env.DB.prepare(TRIP_AGG_SQL(`boot IN (${ids.map(() => "?").join(",")})`))
+    .bind(...ids).all<TripAgg>();
+  return rows.results.sort((a, b) => b.start_ts - a.start_ts);
+}
+
 export async function tripAgg(env: Env, boot: number): Promise<TripAgg | null> {
   return env.DB.prepare(TRIP_AGG_SQL("boot = ?")).bind(boot).first<TripAgg>();
 }
