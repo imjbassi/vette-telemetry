@@ -95,13 +95,17 @@ function writeConnectorUrl(url, mcpSecret) {
 // ---- live checks -------------------------------------------------------------------
 
 async function smoke(url, secrets) {
-  // A brand new workers.dev hostname can take a minute to start resolving.
+  // On a brand new workers.dev subdomain, DNS resolves quickly but the TLS certificate
+  // can take several minutes. Until then every HTTPS handshake fails.
   let healthy = false;
-  for (let i = 0; i < 24 && !healthy; i++) {
+  for (let i = 0; i < 90 && !healthy; i++) {
     try { healthy = (await fetch(`${url}/health`)).ok; } catch { /* not up yet */ }
-    if (!healthy) await new Promise((r) => setTimeout(r, 5000));
+    if (!healthy) {
+      if (i === 3) console.log("not answering yet (normal for a new subdomain), waiting up to 15 minutes");
+      await new Promise((r) => setTimeout(r, 10000));
+    }
   }
-  if (!healthy) fail(`${url}/health did not answer within 2 minutes`);
+  if (!healthy) fail(`${url}/health did not answer within 15 minutes. Everything is deployed, so just run this again later.`);
   console.log("health: ok");
 
   const bad = await fetch(`${url}/ingest`, { method: "POST", headers: { Authorization: "Bearer wrong" }, body: new Uint8Array(48) });
