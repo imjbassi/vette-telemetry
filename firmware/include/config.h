@@ -33,7 +33,9 @@
 
 // ---- Storage / upload ----
 #define FLUSH_EVERY          5      // records per fsync. Power cut loses at most this many.
-#define UPLOAD_PERIOD_MS     30000
+// Each upload is a fresh HTTPS session on the modem, so the TLS handshake dominates data use:
+// roughly 1.5 MB per hour of driving at 15 s.
+#define UPLOAD_PERIOD_MS     15000
 #define MAX_UPLOAD_BYTES     16384
 #define QUEUE_MAX_BYTES      (4 * 1024 * 1024)  // drop oldest segments past this
 

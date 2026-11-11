@@ -12,10 +12,12 @@ inline uint32_t epochBase = 0;
 inline void setEpochNow(uint32_t unixNow) {
   uint32_t base = unixNow - millis() / 1000;
   portENTER_CRITICAL(&mux);
-  bool first = epochBase == 0;
+  uint32_t old = epochBase;
   epochBase = base;
   portEXIT_CRITICAL(&mux);
-  if (first) Serial.printf("[time] epoch base %lu\n", (unsigned long)base);
+  if (old == 0) Serial.printf("[time] epoch base %lu\n", (unsigned long)base);
+  else if ((int32_t)(base - old) > 60 || (int32_t)(old - base) > 60)
+    Serial.printf("[time] clock corrected by %ld s\n", (long)((int32_t)(base - old)));
 }
 
 // days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm)

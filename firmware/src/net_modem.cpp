@@ -172,18 +172,33 @@ static void readClock() {
   char sign = '+';
   if (sscanf(r.c_str() + q + 1, "%d/%d/%d,%d:%d:%d%c%d", &yy, &MM, &dd, &hh, &mm, &ss, &sign, &tz) < 6) return;
   if (yy < 24 || yy > 60) return;  // RTC not synced yet
-  int32_t offset = (sign == '-' ? -tz : tz) * 15 * 60;
-  state::setEpochNow(state::toUnix(2000 + yy, MM, dd, hh, mm, ss) - offset);
+  // On the SIM7670G (V1.9.05) the clock fields are already UTC and the zone suffix is only
+  // informational. Applying the offset put every record 8 h in the future. GNSS time, when
+  // it arrives, replaces this anyway.
+  (void)sign; (void)tz;
+  if (epochBase() == 0) Serial.println("[time] provisional time from the cell network clock");
+  state::setEpochNow(state::toUnix(2000 + yy, MM, dd, hh, mm, ss));
 }
 
-static int32_t nmeaToE7(const String& v, bool negative) {
+// Coordinates arrive either as NMEA ddmm.mmmm / dddmm.mmmm or, on the SIM7670G, as plain
+// decimal degrees (37.819900 / 122.478300). Tell them apart by the digits before the point:
+// NMEA always has 4 (lat) or 5 (lon), decimal degrees at most 2 or 3.
+static int32_t coordToE7(const String& v, bool negative, bool isLat) {
+  int dot = v.indexOf('.');
+  int intDigits = dot < 0 ? v.length() : dot;
   double raw = v.toDouble();
-  int deg = (int)(raw / 100);
-  double dec = deg + (raw - deg * 100) / 60.0;
+  double dec;
+  if (intDigits >= (isLat ? 4 : 5)) {
+    int deg = (int)(raw / 100);
+    dec = deg + (raw - deg * 100) / 60.0;
+  } else {
+    dec = raw;
+  }
   return (int32_t)((negative ? -dec : dec) * 1e7);
 }
 
-// +CGNSSINFO: 2,09,05,00,3113.330650,N,12121.262554,E,131117,091918.0,32.1,0.0,255.0,1.1,0.8,0.7
+// +CGNSSINFO: 3,08,,04,00,37.819900,N,122.478300,W,010126,120000.00,...   (SIM7670G)
+// +CGNSSINFO: 2,09,05,00,3113.330650,N,12121.262554,E,131117,091918.0,...  (older A76xx)
 // Firmware revisions differ in how many satellite-count fields precede lat, so anchor on N/S.
 static void readGnss() {
   String r = at("AT+CGNSSINFO", 3000);
@@ -206,8 +221,13 @@ static void readGnss() {
   Fix f;
   if (ns >= 1 && ns + 4 < n && tok[ns - 1].length()) {
     f.valid = true;
-    f.lat_e7 = nmeaToE7(tok[ns - 1], tok[ns] == "S");
-    f.lon_e7 = nmeaToE7(tok[ns + 1], tok[ns + 2] == "W");
+    f.lat_e7 = coordToE7(tok[ns - 1], tok[ns] == "S", true);
+    f.lon_e7 = coordToE7(tok[ns + 1], tok[ns + 2] == "W", false);
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      Serial.printf("[gnss] first fix %.6f, %.6f (%s)\n", f.lat_e7 / 1e7, f.lon_e7 / 1e7, tok[ns - 1].c_str());
+    }
     int sats = 0;
     for (int i = 1; i < ns - 1; i++) sats += tok[i].toInt();
     f.sats = (uint8_t)min(sats, 255);
