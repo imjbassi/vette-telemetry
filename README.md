@@ -81,7 +81,7 @@ node scripts/mcp-smoke.mjs              # calls every MCP tool
 
 Open the URL in `backend/.secrets/dashboard-url.txt` on any device: `https://<worker-host>/dash/<DASH_SECRET>/`. Like the connector, the secret path is the auth, so treat it like a password. On a phone, "Add to Home Screen" makes it behave like an app.
 
-It shows fuel level and range, battery, coolant, 30-day MPG, odometer, the car's last GPS position, recent trips with the route colored by speed, speed/RPM/coolant charts per trip, and per-trip MPG against the EPA rating. It refreshes every 20 s. The page is `backend/src/dash.html` (no build step) and its JSON API is in `backend/src/dash.ts`. Map tiles come from OpenStreetMap, and the page only sends the site's origin as the referrer, never the secret path.
+Four sections. **Overview**: fuel, range, battery, 30-day MPG, last drive's speed, per-trip MPG against EPA, location, recent trips. **Live**: speed, RPM, throttle, coolant, instant MPG, airflow, battery, intake air, fuel and cell signal with the last 10 minutes as sparklines and charts. **Trips**: every ignition cycle with a speed-colored route, stats, speed/RPM/coolant/throttle charts and CSV export. **Logs**: last upload, uploads per hour, signal, GPS, the upload log, the newest raw readings and a per-session summary. It polls every 4 to 8 s while the engine runs and every 20 to 30 s when parked, and stops while the tab is hidden. The page is `backend/src/dash.html` (no build step) and its JSON API is in `backend/src/dash.ts`. Map tiles come from OpenStreetMap, and the page only sends the site's origin as the referrer, never the secret path.
 
 ### Claude connector
 

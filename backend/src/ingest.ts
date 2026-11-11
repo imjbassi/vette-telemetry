@@ -23,6 +23,20 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
   const { samples, rejected } = decode(buf);
 
+  for (const s of samples) {
+    // A device clock in the future is wrong (firmware before the 2026-11-11 GPS and clock fix added the zone offset to
+    // the modem's UTC clock). Treat it as unknown so the upload time is used instead.
+    if (s.epoch > now + 300) s.epoch = 0;
+    // Firmware before the 2026-11-11 GPS and clock fix parsed the SIM7670G's decimal degrees as NMEA ddmm.mmmm, which
+    // squeezes every location into |lat| < 1.5, |lon| < 3: open ocean in the Gulf of Guinea.
+    // Undo it: stored = d + (raw - 100 d) / 60 with d = floor(raw / 100).
+    if (s.lat != null && s.lon != null && Math.abs(s.lat) < 1.5 && Math.abs(s.lon) < 3 && (s.lat !== 0 || s.lon !== 0)) {
+      const a = Math.abs(s.lon);
+      s.lat = s.lat * 60;
+      s.lon = Math.sign(s.lon) * (a >= 1 ? 100 + (a - 1) * 60 : a * 60);
+    }
+  }
+
   // Resolve timestamps. Each boot has a fixed epoch base (unix time at millis 0).
   const boots = [...new Set(samples.map((s) => s.boot))];
   const known = new Map<number, number>();
