@@ -91,24 +91,67 @@ bool begin() {
   String pin = at("AT+CPIN?", 5000);
   if (pin.indexOf("READY") < 0) Serial.printf("[modem] SIM not ready: %s", pin.c_str());
   atOk("AT+CTZU=1");  // let NITZ update the RTC
-  atOk(String("AT+CGDCONT=1,\"IP\",\"") + MODEM_APN + "\"");
-  atOk("AT+CGNSSPWR=1", 5000);
+
+  // The APN is stored in the modem and used when it attaches. If ours is not there yet,
+  // set it and bounce the radio so the attach is redone with it.
+  String ctx = at("AT+CGDCONT?");
+  if (ctx.indexOf(String("\"") + MODEM_APN + "\"") < 0) {
+    Serial.printf("[modem] setting APN \"%s\" and re-attaching\n", MODEM_APN);
+    atOk(String("AT+CGDCONT=1,\"IP\",\"") + MODEM_APN + "\"");
+    atOk("AT+CFUN=0", 10000);
+    atOk("AT+CFUN=1", 10000);
+  } else {
+    Serial.printf("[modem] APN \"%s\" already set\n", MODEM_APN);
+  }
+
+  // TLS context 0 for the modem's HTTP stack: any TLS version, send SNI (Cloudflare needs
+  // it), no server certificate check, and do not reject certs because the clock is unset.
+  // Same trust level as the WiFi path's setInsecure(). Failures here are not fatal.
+  const char* ssl[] = {
+      "AT+CSSLCFG=\"sslversion\",0,4",
+      "AT+CSSLCFG=\"authmode\",0,0",
+      "AT+CSSLCFG=\"enableSNI\",0,1",
+      "AT+CSSLCFG=\"ignorelocaltime\",0,1",
+  };
+  for (auto* c : ssl) {
+    if (!atOk(c)) Serial.printf("[modem] %s not accepted\n", c);
+  }
+
+  if (!atOk("AT+CGNSSPWR=1", 5000)) Serial.println("[modem] GNSS power-on not accepted");
   s_lastReg = 0;
   return true;
 }
 
 bool ready() { return s_ready; }
 
+static void readCsqNow() {
+  String r = at("AT+CSQ");  // +CSQ: 20,99
+  int c = r.indexOf("+CSQ:");
+  if (c >= 0) state::csq = (uint8_t)r.substring(c + 5).toInt();
+}
+
 static void checkRegistration() {
   String r = at("AT+CEREG?");  // +CEREG: 0,1  (1 home, 5 roaming)
   int c = r.indexOf("+CEREG:");
   bool reg = false;
+  int st = -1;
   if (c >= 0) {
     String stat;
     field(r.substring(c + 7), ',', 1, stat);
-    reg = stat.toInt() == 1 || stat.toInt() == 5;
+    st = stat.toInt();
+    reg = st == 1 || st == 5;
   }
-  if (!reg) { s_ready = false; return; }
+  if (!reg) {
+    // 0 idle, 2 searching, 3 denied (SIM not active or wrong plan), 4 unknown
+    static uint8_t n = 0;
+    if (n++ % 4 == 0) {
+      readCsqNow();
+      Serial.printf("[modem] not registered yet (state %d%s, signal %u/31)\n", st,
+                    st == 3 ? " = denied: is the SIM plan active?" : st == 2 ? " = searching" : "", state::csq);
+    }
+    s_ready = false;
+    return;
+  }
   if (!s_ready) {
     atOk("AT+CGATT=1", 10000);
     atOk("AT+CGACT=1,1", 15000);
@@ -118,11 +161,7 @@ static void checkRegistration() {
   }
 }
 
-static void readCsq() {
-  String r = at("AT+CSQ");  // +CSQ: 20,99
-  int c = r.indexOf("+CSQ:");
-  if (c >= 0) state::csq = (uint8_t)r.substring(c + 5).toInt();
-}
+static void readCsq() { readCsqNow(); }
 
 // +CCLK: "24/11/09,12:34:56-32"  (tz in quarter hours, local time)
 static void readClock() {
@@ -200,6 +239,7 @@ int post(const uint8_t* body, size_t len) {
   if (!atOk("AT+HTTPINIT", 5000)) { s_ready = false; return -2; }
   int code = -3;
   do {
+    atOk("AT+HTTPPARA=\"SSLCFG\",0");  // use TLS context 0 from begin(). Optional on some firmware.
     if (!atOk(String("AT+HTTPPARA=\"URL\",\"https://") + INGEST_HOST + INGEST_PATH + "\"")) break;
     if (!atOk("AT+HTTPPARA=\"CONTENT\",\"application/octet-stream\"")) break;
     if (!atOk(String("AT+HTTPPARA=\"USERDATA\",\"Authorization: Bearer ") + DEVICE_TOKEN + "\"")) break;

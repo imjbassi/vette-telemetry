@@ -39,7 +39,11 @@ Copy `firmware/include/secrets.example.h` to `secrets.h` first (gitignored).
 
 ### sim7670g bring-up (Nov 10)
 
-- Modem UART: ESP32 RX 17, TX 18, 115200 (from community reports, not an official Waveshare example. Verify against the board schematic).
+- DIP switches: `4G` on (powers the modem), `HUB` on (needed for USB flashing and serial), `CAM` off, `USB` off (keeps the modem's own USB off the cable so the computer sees one serial port).
+- LTE uses the onboard antenna. GPS needs the external antenna on the GNSS connector and a view of the sky.
+- First boot needs the CX pairing window again: replug the CX, and keep the AtomS3 unpowered so it does not take the connection.
+- Modem UART: ESP32 RX 17, TX 18, 115200 (from two community sources, one quoting a Waveshare support sample. Not in the official docs).
+- The modem's TLS context skips server certificate checks (`authmode 0`), like the WiFi path. Pinning Cloudflare's root CA is a possible hardening step.
 - Boot log prints `ATI` and `ICCID`. **EIOTCLUB's APN depends on the ICCID prefix.** Check it against their APN table and set `MODEM_APN`. `america.bics` is a guess for a US IoT SIM.
 - Serial logs go out UART0 via the onboard CH343 (`ARDUINO_USB_CDC_ON_BOOT=0`). If the monitor is silent, flip it to 1.
 - HTTPS uses the modem's own HTTP stack (`AT+HTTPINIT/HTTPPARA/HTTPDATA/HTTPACTION`). Someone reported URL truncation near 64 chars on this board, so keep `INGEST_HOST` short. If you see 7xx codes from `HTTPACTION`, it is a TLS/SNI issue, and the next step is `AT+HTTPPARA="SSLCFG"` with an SSL context.
