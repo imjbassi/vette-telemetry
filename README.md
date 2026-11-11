@@ -1,4 +1,4 @@
-﻿# vette-telemetry
+# vette-telemetry
 
 C8 Stingray logger. OBDLink CX (BLE) -> ESP32-S3 -> LTE -> Cloudflare Worker + D1 -> MCP -> Claude.
 
