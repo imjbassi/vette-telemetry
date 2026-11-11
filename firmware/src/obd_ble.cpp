@@ -25,11 +25,28 @@ static void onNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, boo
   if (sawPrompt) xSemaphoreGive(s_prompt);
 }
 
+// OBDLink CX: link is always encrypted, bonding is only accepted during the first
+// 5 minutes after the adapter powers on, legacy pairing PIN is 123456.
+static const uint32_t kLegacyPin = 123456;
+
 class ClientCb : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient*) override { s_connected = true; }
   void onDisconnect(NimBLEClient*) override {
     s_connected = false;
     Serial.println("[ble] disconnected");
+  }
+  uint32_t onPassKeyRequest() override {
+    Serial.println("[ble] passkey requested, sending 123456");
+    return kLegacyPin;
+  }
+  bool onConfirmPIN(uint32_t pin) override {
+    Serial.printf("[ble] confirm pin %06lu\n", (unsigned long)pin);
+    return true;
+  }
+  void onAuthenticationComplete(ble_gap_conn_desc* d) override {
+    Serial.printf("[ble] security: encrypted=%d bonded=%d authenticated=%d key_size=%d\n",
+                  d->sec_state.encrypted, d->sec_state.bonded, d->sec_state.authenticated,
+                  d->sec_state.key_size);
   }
 };
 static ClientCb s_cb;
@@ -38,9 +55,11 @@ bool begin() {
   s_prompt = xSemaphoreCreateBinary();
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  // CX pairs on first subscribe/write. Just Works, bonded, secure connections.
+  // Bond, no MITM requirement, LE secure connections when the peer supports it.
+  // Keyboard-only IO lets us answer a legacy passkey request with 123456 and
+  // otherwise falls back to Just Works.
   NimBLEDevice::setSecurityAuth(true, false, true);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
   return true;
 }
 
@@ -130,6 +149,15 @@ bool connect(uint32_t scanSeconds) {
   s_connected = true;
   Serial.printf("[ble] connected, MTU %u\n", s_client->getMTU());
 
+  // The CX drops traffic on an unencrypted link. Start encryption ourselves: this
+  // pairs on first contact and re-encrypts with the stored bond afterwards.
+  if (!s_client->secureConnection()) {
+    Serial.println("[ble] pairing/encryption failed. The CX only accepts new bonds for 5 min after");
+    Serial.println("      power-up: unplug it for 10 s, plug it back in, then reset the AtomS3.");
+    disconnect();
+    return false;
+  }
+
   dumpGatt(s_client);
   if (!pickChars(s_client)) { Serial.println("[ble] no usable chars"); disconnect(); return false; }
   Serial.printf("[ble] rx %s  tx %s\n", s_rx->getUUID().toString().c_str(), s_tx->getUUID().toString().c_str());
@@ -171,8 +199,12 @@ String cmd(const char* c, uint32_t timeoutMs) {
   xSemaphoreTake(s_prompt, 0);  // clear stale signal
 
   String line = String(c) + "\r";
-  bool noRsp = s_tx->canWriteNoResponse();
-  if (!s_tx->writeValue((const uint8_t*)line.c_str(), line.length(), !noRsp)) return String();
+  // OBDLink's reference code uses acknowledged writes. Use them when available.
+  bool withRsp = s_tx->canWrite();
+  if (!s_tx->writeValue((const uint8_t*)line.c_str(), line.length(), withRsp)) {
+    Serial.printf("[obd] write failed for %s\n", c);
+    return String();
+  }
 
   if (xSemaphoreTake(s_prompt, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
     Serial.printf("[obd] timeout on %s\n", c);
