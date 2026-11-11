@@ -66,6 +66,7 @@ function loadOrCreateSecrets() {
   let created = false;
   if (!s.DEVICE_TOKEN) { s.DEVICE_TOKEN = randomBytes(16).toString("hex"); created = true; }
   if (!s.MCP_SECRET) { s.MCP_SECRET = randomBytes(24).toString("hex"); created = true; }
+  if (!s.DASH_SECRET) { s.DASH_SECRET = randomBytes(24).toString("hex"); created = true; }
   fs.writeFileSync(file, JSON.stringify(s, null, 2));
   return { secrets: s, created };
 }
@@ -89,6 +90,12 @@ function writeFirmwareSecrets(host, deviceToken) {
 function writeConnectorUrl(url, mcpSecret) {
   const file = path.join(secretsDir, "connector-url.txt");
   fs.writeFileSync(file, `${url}/mcp/${mcpSecret}\n`);
+  return file;
+}
+
+function writeDashboardUrl(url, dashSecret) {
+  const file = path.join(secretsDir, "dashboard-url.txt");
+  fs.writeFileSync(file, `${url}/dash/${dashSecret}/\n`);
   return file;
 }
 
@@ -129,6 +136,20 @@ async function smoke(url, secrets) {
   const wrong = await fetch(`${url}/mcp/not-the-secret`, { method: "POST", body: "{}" });
   if (wrong.status !== 404) fail(`MCP answered on a wrong secret path (status ${wrong.status})`);
   console.log("mcp hides behind the secret path: ok");
+
+  // A secret stored a moment ago can take a few seconds to reach every Cloudflare location.
+  let page, html = "";
+  for (let i = 0; i < 12 && !html.includes("<title>Corvette</title>"); i++) {
+    if (i) await new Promise((r) => setTimeout(r, 5000));
+    page = await fetch(`${url}/dash/${secrets.DASH_SECRET}/`);
+    html = page.ok ? await page.text() : "";
+  }
+  if (!html.includes("<title>Corvette</title>")) fail(`dashboard page did not load (status ${page.status})`);
+  const st = await fetch(`${url}/dash/${secrets.DASH_SECRET}/api/status`);
+  if (!st.ok || !("latest" in (await st.json()))) fail(`dashboard API did not answer (status ${st.status})`);
+  const hidden = await fetch(`${url}/dash/not-the-secret/`);
+  if (hidden.status !== 404) fail(`dashboard answered on a wrong secret path (status ${hidden.status})`);
+  console.log("dashboard page and API: ok, hidden behind its secret path");
 }
 
 // ---- main --------------------------------------------------------------------------
@@ -172,15 +193,19 @@ console.log(`deployed to ${url}`);
 step("setting Worker secrets");
 const { secrets, created } = loadOrCreateSecrets();
 const tmp = path.join(secretsDir, "bulk.tmp.json");
-fs.writeFileSync(tmp, JSON.stringify({ DEVICE_TOKEN: secrets.DEVICE_TOKEN, MCP_SECRET: secrets.MCP_SECRET }));
+fs.writeFileSync(tmp, JSON.stringify({
+  DEVICE_TOKEN: secrets.DEVICE_TOKEN, MCP_SECRET: secrets.MCP_SECRET, DASH_SECRET: secrets.DASH_SECRET,
+}));
 try { wr(["secret", "bulk", path.relative(backend, tmp), "--config", CONFIG]); } finally { fs.rmSync(tmp, { force: true }); }
 console.log(created ? "generated new secrets and stored them" : "re-used existing secrets and stored them");
 
 step("writing device and connector settings");
 const fw = writeFirmwareSecrets(new URL(url).host, secrets.DEVICE_TOKEN);
 const conn = writeConnectorUrl(url, secrets.MCP_SECRET);
+const dash = writeDashboardUrl(url, secrets.DASH_SECRET);
 console.log(`firmware settings: ${fw}`);
 console.log(`connector URL:     ${conn}`);
+console.log(`dashboard URL:     ${dash}`);
 
 step("checking the live Worker");
 await smoke(url, secrets);
@@ -188,3 +213,4 @@ await smoke(url, secrets);
 console.log(`\nDone. Worker: ${url}`);
 console.log("Next: set WIFI_SSID / WIFI_PASS in firmware/include/secrets.h, flash, and add the");
 console.log("URL from .secrets/connector-url.txt as a custom connector in Claude.");
+console.log("Dashboard: open the URL in .secrets/dashboard-url.txt on any device.");

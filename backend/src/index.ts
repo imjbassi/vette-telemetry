@@ -1,3 +1,4 @@
+import { handleDash } from "./dash";
 import { Env, handleIngest } from "./ingest";
 import { handleMcp } from "./mcp";
 
@@ -25,6 +26,16 @@ export default {
       const secret = url.pathname.slice(5).replace(/\/$/, "");
       if (!env.MCP_SECRET || !safeEqual(secret, env.MCP_SECRET)) return new Response("not found", { status: 404 });
       return handleMcp(req, env);
+    }
+
+    // Dashboard URL: https://<host>/dash/<DASH_SECRET>/. Same secret-path scheme as MCP.
+    if (url.pathname.startsWith("/dash/")) {
+      const after = url.pathname.slice(6);
+      const cut = after.indexOf("/");
+      const secret = cut < 0 ? after : after.slice(0, cut);
+      const rest = cut < 0 ? "" : after.slice(cut);
+      if (!env.DASH_SECRET || !safeEqual(secret, env.DASH_SECRET)) return new Response("not found", { status: 404 });
+      return handleDash(req, env, rest, `/dash/${secret}`);
     }
 
     if (url.pathname === "/health") return Response.json({ ok: true });

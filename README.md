@@ -77,6 +77,12 @@ node scripts/fake-device.mjs            # simulated 20 min drive, incl. no-clock
 node scripts/mcp-smoke.mjs              # calls every MCP tool
 ```
 
+### Dashboard
+
+Open the URL in `backend/.secrets/dashboard-url.txt` on any device: `https://<worker-host>/dash/<DASH_SECRET>/`. Like the connector, the secret path is the auth, so treat it like a password. On a phone, "Add to Home Screen" makes it behave like an app.
+
+It shows fuel level and range, battery, coolant, 30-day MPG, odometer, the car's last GPS position, recent trips with the route colored by speed, speed/RPM/coolant charts per trip, and per-trip MPG against the EPA rating. It refreshes every 20 s. The page is `backend/src/dash.html` (no build step) and its JSON API is in `backend/src/dash.ts`. Map tiles come from OpenStreetMap, and the page only sends the site's origin as the referrer, never the secret path.
+
 ### Claude connector
 
 Settings > Connectors > Add custom connector, URL `https://<worker-host>/mcp/<MCP_SECRET>`. The secret path is the auth, so treat the URL like a password.

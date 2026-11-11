@@ -84,11 +84,63 @@ export async function location(env: Env) {
 
 // ------------------------------------------------------------ trips
 
-interface TripAgg {
+export interface TripAgg {
   boot: number; start_ts: number; end_ts: number; km: number | null; maf_g: number | null;
   engine_s: number | null; moving_s: number | null; max_kph: number | null; max_rpm: number | null;
   max_coolant: number | null; avg_rpm: number | null; est: number;
 }
+
+// Raw numbers for one trip. The MCP tools format these as text, the dashboard as charts.
+export interface TripNums {
+  id: number; start_ts: number; end_ts: number; duration_s: number; engine_s: number; moving_s: number;
+  miles: number; gallons: number; mpg: number | null; avg_mph: number | null; max_mph: number | null;
+  max_rpm: number | null; avg_rpm: number | null; max_coolant_f: number | null; est: boolean;
+}
+
+export function tripNumbers(t: TripAgg): TripNums {
+  const miles = (t.km ?? 0) * KM_TO_MI;
+  const gallons = (t.maf_g ?? 0) / (AFR * G_PER_GAL);
+  return {
+    id: t.boot,
+    start_ts: t.start_ts,
+    end_ts: t.end_ts,
+    duration_s: t.end_ts - t.start_ts,
+    engine_s: t.engine_s ?? 0,
+    moving_s: t.moving_s ?? 0,
+    miles: r2(miles) ?? 0,
+    gallons: r2(gallons) ?? 0,
+    mpg: gallons > 0.01 && miles > 0.1 ? r1(miles / gallons) : null,
+    avg_mph: t.moving_s ? r1(miles / (t.moving_s / 3600)) : null,
+    max_mph: t.max_kph == null ? null : Math.round(t.max_kph * KM_TO_MI),
+    max_rpm: t.max_rpm,
+    avg_rpm: t.avg_rpm == null ? null : Math.round(t.avg_rpm),
+    max_coolant_f: cToF(t.max_coolant),
+    est: t.est === 1,
+  };
+}
+
+export async function recentTripAggs(env: Env, limit: number): Promise<TripAgg[]> {
+  // Cheap pass to find recent boots, then aggregate just those.
+  const boots = await env.DB.prepare(
+    `SELECT boot FROM samples GROUP BY boot HAVING SUM(flags & 1) > 0 ORDER BY MAX(ts) DESC LIMIT ?`,
+  ).bind(limit).all<{ boot: number }>();
+  const ids = boots.results.map((b) => b.boot);
+  if (!ids.length) return [];
+  const rows = await env.DB.prepare(TRIP_AGG_SQL(`boot IN (${ids.map(() => "?").join(",")})`))
+    .bind(...ids).all<TripAgg>();
+  return rows.results.sort((a, b) => b.start_ts - a.start_ts);
+}
+
+export async function tripAggsSince(env: Env, since: number): Promise<TripAgg[]> {
+  const rows = await env.DB.prepare(TRIP_AGG_SQL("ts >= ?")).bind(since).all<TripAgg>();
+  return rows.results.sort((a, b) => b.start_ts - a.start_ts);
+}
+
+export async function tripAgg(env: Env, boot: number): Promise<TripAgg | null> {
+  return env.DB.prepare(TRIP_AGG_SQL("boot = ?")).bind(boot).first<TripAgg>();
+}
+
+export const CAR = { TANK_GAL, EPA: { city: 16, highway: 24, combined: EPA_COMBINED_MPG }, KM_TO_MI };
 
 const TRIP_AGG_SQL = (where: string) => `
   WITH s AS (
@@ -106,37 +158,28 @@ const TRIP_AGG_SQL = (where: string) => `
   FROM s GROUP BY boot HAVING SUM(flags & 1) > 0`;
 
 function shapeTrip(env: Env, t: TripAgg) {
-  const miles = (t.km ?? 0) * KM_TO_MI;
-  const gal = (t.maf_g ?? 0) / (AFR * G_PER_GAL);
+  const n = tripNumbers(t);
   return {
-    trip_id: t.boot,
-    start: fmtTime(env, t.start_ts),
-    end: fmtTime(env, t.end_ts),
-    duration_min: r1((t.end_ts - t.start_ts) / 60),
-    engine_on_min: r1((t.engine_s ?? 0) / 60),
-    moving_min: r1((t.moving_s ?? 0) / 60),
-    distance_mi: r2(miles),
-    fuel_used_gal: r2(gal),
-    mpg: gal > 0.01 && miles > 0.1 ? r1(miles / gal) : null,
-    avg_moving_speed_mph: t.moving_s ? r1(miles / (t.moving_s / 3600)) : null,
-    max_speed_mph: t.max_kph == null ? null : Math.round(t.max_kph * KM_TO_MI),
-    max_rpm: t.max_rpm,
-    avg_rpm: t.avg_rpm == null ? null : Math.round(t.avg_rpm),
-    max_coolant_f: cToF(t.max_coolant),
-    times_estimated: t.est === 1,
+    trip_id: n.id,
+    start: fmtTime(env, n.start_ts),
+    end: fmtTime(env, n.end_ts),
+    duration_min: r1(n.duration_s / 60),
+    engine_on_min: r1(n.engine_s / 60),
+    moving_min: r1(n.moving_s / 60),
+    distance_mi: n.miles,
+    fuel_used_gal: n.gallons,
+    mpg: n.mpg,
+    avg_moving_speed_mph: n.avg_mph,
+    max_speed_mph: n.max_mph,
+    max_rpm: n.max_rpm,
+    avg_rpm: n.avg_rpm,
+    max_coolant_f: n.max_coolant_f,
+    times_estimated: n.est,
   };
 }
 
 export async function listTrips(env: Env, limit: number) {
-  // Cheap pass to find recent boots, then aggregate just those.
-  const boots = await env.DB.prepare(
-    `SELECT boot FROM samples GROUP BY boot HAVING SUM(flags & 1) > 0 ORDER BY MAX(ts) DESC LIMIT ?`,
-  ).bind(limit).all<{ boot: number }>();
-  const ids = boots.results.map((b) => b.boot);
-  if (!ids.length) return { trips: [] };
-  const rows = await env.DB.prepare(TRIP_AGG_SQL(`boot IN (${ids.map(() => "?").join(",")})`))
-    .bind(...ids).all<TripAgg>();
-  const trips = rows.results.sort((a, b) => b.start_ts - a.start_ts).map((t) => shapeTrip(env, t));
+  const trips = (await recentTripAggs(env, limit)).map((t) => shapeTrip(env, t));
   return { trips };
 }
 
@@ -154,7 +197,7 @@ export async function tripSummary(env: Env, tripId?: number) {
     if (!last) return { error: "No trips recorded yet." };
     boot = last.boot;
   }
-  const agg = await env.DB.prepare(TRIP_AGG_SQL("boot = ?")).bind(boot).first<TripAgg>();
+  const agg = await tripAgg(env, boot);
   if (!agg) return { error: `Trip ${boot} not found.` };
   const [f0, f1, p0, p1, o0, o1] = await Promise.all([
     edge(env, boot, "fuel_pct", "ASC"), edge(env, boot, "fuel_pct", "DESC"),
@@ -177,8 +220,7 @@ export async function tripSummary(env: Env, tripId?: number) {
 
 export async function fuelEconomy(env: Env, days: number) {
   const since = Math.floor(Date.now() / 1000) - days * 86400;
-  const rows = await env.DB.prepare(TRIP_AGG_SQL("ts >= ?")).bind(since).all<TripAgg>();
-  const trips = rows.results.sort((a, b) => b.start_ts - a.start_ts).map((t) => shapeTrip(env, t));
+  const trips = (await tripAggsSince(env, since)).map((t) => shapeTrip(env, t));
   const miles = trips.reduce((a, t) => a + (t.distance_mi ?? 0), 0);
   const gal = trips.reduce((a, t) => a + (t.fuel_used_gal ?? 0), 0);
   return {

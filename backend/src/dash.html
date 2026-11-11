@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="strict-origin">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<title>Corvette</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --line: #e3e5ea; --text: #14171c; --muted: #6b7280;
+    --accent: #d4381f; --good: #1f9d55; --warn: #c27c0e; --bad: #d4381f;
+    --s1: #d4381f; --s2: #2563eb; --s3: #c27c0e; --track: #2563eb;
+    --shadow: 0 1px 2px rgba(0,0,0,.04), 0 1px 8px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0d10; --card: #14171c; --line: #262a31; --text: #eef0f3; --muted: #9098a4;
+      --accent: #ff5a3c; --good: #3ccf7e; --warn: #f0a92a; --bad: #ff5a3c;
+      --s1: #ff6a4d; --s2: #5b9bff; --s3: #f0a92a; --track: #5b9bff;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px 40px;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+  h1 small { display: block; font-size: 13px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+          background: var(--card); border: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 20%, transparent); }
+  .chip b { color: var(--text); font-weight: 600; }
+
+  .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 12px; }
+  @media (min-width: 620px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+  @media (min-width: 1040px) { .tiles { grid-template-columns: repeat(6, 1fr); } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+  .tile { padding: 14px 16px; min-height: 112px; display: flex; flex-direction: column; }
+  .tile .label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .tile .value { font-size: 30px; font-weight: 650; letter-spacing: -.02em; margin-top: 6px; }
+  .tile .value small { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+  .tile .sub { font-size: 13px; color: var(--muted); margin-top: auto; padding-top: 6px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; background: var(--good); border-radius: 3px; transition: width .4s; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 900px) { .grid2 { grid-template-columns: 1.15fr 1fr; } }
+  .section { padding: 14px 16px; }
+  .section h2 { font-size: 14px; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .section h2 span { font-size: 12px; color: var(--muted); font-weight: 500; }
+  #map { height: 340px; border-radius: 10px; overflow: hidden; background: var(--line); }
+  .empty { color: var(--muted); font-size: 14px; padding: 18px 4px; text-align: center; }
+
+  .trips { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow: auto; }
+  .trips li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 10px; border-radius: 10px; cursor: pointer; }
+  .trips li + li { border-top: 1px solid var(--line); }
+  .trips li:hover { background: color-mix(in srgb, var(--line) 50%, transparent); }
+  .trips li.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); border-top-color: transparent; }
+  .trips li.sel + li { border-top-color: transparent; }
+  .trips .when { font-weight: 600; font-size: 14px; }
+  .trips .meta { font-size: 13px; color: var(--muted); grid-column: 1; }
+  .trips .mpg { grid-row: 1 / span 2; grid-column: 2; align-self: center; text-align: right; font-weight: 650; font-size: 17px; }
+  .trips .mpg small { display: block; font-size: 11px; color: var(--muted); font-weight: 500; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .stat { padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--line) 45%, transparent); }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+  .stat .v { font-size: 17px; font-weight: 650; margin-top: 2px; }
+  .chart { position: relative; margin-top: 10px; }
+  .chart .ct { font-size: 12px; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+  .chart .ct b { color: var(--text); font-weight: 650; }
+  .chart svg { width: 100%; height: 110px; display: block; overflow: visible; touch-action: pan-y; }
+  .chart text { fill: var(--muted); font-size: 10px; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .econ svg { width: 100%; height: 140px; display: block; }
+  .econ text { fill: var(--muted); font-size: 10px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 8px; }
+  .row div { font-size: 13px; color: var(--muted); }
+  .row div b { display: block; font-size: 22px; color: var(--text); font-weight: 650; letter-spacing: -.01em; }
+  footer { margin-top: 18px; font-size: 12px; color: var(--muted); text-align: center; }
+  .err { color: var(--bad); }
+  .leaflet-container { font: inherit; }
+  @media (prefers-color-scheme: dark) {
+    .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9); }
+    .leaflet-control-attribution { background: rgba(20,23,28,.75) !important; color: var(--muted); }
+    .leaflet-control-attribution a { color: var(--s2); }
+    .leaflet-bar a, .leaflet-bar a:hover { background: var(--card); color: var(--text); border-bottom-color: var(--line); }
+    .leaflet-bar { border-color: var(--line) !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Corvette <small>2024 Stingray · C8</small></h1>
+    <div class="chip"><i class="dot" id="dot"></i><b id="state">Loading</b><span id="updated"></span></div>
+  </header>
+
+  <section class="tiles" id="tiles">
+    <div class="card tile"><div class="label">Fuel</div><div class="value" id="fuel">–</div>
+      <div class="bar"><i id="fuelbar" style="width:0"></i></div><div class="sub" id="fuelsub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Range</div><div class="value" id="range">–</div><div class="sub" id="rangesub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Battery</div><div class="value" id="batt">–</div><div class="sub" id="battsub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Coolant</div><div class="value" id="cool">–</div><div class="sub" id="coolsub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Fuel economy</div><div class="value" id="mpg">–</div><div class="sub" id="mpgsub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Odometer</div><div class="value" id="odo">–</div><div class="sub" id="odosub">&nbsp;</div></div>
+  </section>
+
+  <div class="grid2">
+    <div class="card section">
+      <h2>Location <span id="locsub"></span></h2>
+      <div id="map"></div>
+    </div>
+    <div class="card section">
+      <h2>Trips <span id="tripcount"></span></h2>
+      <ul class="trips" id="trips"><li class="empty" style="cursor:default">Loading…</li></ul>
+    </div>
+  </div>
+
+  <div class="card section" style="margin-top:12px" id="detail" hidden>
+    <h2 id="dtitle">Trip</h2>
+    <div class="stats" id="dstats"></div>
+    <div class="chart" id="c-speed"></div>
+    <div class="chart" id="c-rpm"></div>
+    <div class="chart" id="c-cool"></div>
+    <div class="note" id="dnote"></div>
+  </div>
+
+  <div class="card section econ" style="margin-top:12px">
+    <h2>Fuel economy <span>last 30 days</span></h2>
+    <div class="row" id="econrow"></div>
+    <div id="econchart"></div>
+  </div>
+
+  <footer id="foot">Live data from the OBDLink logger. Refreshes automatically.</footer>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const dark = matchMedia("(prefers-color-scheme: dark)");
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const KM_TO_MI = 0.621371;
+  let selected = null, lastStatus = null, map = null, tiles = null, posMarker = null, trackLayer = null;
+
+  // ---------------------------------------------------------------- formatting
+  const now = () => Date.now() / 1000;
+  function ago(ts) {
+    if (!ts) return "";
+    const s = Math.max(0, now() - ts);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+  const dayFmt = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+  const when = (ts) => dayFmt.format(new Date(ts * 1000)) + ", " + timeFmt.format(new Date(ts * 1000));
+  function dur(s) {
+    s = Math.round(s);
+    if (s < 60) return s + " s";
+    const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return h ? `${h} h ${m} min` : `${m} min`;
+  }
+  const f1 = (x) => (x == null ? "–" : (Math.round(x * 10) / 10).toLocaleString());
+  const f0 = (x) => (x == null ? "–" : Math.round(x).toLocaleString());
+  const cToF = (c) => (c == null ? null : c * 1.8 + 32);
+
+  async function get(path) {
+    const r = await fetch(path, { cache: "no-store" });
+    if (!r.ok) throw new Error(path + " " + r.status);
+    return r.json();
+  }
+
+  // ---------------------------------------------------------------- map
+  function initMap() {
+    if (!window.L || map) return;
+    map = L.map("map", { zoomControl: true, attributionControl: true }).setView([39.5, -98.35], 3);
+    setTiles();
+    dark.addEventListener("change", setTiles);
+  }
+  function setTiles() {
+    if (!map) return;
+    if (tiles) return;
+    // OpenStreetMap's standard tiles. Dark mode inverts them with a CSS filter.
+    tiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+  }
+  function showPosition(lat, lon, label) {
+    if (!map) return;
+    const ll = [lat, lon];
+    if (!posMarker) {
+      posMarker = L.circleMarker(ll, { radius: 8, color: "#fff", weight: 2, fillColor: css("--accent"), fillOpacity: 1 }).addTo(map);
+    } else posMarker.setLatLng(ll);
+    posMarker.bindTooltip(label);
+    if (!trackLayer) map.setView(ll, 15);
+  }
+  function speedColor(mph) {
+    if (mph == null) return css("--muted");
+    if (mph < 25) return "#3ccf7e";
+    if (mph < 50) return "#5b9bff";
+    if (mph < 75) return "#f0a92a";
+    return "#ff5a3c";
+  }
+  function showTrack(track) {
+    if (!map) return;
+    if (trackLayer) { map.removeLayer(trackLayer); trackLayer = null; }
+    if (!track || track.length < 2) return;
+    trackLayer = L.layerGroup().addTo(map);
+    // Group consecutive points by speed color so the line is a handful of polylines.
+    let seg = [track[0]], color = speedColor(track[0][2]);
+    const flush = () => { if (seg.length > 1) L.polyline(seg.map((p) => [p[0], p[1]]), { color, weight: 4, opacity: .9 }).addTo(trackLayer); };
+    for (let i = 1; i < track.length; i++) {
+      const c = speedColor(track[i][2]);
+      seg.push(track[i]);
+      if (c !== color) { flush(); seg = [track[i]]; color = c; }
+    }
+    flush();
+    const a = track[0], b = track[track.length - 1];
+    L.circleMarker([a[0], a[1]], { radius: 6, color: "#fff", weight: 2, fillColor: "#3ccf7e", fillOpacity: 1 }).bindTooltip("Start").addTo(trackLayer);
+    L.circleMarker([b[0], b[1]], { radius: 6, color: "#fff", weight: 2, fillColor: "#14171c", fillOpacity: 1 }).bindTooltip("End").addTo(trackLayer);
+    map.fitBounds(L.latLngBounds(track.map((p) => [p[0], p[1]])), { padding: [24, 24] });
+  }
+
+  // ---------------------------------------------------------------- status
+  function render(s) {
+    lastStatus = s;
+    const L_ = s.latest || {};
+    const v = (k) => (L_[k] ? L_[k].v : null);
+    const t = (k) => (L_[k] ? L_[k].ts : null);
+    const has = Object.keys(L_).length > 0;
+
+    const engineOn = v("engine_on") === 1 && now() - (t("engine_on") || 0) < 120;
+    $("dot").className = "dot" + (engineOn ? " on" : "");
+    $("state").textContent = !has ? "Waiting for first upload" : engineOn ? "Engine running" : "Parked";
+    $("updated").textContent = t("last_upload") ? "· updated " + ago(t("last_upload")) : "";
+
+    const fuel = v("fuel_pct");
+    $("fuel").innerHTML = fuel == null ? "–" : f0(fuel) + "<small>%</small>";
+    $("fuelbar").style.width = (fuel ?? 0) + "%";
+    $("fuelbar").style.background = fuel == null ? "" : fuel < 15 ? css("--bad") : fuel < 30 ? css("--warn") : css("--good");
+    const gal = fuel == null ? null : (fuel / 100) * s.car.tank_gal;
+    $("fuelsub").textContent = gal == null ? "No reading yet" : `${f1(gal)} of ${s.car.tank_gal} gal`;
+
+    const basis = s.mpg30 ?? s.car.epa.combined;
+    $("range").innerHTML = gal == null ? "–" : f0(gal * basis) + "<small>mi</small>";
+    $("rangesub").textContent = gal == null ? "" : s.mpg30 ? `At your ${f1(s.mpg30)} mpg average` : `At EPA ${s.car.epa.combined} mpg (no history yet)`;
+
+    const batt = v("adapter_v");
+    $("batt").innerHTML = batt == null ? "–" : f1(batt) + "<small>V</small>";
+    // The logger only runs while the car is powered, so engine-off readings are taken with the
+    // electronics drawing current. Around 12 V is normal then. A true resting voltage is never seen.
+    $("battsub").textContent = batt == null ? "" : (batt >= 13 ? "Charging" : batt >= 11.8 ? "Engine off, normal" : "Low, check battery") + " · " + ago(t("adapter_v"));
+    if (batt != null && batt < 11.8) $("batt").classList.add("err"); else $("batt").classList.remove("err");
+
+    const cool = cToF(v("coolant_c"));
+    $("cool").innerHTML = cool == null ? "–" : f0(cool) + "<small>°F</small>";
+    $("coolsub").textContent = cool == null ? "" : (engineOn ? (cool < 160 ? "Warming up" : "Normal") : "Last while running") + " · " + ago(t("coolant_c"));
+
+    $("mpg").innerHTML = s.mpg30 == null ? "–" : f1(s.mpg30) + "<small>mpg</small>";
+    $("mpgsub").textContent = `EPA ${s.car.epa.city} city / ${s.car.epa.highway} hwy`;
+
+    const odo = v("odo_km");
+    $("odo").innerHTML = odo == null ? "–" : f0(odo * KM_TO_MI) + "<small>mi</small>";
+    $("odosub").textContent = odo == null ? "Not reported yet" : ago(t("odo_km"));
+
+    const lat = v("lat"), lon = v("lon");
+    if (lat != null && lon != null) {
+      $("locsub").textContent = (engineOn ? "live · " : "parked · ") + ago(t("lat"));
+      showPosition(lat, lon, engineOn ? "Now" : "Parked here");
+    } else {
+      $("locsub").textContent = "no GPS fix yet";
+    }
+  }
+
+  async function refreshStatus() {
+    try { render(await get("api/status")); $("foot").classList.remove("err"); $("foot").textContent = "Live data from the OBDLink logger. Refreshes automatically."; }
+    catch (e) { $("foot").classList.add("err"); $("foot").textContent = "Could not reach the server. Retrying…"; }
+  }
+
+  // ---------------------------------------------------------------- trips
+  async function refreshTrips() {
+    let data;
+    try { data = await get("api/trips?limit=30"); } catch { return; }
+    const ul = $("trips");
+    $("tripcount").textContent = data.trips.length ? `${data.trips.length} recent` : "";
+    if (!data.trips.length) { ul.innerHTML = '<li class="empty" style="cursor:default">No trips yet. One appears after the engine runs with the logger connected.</li>'; return; }
+    ul.innerHTML = "";
+    for (const t of data.trips) {
+      const li = document.createElement("li");
+      li.dataset.id = t.id;
+      if (t.id === selected) li.className = "sel";
+      li.innerHTML = `<div class="when"></div><div class="meta"></div><div class="mpg"></div>`;
+      li.children[0].textContent = when(t.start_ts);
+      li.children[1].textContent = `${f1(t.miles)} mi · ${dur(t.duration_s)}` + (t.max_mph ? ` · max ${t.max_mph} mph` : "");
+      li.children[2].innerHTML = t.mpg == null ? "–<small>mpg</small>" : `${f1(t.mpg)}<small>mpg</small>`;
+      li.onclick = () => selectTrip(t.id);
+      ul.appendChild(li);
+    }
+    if (selected == null) selectTrip(data.trips[0].id);
+  }
+
+  async function selectTrip(id) {
+    selected = id;
+    for (const li of $("trips").children) li.classList.toggle("sel", li.dataset && +li.dataset.id === id);
+    let d;
+    try { d = await get("api/trip/" + id); } catch { return; }
+    const t = d.trip;
+    $("detail").hidden = false;
+    $("dtitle").textContent = when(t.start_ts);
+    const stats = [
+      ["Distance", `${f1(t.miles)} mi`], ["Duration", dur(t.duration_s)], ["Moving", dur(t.moving_s)],
+      ["Fuel used", `${t.gallons.toFixed(2)} gal`], ["MPG", t.mpg == null ? "–" : f1(t.mpg)],
+      ["Avg speed", t.avg_mph == null ? "–" : `${f0(t.avg_mph)} mph`], ["Top speed", t.max_mph == null ? "–" : `${t.max_mph} mph`],
+      ["Max RPM", f0(t.max_rpm)], ["Max coolant", t.max_coolant_f == null ? "–" : `${f0(t.max_coolant_f)} °F`],
+    ];
+    $("dstats").innerHTML = "";
+    for (const [k, v] of stats) {
+      const el = document.createElement("div");
+      el.className = "stat";
+      el.innerHTML = '<div class="k"></div><div class="v"></div>';
+      el.children[0].textContent = k; el.children[1].textContent = v;
+      $("dstats").appendChild(el);
+    }
+    current = d;
+    drawCharts();
+    $("dnote").textContent = (t.est ? "Some times in this trip are estimated (the logger had no clock yet). " : "") +
+      "Fuel used is calculated from engine airflow.";
+    showTrack(d.track);
+  }
+
+  // ---------------------------------------------------------------- charts
+  let current = null;
+  function drawCharts() {
+    if (!current) return;
+    const s = current.series;
+    lineChart($("c-speed"), "Speed", s.t, s.mph, css("--s2"), "mph", 0);
+    lineChart($("c-rpm"), "RPM", s.t, s.rpm, css("--s1"), "rpm", 0);
+    lineChart($("c-cool"), "Coolant", s.t, s.coolant_f, css("--s3"), "°F", 0);
+  }
+
+  function lineChart(el, title, xs, ys, color, unit, dec) {
+    const W = Math.max(280, el.clientWidth || 600), H = 110, padL = 34, padR = 8, padT = 8, padB = 18;
+    const pts = xs.map((x, i) => [x, ys[i]]).filter((p) => p[1] != null);
+    el.innerHTML = `<div class="ct"><span>${title}</span><b></b></div>`;
+    const readout = el.querySelector("b");
+    if (pts.length < 2) { el.insertAdjacentHTML("beforeend", '<div class="empty" style="padding:10px">No data</div>'); return; }
+    const x0 = xs[0], x1 = xs[xs.length - 1] || x0 + 1;
+    let y0 = Math.min(...pts.map((p) => p[1])), y1 = Math.max(...pts.map((p) => p[1]));
+    if (y0 === y1) { y0 -= 1; y1 += 1; }
+    const pad = (y1 - y0) * 0.08; y0 = Math.max(0, y0 - pad); y1 += pad;
+    const X = (x) => padL + ((x - x0) / (x1 - x0)) * (W - padL - padR);
+    const Y = (y) => padT + (1 - (y - y0) / (y1 - y0)) * (H - padT - padB);
+    // Break the line where data is missing.
+    let d = "", pen = false;
+    xs.forEach((x, i) => {
+      const y = ys[i];
+      if (y == null) { pen = false; return; }
+      d += (pen ? "L" : "M") + X(x).toFixed(1) + "," + Y(y).toFixed(1);
+      pen = true;
+    });
+    const fmt = (v) => (dec ? v.toFixed(dec) : Math.round(v).toLocaleString());
+    const avg = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    readout.textContent = `avg ${fmt(avg)} · max ${fmt(Math.max(...pts.map((p) => p[1])))} ${unit}`;
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.innerHTML =
+      `<line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="${css("--line")}"/>` +
+      `<line x1="${padL}" y1="${padT}" x2="${W - padR}" y2="${padT}" stroke="${css("--line")}" stroke-dasharray="3 4"/>` +
+      `<text x="${padL - 6}" y="${padT + 4}" text-anchor="end">${fmt(y1)}</text>` +
+      `<text x="${padL - 6}" y="${H - padB}" text-anchor="end">${fmt(y0)}</text>` +
+      `<text x="${padL}" y="${H - 4}">${timeFmt.format(new Date(x0 * 1000))}</text>` +
+      `<text x="${W - padR}" y="${H - 4}" text-anchor="end">${timeFmt.format(new Date(x1 * 1000))}</text>` +
+      `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` +
+      `<line class="hx" y1="${padT}" y2="${H - padB}" stroke="${css("--muted")}" stroke-width="1" opacity="0"/>` +
+      `<circle class="hd" r="4" fill="${color}" stroke="${css("--card")}" stroke-width="2" opacity="0"/>`;
+    el.appendChild(svg);
+    const hx = svg.querySelector(".hx"), hd = svg.querySelector(".hd");
+    const base = readout.textContent;
+    const move = (ev) => {
+      const r = svg.getBoundingClientRect();
+      const px = ((ev.clientX - r.left) / r.width) * W;
+      const tx = x0 + ((px - padL) / (W - padL - padR)) * (x1 - x0);
+      let best = pts[0];
+      for (const p of pts) if (Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
+      hx.setAttribute("x1", X(best[0])); hx.setAttribute("x2", X(best[0])); hx.setAttribute("opacity", ".5");
+      hd.setAttribute("cx", X(best[0])); hd.setAttribute("cy", Y(best[1])); hd.setAttribute("opacity", "1");
+      readout.textContent = `${fmt(best[1])} ${unit} at ${timeFmt.format(new Date(best[0] * 1000))}`;
+    };
+    const leave = () => { hx.setAttribute("opacity", "0"); hd.setAttribute("opacity", "0"); readout.textContent = base; };
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerdown", move);
+    svg.addEventListener("pointerleave", leave);
+  }
+
+  // ---------------------------------------------------------------- economy
+  async function refreshEconomy() {
+    let e;
+    try { e = await get("api/economy?days=30"); } catch { return; }
+    $("econrow").innerHTML = "";
+    for (const [k, v] of [["Average", e.mpg == null ? "–" : f1(e.mpg) + " mpg"], ["Distance", f1(e.miles) + " mi"],
+                          ["Fuel used", e.gallons.toFixed(1) + " gal"], ["EPA combined", e.epa.combined + " mpg"]]) {
+      const d = document.createElement("div");
+      d.innerHTML = "<b></b>"; d.firstChild.textContent = v; d.append(k);
+      $("econrow").appendChild(d);
+    }
+    const trips = e.trips.filter((t) => t.mpg != null).sort((a, b) => a.start_ts - b.start_ts);
+    const box = $("econchart");
+    if (!trips.length) { box.innerHTML = '<div class="empty">Per-trip MPG shows up here after a few drives.</div>'; return; }
+    const W = Math.max(280, box.clientWidth || 600), H = 140, padL = 30, padB = 18, padT = 8;
+    const maxY = Math.max(e.epa.highway + 4, ...trips.map((t) => t.mpg)) * 1.05;
+    const bw = Math.min(28, (W - padL) / trips.length - 4);
+    const Y = (y) => padT + (1 - y / maxY) * (H - padT - padB);
+    let svg = `<svg viewBox="0 0 ${W} ${H}">`;
+    svg += `<line x1="${padL}" y1="${Y(e.epa.combined)}" x2="${W}" y2="${Y(e.epa.combined)}" stroke="${css("--muted")}" stroke-dasharray="4 4"/>`;
+    svg += `<text x="${W}" y="${Y(e.epa.combined) - 4}" text-anchor="end">EPA ${e.epa.combined}</text>`;
+    svg += `<text x="${padL - 6}" y="${padT + 4}" text-anchor="end">${Math.round(maxY)}</text><text x="${padL - 6}" y="${H - padB}" text-anchor="end">0</text>`;
+    trips.forEach((t, i) => {
+      const x = padL + 4 + i * ((W - padL - 4) / trips.length);
+      const y = Y(t.mpg);
+      const col = t.mpg >= e.epa.combined ? css("--good") : css("--warn");
+      svg += `<rect x="${x}" y="${y}" width="${bw}" height="${H - padB - y}" rx="3" fill="${col}"><title>${when(t.start_ts)}: ${f1(t.mpg)} mpg, ${f1(t.miles)} mi</title></rect>`;
+    });
+    box.innerHTML = svg + "</svg>";
+  }
+
+  // ---------------------------------------------------------------- boot
+  initMap();
+  refreshStatus(); refreshTrips(); refreshEconomy();
+  setInterval(refreshStatus, 20000);
+  setInterval(() => { refreshTrips(); refreshEconomy(); }, 60000);
+  let rt;
+  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { drawCharts(); refreshEconomy(); }, 150); });
+  dark.addEventListener("change", () => { drawCharts(); refreshEconomy(); if (lastStatus) render(lastStatus); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });
+})();
+</script>
+</body>
+</html>

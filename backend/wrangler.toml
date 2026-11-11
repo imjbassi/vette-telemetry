@@ -2,6 +2,12 @@ name = "vette-telemetry"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 
+# Bundle the dashboard page as a string.
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = true
+
 [vars]
 # IANA zone used for human-readable times in tool output.
 LOCAL_TZ = "America/Los_Angeles"
@@ -11,6 +17,7 @@ binding = "DB"
 database_name = "vette"
 database_id = "REPLACE_AFTER_wrangler_d1_create"
 
-# Secrets (wrangler secret put NAME, or .dev.vars locally):
+# Secrets (wrangler secret put NAME, or .dev.vars locally). npm run setup generates all three.
 #   DEVICE_TOKEN  bearer token the ESP32 sends on /ingest
 #   MCP_SECRET    random path segment, the connector URL is https://<host>/mcp/<MCP_SECRET>
+#   DASH_SECRET   random path segment, the dashboard URL is https://<host>/dash/<DASH_SECRET>/

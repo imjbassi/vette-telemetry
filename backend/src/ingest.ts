@@ -4,6 +4,7 @@ export interface Env {
   DB: D1Database;
   DEVICE_TOKEN: string;
   MCP_SECRET: string;
+  DASH_SECRET: string;
   LOCAL_TZ: string;
 }
 
