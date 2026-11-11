@@ -1,6 +1,7 @@
 #include "obd_ble.h"
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <nvs.h>
 #include "config.h"
 
 namespace obd {
@@ -29,9 +30,32 @@ static void onNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, boo
 // OBDLink CX: link is always encrypted, bonding is only accepted during the first
 // 5 minutes after the adapter powers on, legacy pairing PIN is 123456.
 static const uint32_t kLegacyPin = 123456;
-static const uint8_t kBondVersion = 2;  // bump to force a one-time bond wipe
+static const uint8_t kBondVersion = 3;  // bump to force a one-time pairing wipe
+static const uint8_t kMaxHeals = 3;     // wipe-and-reboot attempts before giving up
+static uint8_t s_heals = 0;
 
 void disconnect();
+
+// NimBLE keeps bonds and its host-privacy "peer device records" in the nimble_bond NVS
+// namespace. NimBLEDevice::deleteAllBonds() leaves the peer records behind, and a record
+// with a zero identity address makes every scan report the adapter as 00:00:00:00:00:00.
+// Erasing the namespace is the only complete reset. RAM copies survive until reboot.
+static bool wipeBleStore() {
+  nvs_handle_t h;
+  if (nvs_open("nimble_bond", NVS_READWRITE, &h) != ESP_OK) return false;
+  esp_err_t e = nvs_erase_all(h);
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+static void setHeals(uint8_t n) {
+  s_heals = n;
+  Preferences p;
+  p.begin("vette", false);
+  p.putUChar("healn", n);
+  p.end();
+}
 
 class ClientCb : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient*) override { s_connected = true; }
@@ -57,6 +81,19 @@ static ClientCb s_cb;
 
 bool begin() {
   s_prompt = xSemaphoreCreateBinary();
+
+  // Pairings made by earlier firmware carry a bad identity record. Erase them once,
+  // before the stack loads them into RAM.
+  Preferences p;
+  p.begin("vette", false);
+  s_heals = p.getUChar("healn", 0);
+  if (p.getUChar("bondv", 0) != kBondVersion) {
+    Serial.printf("[ble] erasing stored pairings: %s\n", wipeBleStore() ? "ok" : "nothing stored");
+    Serial.println("[ble] the CX must pair again, which it only allows for 5 min after it is plugged in");
+    p.putUChar("bondv", kBondVersion);
+  }
+  p.end();
+
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   // Bond, no MITM requirement, LE secure connections when the peer supports it.
@@ -68,23 +105,15 @@ bool begin() {
   // storing it makes later scans report the adapter as 00:00:00:00:00:00.
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
-
-  // Bonds made by earlier firmware carry that bad identity. Drop them once.
-  Preferences p;
-  p.begin("vette", false);
-  if (p.getUChar("bondv", 0) != kBondVersion) {
-    Serial.println("[ble] clearing old bonds (pair again within 5 min of plugging in the CX)");
-    NimBLEDevice::deleteAllBonds();
-    p.putUChar("bondv", kBondVersion);
-  }
-  p.end();
   return true;
 }
 
 void forgetBonds() {
   disconnect();
-  NimBLEDevice::deleteAllBonds();
-  Serial.println("[ble] bonds deleted. Replug the CX, then it will pair again.");
+  wipeBleStore();
+  Serial.println("[ble] pairings erased, rebooting. Replug the CX so it accepts a new pairing.");
+  delay(200);
+  ESP.restart();
 }
 
 bool connected() { return s_connected && s_client && s_client->isConnected(); }
@@ -162,10 +191,18 @@ bool connect(uint32_t scanSeconds) {
 
   // Self-heal: a null address means a stored bond has a bad identity for this adapter.
   if (target->getAddress().toString() == "00:00:00:00:00:00") {
-    Serial.println("[ble] adapter resolved to a null address, deleting bonds and rescanning");
     scan->clearResults();
-    NimBLEDevice::deleteAllBonds();
-    return false;
+    if (s_heals >= kMaxHeals) {
+      Serial.println("[ble] adapter still shows a null address after erasing pairings.");
+      Serial.println("      Run: pio run -e atoms3 -t erase   then flash again.");
+      return false;
+    }
+    Serial.printf("[ble] adapter resolved to a null address, erasing pairings and rebooting (%u/%u)\n",
+                  s_heals + 1, kMaxHeals);
+    setHeals(s_heals + 1);
+    wipeBleStore();
+    delay(200);
+    ESP.restart();
   }
 
   if (!s_client) {
@@ -189,6 +226,7 @@ bool connect(uint32_t scanSeconds) {
     disconnect();
     return false;
   }
+  if (s_heals) setHeals(0);
 
   dumpGatt(s_client);
   if (!pickChars(s_client)) { Serial.println("[ble] no usable chars"); disconnect(); return false; }
