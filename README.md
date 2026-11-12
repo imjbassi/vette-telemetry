@@ -48,6 +48,8 @@ cd firmware
 pio run -e atoms3-bench -t upload -t monitor
 ```
 
+Without an AtomS3, run the same script on the car board at the desk with `pio run -e sim7670g-bench -t upload -t monitor`. It never touches the modem or Bluetooth, so the CX pairing stays, and it keeps its records in `/qbench`, so the car's unsent queue in `/q` stays too. It does count up the boot counter. Take the board out of the car, power it from the laptop, and keep the CX away or unplugged. When the bench passes, flash `sim7670g` onto the same board (step 4 below), then put it back in the car. Save the running image (step 3) before the bench flash, not after.
+
 Every host test must pass first. Leave the bench running for at least 45 minutes. Drain 3 comes about 42 minutes in. It is the only drain with large uploads refused, so it is the only one that runs the fallback to small uploads. The run passes when the monitor shows all of these:
 
 - `[bench] drain 1 PASS`, `[bench] drain 2 PASS` and `[bench] drain 3 PASS`
