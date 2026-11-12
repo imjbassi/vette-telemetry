@@ -12,6 +12,11 @@ fallthrough = true
 # IANA zone used for human-readable times in tool output.
 LOCAL_TZ = "America/Los_Angeles"
 
+# Keep Worker logs. A failed upload or tool call is logged with console.error, and without
+# this nothing is stored to look at afterwards. Read them in the Cloudflare dashboard.
+[observability]
+enabled = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "vette"

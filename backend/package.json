@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "setup": "node scripts/setup.mjs",
-    "deploy": "wrangler deploy --config wrangler.local.toml",
+    "deploy": "node scripts/deploy.mjs",
     "db:init:local": "wrangler d1 execute vette --local --file=schema.sql",
     "db:init:remote": "wrangler d1 execute vette --remote --file=schema.sql --config wrangler.local.toml",
+    "db:backup": "node scripts/db-backup.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "check:dash": "node scripts/check-dash.mjs",
     "fake": "node scripts/fake-device.mjs"
   },
   "devDependencies": {
