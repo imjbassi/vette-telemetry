@@ -77,6 +77,12 @@ node scripts/fake-device.mjs            # simulated 20 min drive, incl. no-clock
 node scripts/mcp-smoke.mjs              # calls every MCP tool
 ```
 
+### Database cost (D1 free tier)
+
+D1 bills every row a query scans, and the free plan allows 5 million rows read and 100,000 written per day. Raw readings live in `samples` (one per second while driving), but nothing that refreshes reads them in bulk. Each upload folds its readings into three rollups (`src/rollup.ts`): `trips` (one row per session), `minutes` (per-minute aggregates) and `track` (a GPS point every 15 s). The dashboard and Claude tools read those, so a 30-day trips lookup reads about 7 rows instead of about 15,000. Raw readings are only read for one trip's detail or CSV, the newest 200 in Logs, live updates newer than what the page already has, and History windows of an hour or less.
+
+The page polls no faster than the logger uploads (15 s while driving, 60 s parked), stops while hidden, and pauses after 15 minutes without interaction. If the rollups ever need rebuilding (after a manual data fix), run `migrations/backfill-rollups.sql`. It is idempotent.
+
 ### Dashboard
 
 Open the URL in `backend/.secrets/dashboard-url.txt` on any device: `https://<worker-host>/dash/<DASH_SECRET>/`. Like the connector, the secret path is the auth, so treat it like a password. On a phone, "Add to Home Screen" makes it behave like an app.

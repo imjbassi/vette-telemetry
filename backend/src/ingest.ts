@@ -1,4 +1,5 @@
 import { decode, Sample } from "./record";
+import { emptyTrip, fold, MINUTE_UPSERT_SQL, Stamped, TRIP_UPSERT_SQL, tripParams, TripRow } from "./rollup";
 
 export interface Env {
   DB: D1Database;
@@ -69,8 +70,11 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
   );
   const latestPatch: Latest = {};
   const put = (k: string, e: LatestEntry) => { if (newer(e, latestPatch[k])) latestPatch[k] = e; };
+  const byBoot = new Map<number, Stamped[]>();
   for (const s of samples) {
     const { ts, est } = tsOf(s);
+    if (!byBoot.has(s.boot)) byBoot.set(s.boot, []);
+    byBoot.get(s.boot)!.push({ s, ts, est });
     stmts.push(ins.bind(s.boot, s.ms, ts, est ? 1 : 0, s.lat, s.lon, s.sats, s.rpm, s.speed_kph, s.coolant_c,
       s.intake_c, s.maf_gs, s.throttle_pct, s.fuel_pct, s.adapter_v, s.ecu_v, s.odo_km, s.csq, s.flags));
     const at = { ts, boot: s.boot, ms: s.ms, ...(est ? { est } : {}) };
@@ -85,13 +89,37 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
     }
     put("engine_on", { v: s.flags & 1 ? 1 : 0, ...at });
   }
+  // Fold this upload into the rollups. One read of the affected trip rows, then upserts.
+  if (byBoot.size) {
+    const ids = [...byBoot.keys()];
+    const rows = await env.DB.prepare(`SELECT * FROM trips WHERE boot IN (${ids.map(() => "?").join(",")})`)
+      .bind(...ids).all<TripRow>();
+    const trips = new Map(rows.results.map((r) => [r.boot, r]));
+    const upMinute = env.DB.prepare(MINUTE_UPSERT_SQL);
+    const upTrip = env.DB.prepare(TRIP_UPSERT_SQL);
+    const insTrack = env.DB.prepare(`INSERT OR REPLACE INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)`);
+    for (const [boot, items] of byBoot) {
+      const r = fold(trips.get(boot) ?? emptyTrip(boot), items);
+      stmts.push(upTrip.bind(...tripParams(r.trip)));
+      for (const p of r.minuteParams) stmts.push(upMinute.bind(...p));
+      for (const p of r.track) stmts.push(insTrack.bind(...p));
+    }
+  }
   for (const [boot, base] of learned) {
     stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO boots (boot, epoch_base) VALUES (?, ?)`).bind(boot, base));
-    // Earlier uploads from this boot were stored with estimated times. Fix them.
+    // Earlier uploads from this boot were stored with estimated times. Fix them, and the
+    // trip's start/end and route times with them. Minute buckets keep their estimated slot,
+    // which is off by at most one upload interval.
     stmts.push(env.DB.prepare(`UPDATE samples SET ts = ? + ms / 1000, ts_est = 0 WHERE boot = ? AND ts_est = 1`).bind(base, boot));
+    stmts.push(env.DB.prepare(`UPDATE track SET ts = ? + ms / 1000 WHERE boot = ?`).bind(base, boot));
+    stmts.push(env.DB.prepare(
+      `UPDATE trips SET start_ts = (SELECT MIN(ts) FROM samples WHERE boot = ?1),
+                        end_ts = (SELECT MAX(ts) FROM samples WHERE boot = ?1), est = 0 WHERE boot = ?1`,
+    ).bind(boot));
   }
   stmts.push(env.DB.prepare(`INSERT INTO ingests (received_at, bytes, records, rejected) VALUES (?,?,?,?)`)
     .bind(now, buf.byteLength, samples.length, rejected));
+  stmts.push(env.DB.prepare(`DELETE FROM ingests WHERE received_at < ?`).bind(now - 30 * 86400));
 
   // D1 batches run as a single transaction.
   for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));

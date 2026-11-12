@@ -455,8 +455,18 @@
   }
   async function get(path) {
     const r = await fetch(path, { cache: "no-store" });
-    if (!r.ok) throw new Error(`${path} ${r.status}`);
+    if (!r.ok) {
+      let msg = `${path} ${r.status}`;
+      try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+      setFoot(msg, true);
+      throw new Error(msg);
+    }
     return r.json();
+  }
+  function setFoot(msg, bad) {
+    const f = $("foot");
+    f.textContent = msg || "Live data from the OBDLink logger.";
+    f.style.color = bad ? "var(--red)" : "";
   }
   const L_ = () => (S.status && S.status.latest) || {};
   const lv = (k) => (L_()[k] ? L_()[k].v : null);
@@ -589,8 +599,8 @@
 
   // ---------------------------------------------------------------- status (header + overview)
   async function loadStatus() {
-    try { S.status = await get("api/status"); $("foot").textContent = "Live data from the OBDLink logger."; $("foot").style.color = ""; }
-    catch { $("foot").textContent = "Could not reach the server. Retrying…"; $("foot").style.color = "var(--red)"; return; }
+    try { S.status = await get("api/status"); setFoot(); }
+    catch { return; }
     renderHeader();
     if (S.view === "overview") renderOverview();
   }
@@ -667,12 +677,17 @@
     }
     $("o-trips-chip").textContent = `${d.trips.length} total`;
     $("t-count").textContent = `${d.trips.length} trips`;
-    if (d.trips.length) loadLastDrive(d.trips[0].id);
+    // Refetch the overview chart only when the newest trip actually changed.
+    if (d.trips.length) {
+      const t0 = d.trips[0], key = `${t0.id}:${t0.end_ts}`;
+      if (key !== S.lastDriveKey) { S.lastDriveKey = key; loadLastDrive(t0.id); }
+    }
     if (S.view === "trips" && S.selected != null && (!S.tripData || S.tripData.trip.id !== S.selected)) loadTrip(S.selected);
   }
 
   async function loadLastDrive(id) {
-    let d; try { d = await get("api/trip/" + id); } catch { return; }
+    // Per-minute series from the rollup: a few dozen rows instead of every reading.
+    let d; try { d = await get(`api/trip/${id}?res=minute`); } catch { return; }
     S.lastDrive = d;
     $("o-drive-sub").textContent = `${when(d.trip.start_ts)} · ${f1(d.trip.miles)} mi · ${dur(d.trip.duration_s)}`;
     $("o-drive-chip").textContent = d.trip.max_mph ? `top ${d.trip.max_mph} mph` : "parked";
@@ -779,8 +794,21 @@
     chart($("l-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, min: 0, empty: "No recent throttle data" });
     chart($("l-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, ref: 220, refColor: "#ef4444", empty: "No recent coolant data" });
   }
+  // Ask only for readings newer than the ones already on screen, then trim to the window.
   async function loadLive() {
-    try { S.live = await get("api/live?minutes=10"); } catch { return; }
+    const prev = S.live;
+    const q = prev && prev.boot != null && prev.last_ms != null ? `&boot=${prev.boot}&since=${prev.last_ms}` : "";
+    let d; try { d = await get("api/live?minutes=10" + q); } catch { return; }
+    if (d.incremental && prev && prev.series && d.series) {
+      for (const k of Object.keys(d.series)) prev.series[k] = prev.series[k].concat(d.series[k]);
+      const t = prev.series.t, cut = (t.length ? t[t.length - 1] : 0) - d.window_s;
+      let i = 0; while (i < t.length && t[i] < cut) i++;
+      if (i) for (const k of Object.keys(prev.series)) prev.series[k] = prev.series[k].slice(i);
+      prev.last_ms = d.last_ms ?? prev.last_ms; prev.latest = d.latest; prev.now = d.now;
+      S.live = prev;
+    } else {
+      S.live = d;
+    }
     S.status = S.status || { latest: S.live.latest };
     if (S.status) S.status.latest = S.live.latest;
     renderHeader();
@@ -796,7 +824,7 @@
   async function loadLogs() {
     let d; try { d = await get("api/logs?limit=200"); } catch { return; }
     S.status = S.status || {}; S.status.latest = d.latest; renderHeader();
-    const L = d.latest, h = d.stats.hour || {}, day = d.stats.day || {};
+    const L = d.latest, h = d.stats.hour || {};
     const lastUp = L.last_upload ? L.last_upload.ts : null;
     const fresh = lastUp && now() - lastUp < 120;
     const cards = [
@@ -808,7 +836,8 @@
     $("g-health").innerHTML = cards.map(([ic, col, lab, v, sub, cls]) =>
       `<div class="card kpi"><div class="lab"><span class="ico"><svg style="color:${col}"><use href="#${ic}"/></svg></span>${lab}</div><div class="val ${cls}">${v}</div><div class="delta">${esc(sub)}</div></div>`).join("");
 
-    $("g-up-chip").textContent = `${f0(day.uploads)} today · ${f1((day.bytes || 0) / 1024)} KB` + (day.rejected ? ` · ${day.rejected} rejected` : "");
+    const shown = d.ingests.reduce((a, r) => ({ kb: a.kb + r.bytes / 1024, rej: a.rej + r.rejected }), { kb: 0, rej: 0 });
+    $("g-up-chip").textContent = `last ${d.ingests.length} · ${f1(shown.kb)} KB` + (shown.rej ? ` · ${shown.rej} rejected` : "");
     $("g-uploads").innerHTML = `<tr><th>Received</th><th class="num">Readings</th><th class="num">Bytes</th><th>Result</th><th class="num">Gap</th></tr>` +
       d.ingests.map((r, i) => {
         const gap = i + 1 < d.ingests.length ? r.received_at - d.ingests[i + 1].received_at : null;
@@ -1032,27 +1061,43 @@
   document.querySelectorAll("[data-view]").forEach((b) => (b.onclick = () => go(b.dataset.view)));
   addEventListener("hashchange", () => show(location.hash.slice(1)));
 
-  // Poll fast only when it matters: the engine is running and the tab is visible.
-  let timer = null;
+  // Polling. Every request costs database reads (the free plan allows 5 million rows a day),
+  // so poll no faster than the logger uploads (every 15 s), slow down while parked, stop while
+  // the tab is hidden, and pause entirely after 15 minutes without any interaction.
+  const IDLE_PAUSE_MS = 15 * 60 * 1000;
+  let timer = null, lastInput = Date.now(), paused = false;
   function schedule() {
     clearTimeout(timer);
-    if (document.hidden) return;
+    if (document.hidden || paused) return;
     const on = engineOn();
-    const ms = S.view === "live" ? (on ? 4000 : 20000) : S.view === "logs" ? (on ? 8000 : 30000) : on ? 8000 : 30000;
+    const ms = S.view === "live" ? (on ? 15000 : 60000) : S.view === "logs" ? (on ? 30000 : 120000) : on ? 20000 : 60000;
     timer = setTimeout(tick, ms);
   }
   let n = 0;
   async function tick() {
+    if (Date.now() - lastInput > IDLE_PAUSE_MS) {
+      paused = true;
+      setFoot("Paused to save database reads. Tap anywhere to resume.");
+      return;
+    }
     n++;
     if (S.view === "live") await loadLive();
     else if (S.view === "logs") await loadLogs();
     else await loadStatus();
-    // Ranges that end now keep moving with the clock. Fixed past ranges never change.
-    if (S.view === "history" && S.hist.preset && S.hist.preset !== "yesterday" && n % 4 === 0) setRange(S.hist.preset);
-    if (n % 6 === 0 || (engineOn() && n % 3 === 0)) { loadTrips(); loadEcon(); }
+    // Short ranges that end now move with the clock. Long and past ranges only reload on demand.
+    if (S.view === "history" && (S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) setRange(S.hist.preset);
+    if (n % 6 === 0) { loadTrips(); loadEcon(); }
     schedule();
   }
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); else clearTimeout(timer); });
+  function wake() {
+    lastInput = Date.now();
+    if (paused) { paused = false; setFoot(); tick(); }
+  }
+  ["pointerdown", "keydown", "wheel", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { clearTimeout(timer); return; }
+    lastInput = Date.now(); paused = false; tick();
+  });
   let rt;
   addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (S.view === "overview") drawOverviewCharts(); if (S.view === "trips") drawTripCharts(); if (S.view === "live") renderLive(); if (S.view === "history") renderHistory(); }, 150); });
 

@@ -35,7 +35,15 @@ export default {
       const secret = cut < 0 ? after : after.slice(0, cut);
       const rest = cut < 0 ? "" : after.slice(cut);
       if (!env.DASH_SECRET || !safeEqual(secret, env.DASH_SECRET)) return new Response("not found", { status: 404 });
-      return handleDash(req, env, rest, `/dash/${secret}`);
+      try {
+        return await handleDash(req, env, rest, `/dash/${secret}`);
+      } catch (e) {
+        // Surface database errors (for example the daily D1 read limit) to the page.
+        const msg = (e as Error).message || "error";
+        const limit = /limit|exceeded|too many/i.test(msg);
+        return Response.json({ error: limit ? "Database read limit reached for today. It resets at midnight UTC." : msg },
+          { status: 503, headers: { "Cache-Control": "no-store" } });
+      }
     }
 
     if (url.pathname === "/health") return Response.json({ ok: true });

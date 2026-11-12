@@ -5,7 +5,6 @@ const G_PER_GAL = 2798.7;
 const TANK_GAL = 18.5; // C8 Stingray
 const EPA_COMBINED_MPG = 19; // 2024 Stingray coupe, fallback when no history
 const KM_TO_MI = 0.621371;
-const MAX_GAP_MS = 5000; // gaps longer than this (quiet mode, BLE drops) are not integrated
 
 const r1 = (x: number | null | undefined) => (x == null || !isFinite(x) ? null : Math.round(x * 10) / 10);
 const r2 = (x: number | null | undefined) => (x == null || !isFinite(x) ? null : Math.round(x * 100) / 100);
@@ -119,60 +118,49 @@ export function tripNumbers(t: TripAgg): TripNums {
   };
 }
 
+// All trip reads go through the `trips` rollup (one row per session, maintained on upload),
+// never a scan of `samples`. D1 bills every row scanned. A trip is a session with the engine on.
+const TRIP_COLS = `boot, start_ts, end_ts, km, maf_g, engine_s, moving_s, max_kph, max_rpm, max_coolant,
+  CASE WHEN rpm_n > 0 THEN rpm_sum / rpm_n END AS avg_rpm, est`;
+
 export async function recentTripAggs(env: Env, limit: number): Promise<TripAgg[]> {
-  // Cheap pass to find recent boots, then aggregate just those.
-  const boots = await env.DB.prepare(
-    `SELECT boot FROM samples GROUP BY boot HAVING SUM(flags & 1) > 0 ORDER BY MAX(ts) DESC LIMIT ?`,
-  ).bind(limit).all<{ boot: number }>();
-  const ids = boots.results.map((b) => b.boot);
-  if (!ids.length) return [];
-  const rows = await env.DB.prepare(TRIP_AGG_SQL(`boot IN (${ids.map(() => "?").join(",")})`))
-    .bind(...ids).all<TripAgg>();
+  const rows = await env.DB.prepare(
+    `SELECT ${TRIP_COLS} FROM trips WHERE engine_n > 0 ORDER BY end_ts DESC LIMIT ?`,
+  ).bind(limit).all<TripAgg>();
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
 }
 
+// Whole trips that were active at some point since `since`.
 export async function tripAggsSince(env: Env, since: number): Promise<TripAgg[]> {
-  const rows = await env.DB.prepare(TRIP_AGG_SQL("ts >= ?")).bind(since).all<TripAgg>();
+  const rows = await env.DB.prepare(`SELECT ${TRIP_COLS} FROM trips WHERE engine_n > 0 AND end_ts >= ?`)
+    .bind(since).all<TripAgg>();
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
 }
 
-// Aggregates clipped to [from, to]: distance, fuel and time only count samples inside it.
+// Per-trip aggregates clipped to [from, to] at one-minute resolution, from `minutes`.
 export async function tripAggsBetween(env: Env, from: number, to: number): Promise<TripAgg[]> {
-  const rows = await env.DB.prepare(TRIP_AGG_SQL("ts BETWEEN ? AND ?")).bind(from, to).all<TripAgg>();
+  const rows = await env.DB.prepare(
+    `SELECT boot, MIN(t) AS start_ts, MAX(t) + 59 AS end_ts, SUM(km) AS km, SUM(maf_g) AS maf_g,
+            SUM(engine_s) AS engine_s, SUM(moving_s) AS moving_s, MAX(spd_max) AS max_kph, MAX(rpm_max) AS max_rpm,
+            MAX(cool_max) AS max_coolant, CASE WHEN SUM(rpm_n) > 0 THEN SUM(rpm_sum) / SUM(rpm_n) END AS avg_rpm, 0 AS est
+     FROM minutes WHERE t BETWEEN ? AND ? GROUP BY boot HAVING SUM(engine_n) > 0`,
+  ).bind(Math.floor(from / 60) * 60, to).all<TripAgg>();
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
 }
 
-// Whole trips (not clipped) that have any sample in [from, to].
+// Whole trips (not clipped) that overlap [from, to].
 export async function tripAggsTouching(env: Env, from: number, to: number): Promise<TripAgg[]> {
-  const boots = await env.DB.prepare(`SELECT DISTINCT boot FROM samples WHERE ts BETWEEN ? AND ?`)
-    .bind(from, to).all<{ boot: number }>();
-  const ids = boots.results.map((b) => b.boot);
-  if (!ids.length) return [];
-  const rows = await env.DB.prepare(TRIP_AGG_SQL(`boot IN (${ids.map(() => "?").join(",")})`))
-    .bind(...ids).all<TripAgg>();
+  const rows = await env.DB.prepare(
+    `SELECT ${TRIP_COLS} FROM trips WHERE engine_n > 0 AND end_ts >= ? AND start_ts <= ?`,
+  ).bind(from, to).all<TripAgg>();
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
 }
 
 export async function tripAgg(env: Env, boot: number): Promise<TripAgg | null> {
-  return env.DB.prepare(TRIP_AGG_SQL("boot = ?")).bind(boot).first<TripAgg>();
+  return env.DB.prepare(`SELECT ${TRIP_COLS} FROM trips WHERE boot = ? AND engine_n > 0`).bind(boot).first<TripAgg>();
 }
 
 export const CAR = { TANK_GAL, EPA: { city: 16, highway: 24, combined: EPA_COMBINED_MPG }, KM_TO_MI };
-
-const TRIP_AGG_SQL = (where: string) => `
-  WITH s AS (
-    SELECT boot, ms, ts, ts_est, speed_kph, maf_gs, rpm, coolant_c, flags,
-           ms - LAG(ms) OVER (PARTITION BY boot ORDER BY ms) AS dms
-    FROM samples WHERE ${where}
-  )
-  SELECT boot, MIN(ts) AS start_ts, MAX(ts) AS end_ts,
-    SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} THEN speed_kph * dms / 3600000.0 END) AS km,
-    SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} THEN maf_gs * dms / 1000.0 END) AS maf_g,
-    SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} AND (flags & 1) THEN dms END) / 1000.0 AS engine_s,
-    SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} AND speed_kph > 0 THEN dms END) / 1000.0 AS moving_s,
-    MAX(speed_kph) AS max_kph, MAX(rpm) AS max_rpm, MAX(coolant_c) AS max_coolant,
-    AVG(CASE WHEN rpm > 0 THEN rpm END) AS avg_rpm, MAX(ts_est) AS est
-  FROM s GROUP BY boot HAVING SUM(flags & 1) > 0`;
 
 function shapeTrip(env: Env, t: TripAgg) {
   const n = tripNumbers(t);
@@ -209,7 +197,7 @@ export async function tripSummary(env: Env, tripId?: number) {
   let boot = tripId;
   if (boot == null) {
     const last = await env.DB.prepare(
-      `SELECT boot FROM samples GROUP BY boot HAVING SUM(flags & 1) > 0 ORDER BY MAX(ts) DESC LIMIT 1`,
+      `SELECT boot FROM trips WHERE engine_n > 0 ORDER BY end_ts DESC LIMIT 1`,
     ).first<{ boot: number }>();
     if (!last) return { error: "No trips recorded yet." };
     boot = last.boot;
