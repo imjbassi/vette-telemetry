@@ -9,7 +9,7 @@ import {
   batteryContext, CAR, carState, clampInt, dateOfDay, dayExpr, dayStart, fmtTime, fuelEconomy, history, latestBattery,
   latestStatus, listTrips, liveBoot, localDay, location, mpg30, MPG30_MIN_MILES, offsetSpans, parseDay, parseTripId,
   resolveWindow, sameRecord, STATE_RULES, tripAgg, tripBefore, tripLabel, tripNumbers, tripNumbersList,
-  tripNumbersWithGaps, tripSummary, tzOffset, unloggedMiles, unloggedTotal,
+  tripNumbersWithGaps, tripSummary, tzOffset, unloggedMiles, unloggedTotal, routeKm, withGpsMiles,
 } from "../src/queries.ts";
 import { makeEnv } from "./helpers/d1.mjs";
 
@@ -336,7 +336,7 @@ test("tripNumbers: every field of the dashboard shape", () => {
   assert.deepEqual(tripNumbers(agg()), {
     id: 12, start_ts: NOW - 3600, end_ts: NOW - 1800, duration_s: 1800, engine_s: 1500, moving_s: 1200,
     miles: 10, gallons: 0.5, mpg: 20, avg_mph: 30, max_mph: 70, max_rpm: 5200, avg_rpm: 1850, max_coolant_f: 204.8,
-    est: false, odo_miles: 10.1, unlogged_before_mi: null, unlogged_known: false, fw: 2, nolink_n: 3,
+    est: false, odo_miles: 10.1, unlogged_before_mi: null, unlogged_known: false, fw: 2, nolink_n: 3, gps_miles: null,
   });
 });
 
@@ -1207,4 +1207,51 @@ test("get_location: coordinates with the shared state", async () => {
     assert.deepEqual([l.car_state.state, l.parked], [state, parked]);
     assert.deepEqual(l.car_state, s.car_state);
   }
+});
+
+// ------------------------------------------------------------ distance from GPS
+
+// A drive north along a meridian at about 20 m/s, one route point every 15 s.
+const northRoute = (n, startMs = 0, mps = 20) =>
+  Array.from({ length: n }, (_, i) => ({ ms: startMs + i * 15000, lat: 37.8199 + (i * 15 * mps) / 110574, lon: -122.4783 }));
+
+test("routeKm: counts driving, skips standing drift, jumps and gaps", () => {
+  // 40 steps of 300 m.
+  assert.ok(Math.abs(routeKm(northRoute(41)) - 12) < 0.01);
+  // Standing: a few metres of drift per step is not distance.
+  const still = Array.from({ length: 200 }, (_, i) => ({ ms: i * 15000, lat: 37.8199 + (i % 2) * 0.00003, lon: -122.4783 }));
+  assert.equal(routeKm(still), 0);
+  // A jump faster than 70 m/s and a gap over 60 s count nothing.
+  assert.equal(routeKm([{ ms: 0, lat: 37.8199, lon: -122.4783 }, { ms: 15000, lat: 37.84, lon: -122.4783 }]), 0);
+  assert.equal(routeKm([{ ms: 0, lat: 37.8199, lon: -122.4783 }, { ms: 120000, lat: 37.83, lon: -122.4783 }]), 0);
+});
+
+test("withGpsMiles: a drive without speed readings gets its GPS distance, a normal one is untouched", async () => {
+  const e = makeEnv();
+  const start = utc(2026, 11, 12, 16);
+  addSession(e, { boot: 13, start, minutes: 16, engine: true });
+  addSession(e, { boot: 14, start: start + 3600, minutes: 10, engine: true });
+  // Session 13 lost its speed readings: no distance in its trip row, but a route.
+  e.DB.sqlite.prepare("UPDATE trips SET km = 0 WHERE boot = 13").run();
+  const ins = e.DB.sqlite.prepare("INSERT INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)");
+  for (const p of northRoute(41)) ins.run(13, p.ms, start + p.ms / 1000, p.lat, p.lon, null);
+  for (const p of northRoute(41)) ins.run(14, p.ms, start + 3600 + p.ms / 1000, p.lat, p.lon, 45);
+
+  const aggs = [await tripAgg(e, 13), await tripAgg(e, 14)];
+  const [a, b] = await withGpsMiles(e, tripNumbersList(aggs));
+  assert.equal(a.miles, 0);
+  assert.equal(a.gps_miles, 7.5); // 12 km
+  assert.equal(b.gps_miles, null, "a trip with speed readings keeps its logged distance");
+
+  // Only the trip that needs it reads route points.
+  const before = e.DB.statements.length;
+  await withGpsMiles(e, tripNumbersList([aggs[1]]));
+  assert.equal(e.DB.statements.length, before, "no query when every trip has its distance");
+
+  // The tools carry the figure with a note.
+  const list = await listTrips(e, { limit: 5 }, start + 7200);
+  const t13 = list.trips.find((t) => t.trip_id === 13);
+  assert.equal(t13.gps_distance_mi, 7.5);
+  assert.match(t13.distance_note, /GPS route/);
+  assert.equal(list.trips.find((t) => t.trip_id === 14).gps_distance_mi, undefined);
 });

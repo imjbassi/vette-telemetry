@@ -3,7 +3,7 @@ import page from "./dash.html";
 import { Env, getLatest, Latest } from "./ingest";
 import {
   CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, recentTripAggs, STATE_RULES, tripAgg, tripAggsBetween,
-  tripAggsSince, tripAggsTouching, tripLabel, tripNumbers, tripNumbersList, tripNumbersWithGaps, unloggedTotal,
+  tripAggsSince, tripAggsTouching, tripLabel, tripNumbers, tripNumbersList, tripNumbersWithGaps, unloggedTotal, withGpsMiles,
 } from "./queries";
 
 const json = (data: unknown, status = 200) =>
@@ -82,7 +82,7 @@ async function trips(env: Env, limit: number) {
   // One row more than asked for: it tells whether older trips exist, and it is the
   // predecessor that the last listed trip needs for its unlogged miles.
   const aggs = await recentTripAggs(env, limit + 1);
-  return { trips: tripNumbersList(aggs).slice(0, limit), limit, more: aggs.length > limit };
+  return { trips: await withGpsMiles(env, tripNumbersList(aggs).slice(0, limit)), limit, more: aggs.length > limit };
 }
 
 interface Row {
@@ -116,7 +116,7 @@ async function trip(env: Env, id: number, coarse = false) {
   }
   // One extra indexed row, the trip before this one, gives the unlogged miles.
   const [[nums], all] = await Promise.all([
-    tripNumbersWithGaps(env, [agg]),
+    tripNumbersWithGaps(env, [agg]).then((n) => withGpsMiles(env, n)),
     env.DB.prepare(
       `SELECT ms, ts, lat, lon, speed_kph, rpm, coolant_c, fuel_pct, throttle_pct, adapter_v
        FROM samples WHERE boot = ? ORDER BY ms`,
@@ -286,7 +286,7 @@ async function history(env: Env, from: number, to: number) {
   const miles = sum("miles"), gallons = sum("gallons");
 
   // Whole trips with their odometer figures. One extra indexed row gives the oldest its predecessor.
-  const whole = await tripNumbersWithGaps(env, touching);
+  const whole = await withGpsMiles(env, await tripNumbersWithGaps(env, touching));
   const startedInside = whole.filter((t) => t.start_ts >= from && t.start_ts <= to);
 
   const mph = (k: number | null) => (k == null ? null : Math.round(k * CAR.KM_TO_MI * 10) / 10);

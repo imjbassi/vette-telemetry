@@ -418,6 +418,9 @@ export interface TripNums {
   // null that means "no gap" from a null that means "not known".
   unlogged_known: boolean;
   fw: number; nolink_n: number;
+  // Distance along the route points, filled by withGpsMiles only for a trip whose speed
+  // readings gave almost nothing. Null otherwise.
+  gps_miles: number | null;
 }
 
 // One trip on its own. `unlogged_before_mi` needs the previous trip, so it is null and not
@@ -447,7 +450,57 @@ export function tripNumbers(t: TripAgg): TripNums {
     unlogged_known: false,
     fw: t.fw ?? 0,
     nolink_n: t.nolink_n ?? 0,
+    gps_miles: null,
   };
+}
+
+// ---- distance from GPS, for drives whose speed readings failed
+
+// Below this logged distance a trip gets a GPS figure, if its route says it moved.
+export const GPS_FALLBACK_BELOW_MI = 0.1;
+// Steps between route points (15 s apart) that count as driving: slower is GPS drift while
+// standing, faster or longer apart is a jump or a gap that says nothing about the path.
+const GPS_MIN_MPS = 2, GPS_MAX_MPS = 70, GPS_MAX_GAP_MS = 60000;
+
+// Kilometres along a route of one session, points in ms order.
+export function routeKm(points: { ms: number; lat: number; lon: number }[]): number {
+  let km = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i];
+    const dt = b.ms - a.ms;
+    if (dt <= 0 || dt > GPS_MAX_GAP_MS) continue;
+    const mid = ((a.lat + b.lat) / 2) * (Math.PI / 180);
+    const dx = (b.lon - a.lon) * 111.32 * Math.cos(mid);
+    const dy = (b.lat - a.lat) * 110.574;
+    const d = Math.hypot(dx, dy);
+    const mps = (d * 1000) / (dt / 1000);
+    if (mps >= GPS_MIN_MPS && mps <= GPS_MAX_MPS) km += d;
+  }
+  return km;
+}
+
+// Fills gps_miles for the trips that logged under GPS_FALLBACK_BELOW_MI. Reads only the
+// route points of those trips, which are rare, so lists of normal drives cost nothing extra.
+export async function withGpsMiles(env: Env, nums: TripNums[]): Promise<TripNums[]> {
+  const want = [...new Set(nums.filter((n) => n.miles < GPS_FALLBACK_BELOW_MI).map((n) => n.id))];
+  if (!want.length) return nums;
+  const byBoot = new Map<number, { ms: number; lat: number; lon: number }[]>();
+  for (let i = 0; i < want.length; i += 90) {
+    const part = want.slice(i, i + 90);
+    const rows = await env.DB.prepare(
+      `SELECT boot, ms, lat, lon FROM track WHERE boot IN (${part.map(() => "?").join(",")}) ORDER BY boot, ms`,
+    ).bind(...part).all<{ boot: number; ms: number; lat: number; lon: number }>();
+    for (const r of rows.results) {
+      if (!byBoot.has(r.boot)) byBoot.set(r.boot, []);
+      byBoot.get(r.boot)!.push(r);
+    }
+  }
+  return nums.map((n) => {
+    const pts = byBoot.get(n.id);
+    if (!pts || n.miles >= GPS_FALLBACK_BELOW_MI) return n;
+    const mi = r1(routeKm(pts) * KM_TO_MI);
+    return mi != null && mi >= GPS_FALLBACK_BELOW_MI ? { ...n, gps_miles: mi } : n;
+  });
 }
 
 // Odometer miles between the end of `prev` and the start of `cur`.
@@ -575,6 +628,8 @@ function shapeTrip(env: Env, n: TripNums, live: number | null) {
     engine_on_min: r1(n.engine_s / 60),
     moving_min: r1(n.moving_s / 60),
     distance_mi: n.miles,
+    // Only present when the speed readings failed but the GPS route shows the car moving.
+    ...(n.gps_miles != null ? { gps_distance_mi: n.gps_miles, distance_note: "Speed readings failed on this trip, so distance_mi is near 0. gps_distance_mi is measured along the GPS route and reads a little short on curves." } : {}),
     odometer_distance_mi: n.odo_miles,
     unlogged_before_mi: n.unlogged_before_mi,
     fuel_used_gal_est: n.gallons,
@@ -612,7 +667,7 @@ export async function listTrips(env: Env, a: { limit?: unknown; from?: unknown; 
   ]);
   const aggs = rows.results.sort((x, y) => y.start_ts - x.start_ts);
   const more = aggs.length > limit;
-  const nums = more || from == null ? tripNumbersList(aggs) : await tripNumbersWithGaps(env, aggs);
+  const nums = await withGpsMiles(env, (more || from == null ? tripNumbersList(aggs) : await tripNumbersWithGaps(env, aggs)).slice(0, limit));
   const live = liveBoot(L, now);
   return {
     ...(from != null || to != null
@@ -658,7 +713,7 @@ export async function tripSummary(env: Env, a: { trip_id?: unknown; include_loca
     withPlaces ? place(env, boot, "ASC") : null, withPlaces ? place(env, boot, "DESC") : null,
     tripBefore(env, agg), getLatest(env),
   ]);
-  const n = { ...tripNumbers(agg), unlogged_before_mi: unloggedMiles(prev, agg) };
+  const [n] = await withGpsMiles(env, [{ ...tripNumbers(agg), unlogged_before_mi: unloggedMiles(prev, agg) }]);
   return {
     ...shapeTrip(env, n, liveBoot(L, now)),
     fuel_level_pct: { start: f0?.fuel_pct ?? null, end: f1?.fuel_pct ?? null },
@@ -745,7 +800,7 @@ export async function history(
     // The oldest session of all, one row through the end_ts index.
     env.DB.prepare(`SELECT start_ts FROM trips WHERE end_ts IS NOT NULL ORDER BY end_ts LIMIT 1`).first<{ start_ts: number | null }>(),
   ]);
-  const nums = await tripNumbersWithGaps(env, touching);
+  const nums = await withGpsMiles(env, await tripNumbersWithGaps(env, touching));
   // A window that begins before the logger had any data would read as days without driving.
   const dataStarts = first?.start_ts ?? null;
   const uncovered = dataStarts == null || dataStarts > w.start;

@@ -857,15 +857,18 @@
   }
 
   // ---------------------------------------------------------------- trips
+  // A trip whose speed readings failed shows its distance along the GPS route instead of 0.
+  const tripMiles = (t) => (t.gps_miles != null ? `about ${f1(t.gps_miles)} mi by GPS` : `${f1(t.miles)} mi`);
+
   function tripItem(t) {
     const li = document.createElement("li");
     li.dataset.id = t.id;
     if (t.id === S.selected) li.className = "sel";
-    li.innerHTML = `<span class="tico"><svg style="color:${t.miles > 0.2 ? "var(--blue)" : "var(--muted)"}"><use href="#i-car"/></svg></span>
+    li.innerHTML = `<span class="tico"><svg style="color:${t.miles > 0.2 || t.gps_miles ? "var(--blue)" : "var(--muted)"}"><use href="#i-car"/></svg></span>
       <div class="w"></div><div class="m"></div><div class="r"></div>`;
     li.querySelector(".w").textContent = when(t.start_ts) + (t.id === liveBoot() ? " · in progress" : "");
     // Engine time, not logger-on time: the logger stays up for a few minutes after the engine stops.
-    li.querySelector(".m").textContent = `${f1(t.miles)} mi · ${dur(t.engine_s)} engine` + (t.max_mph ? ` · top ${t.max_mph} mph` : "") +
+    li.querySelector(".m").textContent = `${tripMiles(t)} · ${dur(t.engine_s)} engine` + (t.max_mph ? ` · top ${t.max_mph} mph` : "") +
       (t.unlogged_before_mi != null ? ` · ${f1(t.unlogged_before_mi)} mi unlogged before` : "");
     li.querySelector(".r").innerHTML = t.mpg == null ? `–<small>mpg</small>` : `${f1(t.mpg)}<small>mpg</small>`;
     li.onclick = () => openTrip(t.id);
@@ -963,7 +966,7 @@
     $("t-csv").href = `api/trip/${t.id}.csv`;
     $("t-csv").setAttribute("download", `corvette-trip-${sid(t.id)}.csv`);
     const stats = [
-      ["Distance", `${f1(t.miles)} mi`], ["By odometer", t.odo_miles == null ? "–" : `${f1(t.odo_miles)} mi`],
+      ["Distance", t.gps_miles != null ? `${f1(t.gps_miles)} mi by GPS` : `${f1(t.miles)} mi`], ["By odometer", t.odo_miles == null ? "–" : `${f1(t.odo_miles)} mi`],
       ["Unlogged before", t.unlogged_before_mi != null ? `${f1(t.unlogged_before_mi)} mi` : d.unlogged_known ? "none" : "–"],
       ["Engine on", dur(t.engine_s)], ["Moving", dur(t.moving_s)], ["Logger on", dur(t.duration_s)],
       ["Fuel used (est.)", `${t.gallons.toFixed(2)} gal`], ["MPG (est.)", f1(t.mpg)], ["Avg speed", t.avg_mph == null ? "–" : `${f0(t.avg_mph)} mph`],
@@ -974,6 +977,7 @@
     const notes = [];
     if (t.est) notes.push("Some times in this trip are estimated because the logger had no clock yet.");
     if (t.unlogged_before_mi != null) notes.push(`The odometer moved ${f1(t.unlogged_before_mi)} mi between the previous trip and this one without being logged.`);
+    if (t.gps_miles != null) notes.push("No speed readings came through on this trip, so the distance is measured along the GPS route. It reads a little short on curves, and fuel and MPG are missing.");
     if (t.nolink_n) notes.push(`${f0(t.nolink_n)} readings were stored without a link to the OBD adapter.`);
     if (d.step > 1) notes.push(`The charts show 1 of every ${d.step} readings.`);
     notes.push("Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.");
