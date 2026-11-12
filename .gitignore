@@ -1,9 +1,11 @@
 # Local tool settings
 .claude/
 
-# Build output
+# Build output. Test builds go to backend/.wrangler/ and to the system temp folder.
+# node_modules at any level: miniflare drops a cache (node_modules/.mf) into whatever
+# folder it is started from.
 firmware/.pio/
-backend/node_modules/
+node_modules/
 backend/.wrangler/
 
 # Secrets and account-specific config

@@ -1,0 +1,23 @@
+# Text files are stored and checked out with LF on every OS, so Windows and macOS checkouts
+# produce the same bytes and no whole-file line-ending diffs.
+* text=auto eol=lf
+
+# Never converted and never diffed as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.bin   binary
+*.elf   binary
+*.hex   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.sqlite binary
+*.db    binary
