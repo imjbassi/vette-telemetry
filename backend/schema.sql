@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS latest (
   json        TEXT NOT NULL
 );
 
+-- One row per upload. received_at must stay NOT NULL: src/ingest.ts stops a stale upload by
+-- inserting a NULL here on purpose, which fails the whole batch.
 CREATE TABLE IF NOT EXISTS ingests (
   received_at INTEGER NOT NULL,
   bytes       INTEGER NOT NULL,
@@ -44,9 +46,13 @@ CREATE INDEX IF NOT EXISTS ingests_at ON ingests(received_at);
 -- ---------------------------------------------------------------------------------------
 -- Rollups, updated incrementally on every upload (see src/rollup.ts). D1 bills every row a
 -- query scans, so the dashboard and Claude tools read these instead of re-aggregating
--- `samples`. migrations/backfill-rollups.sql rebuilds them from `samples` if ever needed.
+-- `samples`. maintenance/rebuild-rollups.sql rebuilds them from `samples` if ever needed.
+--
+-- This file only creates what is missing. A change to an existing table also needs a
+-- numbered file in schema-changes/, run by hand once on each existing database.
 
 -- One row per session (device power-up). A trip is a session with the engine on.
+-- A session id is the boot counter of the board plus its install id times 65536 (see src/record.ts).
 CREATE TABLE IF NOT EXISTS trips (
   boot        INTEGER PRIMARY KEY,
   start_ts    INTEGER, end_ts INTEGER,
@@ -57,7 +63,13 @@ CREATE TABLE IF NOT EXISTS trips (
   engine_s    REAL NOT NULL DEFAULT 0, moving_s REAL NOT NULL DEFAULT 0,
   max_kph     INTEGER, max_rpm INTEGER, max_coolant REAL,
   rpm_sum     REAL NOT NULL DEFAULT 0, rpm_n INTEGER NOT NULL DEFAULT 0,
-  est         INTEGER NOT NULL DEFAULT 0
+  est         INTEGER NOT NULL DEFAULT 0,
+  -- Added by schema-changes/0001-trips-odometer-fw.sql. Keep the order: columns added to an
+  -- existing table always land at the end.
+  odo_start   REAL,                          -- first odometer reading of the session, km
+  odo_end     REAL,                          -- last odometer reading of the session, km
+  fw          INTEGER NOT NULL DEFAULT 0,    -- highest firmware build byte seen in the session
+  nolink_n    INTEGER NOT NULL DEFAULT 0     -- records written while the adapter link was down
 );
 CREATE INDEX IF NOT EXISTS trips_end ON trips(end_ts);
 

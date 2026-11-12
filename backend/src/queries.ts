@@ -1,83 +1,394 @@
-import { Env, getLatest } from "./ingest";
+import { Env, getLatest, Latest, LatestEntry } from "./ingest";
 
-const AFR = 14.7;
+// Pump gasoline is E10, which burns about 14.1 parts air per part fuel. 14.7 is pure gasoline.
+const AFR = 14.1;
 const G_PER_GAL = 2798.7;
 const TANK_GAL = 18.5; // C8 Stingray
-const EPA_COMBINED_MPG = 19; // 2024 Stingray coupe, fallback when no history
+const EPA = { city: 16, highway: 24, combined: 19 }; // 2024 Stingray coupe. Combined is the fallback when history is thin.
 const KM_TO_MI = 0.621371;
+export const MPG30_MIN_MILES = 25; // logged miles needed before the 30-day MPG replaces the EPA figure
+const RANKED_TRIP_MIN_MILES = 2; // shorter trips are too noisy to be a best or worst MPG
+const UNLOGGED_MIN_KM = 0.3; // the odometer steps in 0.1 km, so smaller gaps are rounding
+const CHARGING_V = 13.0;
+const LOW_V = 11.8;
+
+export const CAR = { TANK_GAL, EPA, KM_TO_MI, AFR, G_PER_GAL };
 
 const r1 = (x: number | null | undefined) => (x == null || !isFinite(x) ? null : Math.round(x * 10) / 10);
 const r2 = (x: number | null | undefined) => (x == null || !isFinite(x) ? null : Math.round(x * 100) / 100);
 const cToF = (c: number | null | undefined) => (c == null ? null : r1(c * 1.8 + 32));
+const nowS = () => Math.floor(Date.now() / 1000);
+const gallonsOf = (mafG: number | null | undefined) => (mafG ?? 0) / (AFR * G_PER_GAL);
 
-export function fmtTime(env: Env, ts: number | null | undefined): string | null {
-  if (!ts) return null;
-  const d = new Date(ts * 1000);
-  const local = new Intl.DateTimeFormat("en-US", {
-    timeZone: env.LOCAL_TZ || "UTC", weekday: "short", year: "numeric", month: "short", day: "numeric",
-    hour: "numeric", minute: "2-digit", timeZoneName: "short",
-  }).format(d);
-  return `${local} (${d.toISOString()})`;
+// An answer that tells the model its arguments were wrong. mcp.ts sends it as an error text.
+export const badInput = (error: string) => ({ error, bad_input: true as const });
+export type BadInput = ReturnType<typeof badInput>;
+
+// Models sometimes send numbers as strings. Anything else unusable falls back to the default.
+export function clampInt(v: unknown, def: number, min: number, max: number): number {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Math.min(Math.max(Number.isFinite(n) ? Math.floor(n) : def, min), max);
 }
 
-function ago(ts: number): string {
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+function wholeNumber(v: unknown): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\d+$/.test(v.trim()) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+// Session id as shown to people. Legacy firmware: the plain boot counter. Newer firmware:
+// install id, a dash, then the counter (for example 173-12). The dashboard shows the same.
+export const tripLabel = (boot: number) => (boot < 65536 ? String(boot) : `${Math.floor(boot / 65536)}-${boot % 65536}`);
+
+// A trip id in either form: the full number, or the label. Null for anything else.
+export function parseTripId(v: unknown): number | null {
+  const n = wholeNumber(v);
+  if (n != null) return n;
+  const m = typeof v === "string" ? /^(\d{1,3})-(\d{1,5})$/.exec(v.trim()) : null;
+  if (!m) return null;
+  // Only what a real label can hold, so a mistyped one cannot land on some other trip.
+  const inst = Number(m[1]), counter = Number(m[2]);
+  return inst >= 1 && inst <= 255 && counter <= 65535 ? inst * 65536 + counter : null;
+}
+
+// ------------------------------------------------------------ local time
+
+// An unknown zone name makes Intl throw. Fall back to UTC so one bad setting cannot break every reader.
+const zones = new Map<string, string>();
+export function zoneOf(env: Pick<Env, "LOCAL_TZ">): string {
+  const want = env.LOCAL_TZ || "UTC";
+  let z = zones.get(want);
+  if (!z) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: want });
+      z = want;
+    } catch {
+      z = "UTC";
+    }
+    zones.set(want, z);
+  }
+  return z;
+}
+
+// Building an Intl.DateTimeFormat is slow, so there is one per zone and it is reused.
+const longFmt = new Map<string, Intl.DateTimeFormat>();
+export function fmtTime(env: Pick<Env, "LOCAL_TZ">, ts: number | null | undefined): string | null {
+  if (!ts) return null;
+  const tz = zoneOf(env);
+  let f = longFmt.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, weekday: "short", year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", timeZoneName: "short",
+    });
+    longFmt.set(tz, f);
+  }
+  const d = new Date(ts * 1000);
+  return `${f.format(d)} (${d.toISOString()})`;
+}
+
+// The zone's wall clock at `ts`, read as if it were UTC. Unix seconds.
+const partsFmt = new Map<string, Intl.DateTimeFormat>();
+function wallClock(tz: string, ts: number): number {
+  let f = partsFmt.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    partsFmt.set(tz, f);
+  }
+  const p: Record<string, number> = {};
+  for (const x of f.formatToParts(new Date(ts * 1000))) if (x.type !== "literal") p[x.type] = Number(x.value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) / 1000;
+}
+
+// Seconds to add to UTC to get local time at `ts`.
+export const tzOffset = (tz: string, ts: number) => wallClock(tz, ts) - ts;
+
+// Calendar dates are handled as day numbers (days since 1970-01-01), so the next day is +1.
+export const localDay = (tz: string, ts: number) => Math.floor(wallClock(tz, ts) / 86400);
+export const dateOfDay = (day: number) => new Date(day * 86400000).toISOString().slice(0, 10);
+
+// "YYYY-MM-DD" to a day number. Null for anything else, including dates that do not exist.
+export function parseDay(v: unknown): number | null {
+  const m = typeof v === "string" ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(v.trim()) : null;
+  if (!m) return null;
+  const ms = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const d = new Date(ms);
+  if (d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) return null;
+  return ms / 86400000;
+}
+
+// Unix time at which local day `day` starts in `tz`.
+export function dayStart(tz: string, day: number): number {
+  const wall = day * 86400;
+  const a = wall - tzOffset(tz, wall);
+  const b = wall - tzOffset(tz, a);
+  // a and b differ only when a clock change lies between them, and then b is the right one.
+  // If the clocks jump over midnight neither fits, and the day starts at the later of the two.
+  return tzOffset(tz, b) === wall - b ? b : Math.max(a, b);
+}
+
+export interface OffsetSpan { from: number; to: number; offset: number }
+
+// Cuts [from, to) wherever the zone's UTC offset changes (daylight saving). Inside one span the
+// offset is constant, so SQL can turn a timestamp into a local day with plain integer arithmetic.
+export function offsetSpans(tz: string, from: number, to: number): OffsetSpan[] {
+  const out: OffsetSpan[] = [];
+  let start = from, off = tzOffset(tz, from);
+  for (let at = from; at < to;) {
+    // Clock changes are months apart, so a one-day step holds at most one.
+    const next = Math.min(at + 86400, to);
+    const o = tzOffset(tz, next);
+    if (o !== off) {
+      let lo = at, hi = next; // the old offset holds at lo, the new one at hi
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (tzOffset(tz, mid) === off) lo = mid; else hi = mid;
+      }
+      if (hi >= to) break; // the change is exactly at the open end of the window
+      out.push({ from: start, to: hi, offset: off });
+      start = hi;
+      off = o;
+    }
+    at = next;
+  }
+  out.push({ from: start, to, offset: off });
+  return out;
+}
+
+// SQL for the local day number of the integer column `col`. D1 binds JS numbers as REAL, and a
+// REAL offset or divisor would make this a float division, so every number is inlined as a
+// checked integer literal instead of bound.
+export function dayExpr(col: string, spans: OffsetSpan[]): string {
+  const lit = (n: number) => {
+    if (!Number.isSafeInteger(n)) throw new Error(`not an integer: ${n}`);
+    return String(n);
+  };
+  const one = (offset: number) => `(${col} + ${lit(offset)}) / 86400`;
+  const last = spans[spans.length - 1];
+  if (spans.length === 1) return one(last.offset);
+  return "CASE " + spans.slice(0, -1).map((s) => `WHEN ${col} < ${lit(s.to)} THEN ${one(s.offset)} `).join("") +
+    `ELSE ${one(last.offset)} END`;
+}
+
+export const HISTORY_PERIODS = ["today", "yesterday", "last_7_days", "last_30_days", "this_month", "last_month", "this_year"] as const;
+export type HistoryPeriod = (typeof HISTORY_PERIODS)[number];
+export const MAX_HISTORY_DAYS = 366;
+
+// Whole local days from_day..to_day (both included), and the same window as unix time [start, end).
+export interface DayWindow { from_day: number; to_day: number; start: number; end: number }
+
+export function resolveWindow(
+  tz: string, now: number, a: { period?: unknown; from?: unknown; to?: unknown },
+): DayWindow | BadInput {
+  const today = localDay(tz, now);
+  let from: number, to: number;
+  if (a.from != null || a.to != null) {
+    if (a.period != null) return badInput("Give either period, or from and to, not both.");
+    if (a.from == null) return badInput("to needs a from date as well. Dates look like 2026-11-05.");
+    const f = parseDay(a.from);
+    if (f == null) return badInput(`from is not a calendar date: ${JSON.stringify(a.from)}. Use YYYY-MM-DD, for example 2026-11-05.`);
+    const t = a.to == null ? today : parseDay(a.to);
+    if (t == null) return badInput(`to is not a calendar date: ${JSON.stringify(a.to)}. Use YYYY-MM-DD, for example 2026-11-05.`);
+    if (f > t) {
+      return badInput(a.to == null
+        ? `from (${dateOfDay(f)}) is in the future. Today is ${dateOfDay(today)} in ${tz}.`
+        : `from (${dateOfDay(f)}) is after to (${dateOfDay(t)}).`);
+    }
+    from = f;
+    to = t;
+  } else {
+    const period = a.period ?? "last_7_days";
+    const d = new Date(today * 86400000);
+    const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    const first = (yy: number, mm: number) => Date.UTC(yy, mm, 1) / 86400000;
+    to = today;
+    switch (period) {
+      case "today": from = today; break;
+      case "yesterday": from = to = today - 1; break;
+      case "last_7_days": from = today - 6; break;
+      case "last_30_days": from = today - 29; break;
+      case "this_month": from = first(y, m); break;
+      case "last_month": from = first(y, m - 1); to = first(y, m) - 1; break;
+      case "this_year": from = first(y, 0); break;
+      default:
+        return badInput(`Unknown period ${JSON.stringify(period)}. Use one of: ${HISTORY_PERIODS.join(", ")}. Or give from and to dates.`);
+    }
+  }
+  const days = to - from + 1;
+  if (days > MAX_HISTORY_DAYS) {
+    return badInput(`That window is ${days} days. The limit is ${MAX_HISTORY_DAYS}. Ask for a shorter range, or make several calls and add them up.`);
+  }
+  return { from_day: from, to_day: to, start: dayStart(tz, from), end: dayStart(tz, to + 1) };
+}
+
+// ------------------------------------------------------------ car state
+
+// One rule for "is it running" shared by the Claude tools and the dashboard.
+export const STATE_RULES = { running_s: 90, lost_s: 600 } as const;
+
+export interface CarState {
+  state: "running" | "no_signal" | "parked" | "unknown";
+  last_seen_ts: number | null; // ts of the newest record (latest.engine_on.ts)
+  age_s: number | null;
+  ended_mid_drive: boolean; // last record had the engine on and is older than lost_s
+  link_down: boolean; // latest.link.v === 0 and age_s < lost_s
+}
+
+export function carState(latest: Latest, now: number): CarState {
+  const e = latest.engine_on;
+  if (!e) return { state: "unknown", last_seen_ts: null, age_s: null, ended_mid_drive: false, link_down: false };
+  // A device clock slightly ahead of ours must not give a negative age.
+  const age = Math.max(0, now - e.ts);
+  const on = e.v === 1;
+  const lost = age > STATE_RULES.lost_s;
+  return {
+    state: !on || lost ? "parked" : age < STATE_RULES.running_s ? "running" : "no_signal",
+    last_seen_ts: e.ts,
+    age_s: age,
+    ended_mid_drive: on && lost,
+    link_down: latest.link?.v === 0 && age < STATE_RULES.lost_s,
+  };
+}
+
+// Boot of the session that is still going, or null. Used to mark a trip as in progress.
+export function liveBoot(latest: Latest, now: number): number | null {
+  const s = carState(latest, now).state;
+  return s === "running" || s === "no_signal" ? latest.engine_on.boot : null;
+}
+
+function ago(ts: number, now: number): string {
+  const s = Math.max(0, now - ts);
   if (s < 90) return `${s}s ago`;
   if (s < 5400) return `${Math.round(s / 60)} min ago`;
   if (s < 172800) return `${r1(s / 3600)} h ago`;
   return `${r1(s / 86400)} days ago`;
 }
 
-function mapsLink(lat: number, lon: number) {
-  return `https://maps.google.com/?q=${lat.toFixed(6)},${lon.toFixed(6)}`;
+const uploadingNow = (latest: Latest, now: number) =>
+  latest.last_upload != null && now - latest.last_upload.ts < STATE_RULES.running_s;
+
+// The logger sends stored records oldest first. While uploads are still arriving, an old
+// newest record does not mean that the end of the drive was lost.
+const catchingUp = (cs: CarState, latest: Latest, now: number) => cs.ended_mid_drive && uploadingNow(latest, now);
+
+// The same during a shorter gap. Only the sentence changes, the car still counts as driving.
+// The upload has to be well after the newest record, or it was just the last post before the
+// car went quiet.
+const drainingGap = (cs: CarState, latest: Latest, now: number) =>
+  cs.state === "no_signal" && cs.last_seen_ts != null && uploadingNow(latest, now) &&
+  latest.last_upload.ts - cs.last_seen_ts > STATE_RULES.running_s;
+
+// The state word plus one plain sentence, for the Claude tools.
+function describeState(env: Env, cs: CarState, latest: Latest, now: number) {
+  const seen = cs.last_seen_ts == null ? "" : ago(cs.last_seen_ts, now);
+  const backlog = catchingUp(cs, latest, now) || drainingGap(cs, latest, now);
+  let summary: string;
+  if (cs.state === "unknown") summary = "The logger has not reported yet.";
+  else if (cs.state === "running") summary = `The engine is running, last report ${seen}.`;
+  else if (cs.state === "no_signal" && !backlog) {
+    summary = `No report since ${seen} and the engine was on then, so the car is probably driving without cell coverage or was just switched off.`;
+  } else if (backlog) {
+    summary = `The logger is uploading stored records right now (last upload ${ago(latest.last_upload.ts, now)}). The newest one so far is from ${seen} ` +
+      "and had the engine on, so the current state is not known until it has caught up.";
+  } else if (cs.ended_mid_drive) {
+    summary = `Treated as parked, but the last report (${seen}) still had the engine on, so the end of that drive was not recorded.`;
+  } else if (cs.link_down) {
+    summary = `The logger is reporting (last ${seen}) but has no Bluetooth link to the OBD adapter, so the engine state is not known.`;
+  } else summary = `Parked, the engine was off at the last report ${seen}.`;
+  return {
+    state: cs.state,
+    summary,
+    last_report: cs.last_seen_ts == null ? null : { at: fmtTime(env, cs.last_seen_ts), age: seen },
+    ended_mid_drive: cs.ended_mid_drive && !backlog,
+    link_down: cs.link_down,
+  };
+}
+
+// A word that says how to read the battery voltage. 12.0 V is normal with the engine on in this
+// car, so the engine state has to be known. Voltage alone cannot tell.
+export function batteryContext(volts: number, engineOn: boolean): "charging" | "engine off" | "low" | "engine on, not charging" {
+  if (volts < LOW_V) return "low";
+  if (volts >= CHARGING_V) return "charging";
+  return engineOn ? "engine on, not charging" : "engine off";
+}
+
+export const sameRecord = (a?: LatestEntry, b?: LatestEntry) => !!a && !!b && a.boot === b.boot && a.ms === b.ms;
+
+// The context word for the newest battery voltage, or null when no voltage was reported yet.
+export function latestBattery(latest: Latest): ReturnType<typeof batteryContext> | null {
+  const volts = latest.adapter_v;
+  if (!volts) return null;
+  // Was the engine on in the record the voltage came from?
+  const engineOn = sameRecord(volts, latest.engine_on) ? latest.engine_on.v === 1
+    : sameRecord(volts, latest.rpm) && latest.rpm.v > 0;
+  return batteryContext(volts.v, engineOn);
 }
 
 // ------------------------------------------------------------ status / location
 
-export async function latestStatus(env: Env) {
+function mapsLink(lat: number, lon: number) {
+  return `https://maps.google.com/?q=${lat.toFixed(6)},${lon.toFixed(6)}`;
+}
+
+export async function latestStatus(env: Env, now = nowS()) {
   const L = await getLatest(env);
   if (!Object.keys(L).length) return { error: "No data received yet." };
   const val = (k: string) => L[k]?.v ?? null;
-  const when = (k: string) => (L[k] ? { at: fmtTime(env, L[k].ts), age: ago(L[k].ts) } : null);
+  const when = (k: string) => (L[k] ? { at: fmtTime(env, L[k].ts), age: ago(L[k].ts, now) } : null);
+  const cs = carState(L, now);
   const fuelPct = val("fuel_pct");
-  const econ = await fuelEconomy(env, 30);
-  const mpg = "combined_mpg" in econ && econ.combined_mpg ? econ.combined_mpg : null;
   const gal = fuelPct == null ? null : (fuelPct / 100) * TANK_GAL;
+  const econ = fuelPct == null ? null : await mpg30(env, now);
   return {
-    engine_running_at_last_report: val("engine_on") === 1,
-    last_upload: when("last_upload"),
+    car_state: describeState(env, cs, L, now),
+    // Without the adapter link the logger cannot see the engine, so this is not known.
+    engine_running_at_last_report: cs.link_down ? null : val("engine_on") === 1,
     fuel: fuelPct == null ? null : {
       level_pct: fuelPct,
       est_gallons_left: r1(gal),
-      est_range_mi: Math.round((gal ?? 0) * (mpg ?? EPA_COMBINED_MPG)),
-      range_basis_mpg: mpg ?? `${EPA_COMBINED_MPG} (EPA combined, no logged history yet)`,
+      est_range_mi: Math.round((gal ?? 0) * (econ?.mpg ?? EPA.combined)),
+      range_basis_mpg: econ?.mpg ?? EPA.combined,
+      range_basis: econ?.mpg != null
+        ? "estimated MPG of the last 30 days"
+        : `EPA combined rating (fewer than ${MPG30_MIN_MILES} logged miles in the last 30 days)`,
       as_of: when("fuel_pct"),
     },
     battery_v: val("adapter_v"),
+    battery_context: latestBattery(L),
     battery_as_of: when("adapter_v"),
-    ecu_v: val("ecu_v"),
+    // The ECU's own voltage reading only means something while the engine runs.
+    ...(cs.state === "running" ? { ecu_v: val("ecu_v") } : {}),
     coolant_f: cToF(val("coolant_c")),
     intake_air_f: cToF(val("intake_c")),
     last_speed_mph: val("speed_kph") == null ? null : Math.round(val("speed_kph")! * KM_TO_MI),
     last_rpm: val("rpm"),
     engine_values_as_of: when("rpm"),
-    odometer_mi: val("odo_km") == null ? "not supported by this ECU (PID A6)" : Math.round(val("odo_km")! * KM_TO_MI),
-    location: val("lat") == null ? null : {
-      lat: val("lat"), lon: val("lon"), map: mapsLink(val("lat")!, val("lon")!), as_of: when("lat"),
-    },
+    odometer_mi: val("odo_km") == null ? null : Math.round(val("odo_km")! * KM_TO_MI),
     cell_signal_csq: val("csq"),
-    note: "Values are the last reported before the car (and logger) powered off if the car is parked.",
+    logger: {
+      firmware_build: val("fw"),
+      adapter_link: L.link ? (L.link.v === 1 ? "up" : "down") : null,
+      last_upload: when("last_upload"),
+    },
+    note: "When the car is parked the logger has no power, so these are the last values it reported. " +
+      "Range is an estimate. The position is only in get_location.",
   };
 }
 
-export async function location(env: Env) {
+export async function location(env: Env, now = nowS()) {
   const L = await getLatest(env);
-  if (L.lat == null) return { error: "No GPS fix has been reported yet." };
+  if (L.lat == null || L.lon == null) return { error: "No GPS fix has been reported yet." };
+  const cs = carState(L, now);
   return {
     lat: L.lat.v, lon: L.lon.v, satellites: L.sats?.v ?? null,
     map: mapsLink(L.lat.v, L.lon.v),
-    as_of: fmtTime(env, L.lat.ts), age: ago(L.lat.ts),
-    parked: L.engine_on?.v !== 1 || Date.now() / 1000 - (L.engine_on?.ts ?? 0) > 120,
+    as_of: fmtTime(env, L.lat.ts), age: ago(L.lat.ts, now),
+    // Null when the engine state is not known: the adapter link is down, or stored records
+    // are still uploading and the newest so far is old.
+    parked: cs.link_down || catchingUp(cs, L, now) ? null : cs.state === "parked",
+    car_state: describeState(env, cs, L, now),
   };
 }
 
@@ -87,6 +398,11 @@ export interface TripAgg {
   boot: number; start_ts: number; end_ts: number; km: number | null; maf_g: number | null;
   engine_s: number | null; moving_s: number | null; max_kph: number | null; max_rpm: number | null;
   max_coolant: number | null; avg_rpm: number | null; est: number;
+  // Odometer at the first and last reading of the session, km. Null when the car never answered
+  // (and always null for aggregates built from `minutes`).
+  odo_start: number | null; odo_end: number | null;
+  fw: number; // highest firmware build seen in the session, 0 = legacy
+  nolink_n: number; // records written while the adapter link was down
 }
 
 // Raw numbers for one trip. The MCP tools format these as text, the dashboard as charts.
@@ -94,11 +410,21 @@ export interface TripNums {
   id: number; start_ts: number; end_ts: number; duration_s: number; engine_s: number; moving_s: number;
   miles: number; gallons: number; mpg: number | null; avg_mph: number | null; max_mph: number | null;
   max_rpm: number | null; avg_rpm: number | null; max_coolant_f: number | null; est: boolean;
+  odo_miles: number | null; // distance by the car's odometer, one decimal
+  // Miles the odometer moved between the previous trip's end and this trip's start, so driving
+  // the logger missed. Null when there is no gap, or when either reading is unknown.
+  unlogged_before_mi: number | null;
+  // True when both of those readings exist, or when no trip came before this one. Tells a
+  // null that means "no gap" from a null that means "not known".
+  unlogged_known: boolean;
+  fw: number; nolink_n: number;
 }
 
+// One trip on its own. `unlogged_before_mi` needs the previous trip, so it is null and not
+// known here. Use tripNumbersList for lists.
 export function tripNumbers(t: TripAgg): TripNums {
   const miles = (t.km ?? 0) * KM_TO_MI;
-  const gallons = (t.maf_g ?? 0) / (AFR * G_PER_GAL);
+  const gallons = gallonsOf(t.maf_g);
   return {
     id: t.boot,
     start_ts: t.start_ts,
@@ -115,13 +441,51 @@ export function tripNumbers(t: TripAgg): TripNums {
     avg_rpm: t.avg_rpm == null ? null : Math.round(t.avg_rpm),
     max_coolant_f: cToF(t.max_coolant),
     est: t.est === 1,
+    odo_miles: t.odo_start != null && t.odo_end != null && t.odo_end >= t.odo_start
+      ? r1((t.odo_end - t.odo_start) * KM_TO_MI) : null,
+    unlogged_before_mi: null,
+    unlogged_known: false,
+    fw: t.fw ?? 0,
+    nolink_n: t.nolink_n ?? 0,
   };
+}
+
+// Odometer miles between the end of `prev` and the start of `cur`.
+export function unloggedMiles(
+  prev: Pick<TripAgg, "odo_end"> | null | undefined, cur: Pick<TripAgg, "odo_start">,
+): number | null {
+  if (!prev || prev.odo_end == null || cur.odo_start == null) return null;
+  // Round to the odometer's 0.1 km step first so float noise cannot cross the threshold.
+  const gapKm = Math.round((cur.odo_start - prev.odo_end) * 10) / 10;
+  return gapKm > UNLOGGED_MIN_KM ? r1(gapKm * KM_TO_MI) : null;
+}
+
+// tripNumbers for a list in any time order, with `unlogged_before_mi` filled from the trip just
+// before each one in the list. The oldest trip has no predecessor in the list and stays null.
+export function tripNumbersList(aggs: TripAgg[]): TripNums[] {
+  const byTime = [...aggs].sort((a, b) => a.start_ts - b.start_ts);
+  const prev = new Map<TripAgg, TripAgg>();
+  byTime.forEach((t, i) => { if (i) prev.set(t, byTime[i - 1]); });
+  return aggs.map((t) => {
+    const p = prev.get(t);
+    return {
+      ...tripNumbers(t),
+      unlogged_before_mi: unloggedMiles(p, t),
+      unlogged_known: p != null && p.odo_end != null && t.odo_start != null,
+    };
+  });
+}
+
+// Total of `unlogged_before_mi` over `trips`. Null when the gap before one of them is not
+// known, because a wrong 0 would say that nothing was missed.
+export function unloggedTotal(trips: TripNums[]): number | null {
+  return trips.every((t) => t.unlogged_known) ? r1(trips.reduce((a, t) => a + (t.unlogged_before_mi ?? 0), 0)) : null;
 }
 
 // All trip reads go through the `trips` rollup (one row per session, maintained on upload),
 // never a scan of `samples`. D1 bills every row scanned. A trip is a session with the engine on.
-const TRIP_COLS = `boot, start_ts, end_ts, km, maf_g, engine_s, moving_s, max_kph, max_rpm, max_coolant,
-  CASE WHEN rpm_n > 0 THEN rpm_sum / rpm_n END AS avg_rpm, est`;
+export const TRIP_COLS = `boot, start_ts, end_ts, km, maf_g, engine_s, moving_s, max_kph, max_rpm, max_coolant,
+  CASE WHEN rpm_n > 0 THEN rpm_sum / rpm_n END AS avg_rpm, est, odo_start, odo_end, fw, nolink_n`;
 
 export async function recentTripAggs(env: Env, limit: number): Promise<TripAgg[]> {
   const rows = await env.DB.prepare(
@@ -138,11 +502,13 @@ export async function tripAggsSince(env: Env, since: number): Promise<TripAgg[]>
 }
 
 // Per-trip aggregates clipped to [from, to] at one-minute resolution, from `minutes`.
+// The minute rows carry no odometer, firmware build or link state, so those come back empty.
 export async function tripAggsBetween(env: Env, from: number, to: number): Promise<TripAgg[]> {
   const rows = await env.DB.prepare(
     `SELECT boot, MIN(t) AS start_ts, MAX(t) + 59 AS end_ts, SUM(km) AS km, SUM(maf_g) AS maf_g,
             SUM(engine_s) AS engine_s, SUM(moving_s) AS moving_s, MAX(spd_max) AS max_kph, MAX(rpm_max) AS max_rpm,
-            MAX(cool_max) AS max_coolant, CASE WHEN SUM(rpm_n) > 0 THEN SUM(rpm_sum) / SUM(rpm_n) END AS avg_rpm, 0 AS est
+            MAX(cool_max) AS max_coolant, CASE WHEN SUM(rpm_n) > 0 THEN SUM(rpm_sum) / SUM(rpm_n) END AS avg_rpm, 0 AS est,
+            NULL AS odo_start, NULL AS odo_end, 0 AS fw, 0 AS nolink_n
      FROM minutes WHERE t BETWEEN ? AND ? GROUP BY boot HAVING SUM(engine_n) > 0`,
   ).bind(Math.floor(from / 60) * 60, to).all<TripAgg>();
   return rows.results.sort((a, b) => b.start_ts - a.start_ts);
@@ -160,83 +526,294 @@ export async function tripAgg(env: Env, boot: number): Promise<TripAgg | null> {
   return env.DB.prepare(`SELECT ${TRIP_COLS} FROM trips WHERE boot = ? AND engine_n > 0`).bind(boot).first<TripAgg>();
 }
 
-export const CAR = { TANK_GAL, EPA: { city: 16, highway: 24, combined: EPA_COMBINED_MPG }, KM_TO_MI };
+// The trip that started before `t` and ended last. One row through the end_ts index.
+// Bounded by the end of `t`, not its start: a session whose last records were dated at upload
+// time can have a stored end a little after the next session's start.
+export async function tripBefore(env: Env, t: Pick<TripAgg, "boot" | "start_ts" | "end_ts">): Promise<TripAgg | null> {
+  return env.DB.prepare(
+    `SELECT ${TRIP_COLS} FROM trips WHERE engine_n > 0 AND end_ts <= ?3 AND start_ts < ?1 AND boot != ?2
+     ORDER BY end_ts DESC LIMIT 1`,
+  ).bind(t.start_ts, t.boot, t.end_ts).first<TripAgg>();
+}
 
-function shapeTrip(env: Env, t: TripAgg) {
-  const n = tripNumbers(t);
+// tripNumbersList plus one lookup, so the oldest trip in the list gets its unlogged miles too.
+export async function tripNumbersWithGaps(env: Env, aggs: TripAgg[]): Promise<TripNums[]> {
+  if (!aggs.length) return [];
+  const oldest = aggs.reduce((a, b) => (b.start_ts < a.start_ts ? b : a));
+  const prev = await tripBefore(env, oldest);
+  if (prev) return tripNumbersList([...aggs, prev]).slice(0, aggs.length);
+  // No trip at all came before the oldest one, so nothing can be missing before it.
+  return tripNumbersList(aggs).map((n) => (n.id === oldest.boot ? { ...n, unlogged_known: true } : n));
+}
+
+// Trip miles are whole hundredths, so the minimum is tested on integer hundredths and float
+// noise in a sum cannot move a total across it.
+const hundredths = (miles: number) => Math.round(miles * 100);
+export const enoughMpgMiles = (miles: number) => hundredths(miles) >= MPG30_MIN_MILES * 100;
+// One decimal, rounded down, so a page that compares it with MPG30_MIN_MILES agrees with enoughMpgMiles.
+export const milesDown = (miles: number) => Math.floor(hundredths(miles) / 10) / 10;
+
+// 30-day figure used for range. Null until at least 25 logged miles exist in the window.
+export async function mpg30(env: Env, now = nowS()): Promise<{ mpg: number | null; miles: number; gallons: number }> {
+  const list = (await tripAggsSince(env, now - 30 * 86400)).map(tripNumbers);
+  const miles = list.reduce((a, t) => a + t.miles, 0);
+  const gallons = list.reduce((a, t) => a + t.gallons, 0);
+  return {
+    mpg: enoughMpgMiles(miles) && gallons > 0.05 ? r1(miles / gallons) : null,
+    miles: milesDown(miles),
+    gallons: r2(gallons) ?? 0,
+  };
+}
+
+function shapeTrip(env: Env, n: TripNums, live: number | null) {
   return {
     trip_id: n.id,
+    label: tripLabel(n.id),
     start: fmtTime(env, n.start_ts),
     end: fmtTime(env, n.end_ts),
-    duration_min: r1(n.duration_s / 60),
+    logger_on_min: r1(n.duration_s / 60),
     engine_on_min: r1(n.engine_s / 60),
     moving_min: r1(n.moving_s / 60),
     distance_mi: n.miles,
-    fuel_used_gal: n.gallons,
-    mpg: n.mpg,
+    odometer_distance_mi: n.odo_miles,
+    unlogged_before_mi: n.unlogged_before_mi,
+    fuel_used_gal_est: n.gallons,
+    mpg_est: n.mpg,
     avg_moving_speed_mph: n.avg_mph,
     max_speed_mph: n.max_mph,
     max_rpm: n.max_rpm,
     avg_rpm: n.avg_rpm,
     max_coolant_f: n.max_coolant_f,
     times_estimated: n.est,
+    in_progress: n.id === live,
   };
 }
 
-export async function listTrips(env: Env, limit: number) {
-  const trips = (await recentTripAggs(env, limit)).map((t) => shapeTrip(env, t));
-  return { trips };
+// Newest trips first. `from` and `to` are local dates (both included) and either may be left out.
+export async function listTrips(env: Env, a: { limit?: unknown; from?: unknown; to?: unknown } = {}, now = nowS()) {
+  const limit = clampInt(a.limit, 10, 1, 50);
+  const tz = zoneOf(env);
+  const from = a.from == null ? null : parseDay(a.from);
+  const to = a.to == null ? null : parseDay(a.to);
+  if (a.from != null && from == null) return badInput(`from is not a calendar date: ${JSON.stringify(a.from)}. Use YYYY-MM-DD, for example 2026-11-05.`);
+  if (a.to != null && to == null) return badInput(`to is not a calendar date: ${JSON.stringify(a.to)}. Use YYYY-MM-DD, for example 2026-11-05.`);
+  if (from != null && to != null && from > to) return badInput(`from (${dateOfDay(from)}) is after to (${dateOfDay(to)}).`);
+
+  const where = ["engine_n > 0"];
+  const binds: number[] = [];
+  if (from != null) { where.push("end_ts >= ?"); binds.push(dayStart(tz, from)); }
+  if (to != null) { where.push("start_ts < ?"); binds.push(dayStart(tz, to + 1)); }
+  // One row more than asked for: it tells whether older trips exist, and it is the
+  // predecessor that the last listed trip needs for its unlogged miles.
+  const [rows, L] = await Promise.all([
+    env.DB.prepare(`SELECT ${TRIP_COLS} FROM trips WHERE ${where.join(" AND ")} ORDER BY end_ts DESC LIMIT ?`)
+      .bind(...binds, limit + 1).all<TripAgg>(),
+    getLatest(env),
+  ]);
+  const aggs = rows.results.sort((x, y) => y.start_ts - x.start_ts);
+  const more = aggs.length > limit;
+  const nums = more || from == null ? tripNumbersList(aggs) : await tripNumbersWithGaps(env, aggs);
+  const live = liveBoot(L, now);
+  return {
+    ...(from != null || to != null
+      ? { window: { from: from == null ? null : dateOfDay(from), to: to == null ? null : dateOfDay(to), time_zone: tz } }
+      : {}),
+    trips: nums.slice(0, limit).map((n) => shapeTrip(env, n, live)),
+    more_trips_exist: more,
+  };
 }
 
 async function edge(env: Env, boot: number, col: string, dir: "ASC" | "DESC") {
-  return env.DB.prepare(`SELECT ${col}, ts FROM samples WHERE boot = ? AND ${col.split(",")[0]} IS NOT NULL ORDER BY ms ${dir} LIMIT 1`)
+  return env.DB.prepare(`SELECT ${col}, ts FROM samples WHERE boot = ? AND ${col} IS NOT NULL ORDER BY ms ${dir} LIMIT 1`)
     .bind(boot).first<Record<string, number>>();
 }
 
-export async function tripSummary(env: Env, tripId?: number) {
-  let boot = tripId;
-  if (boot == null) {
+// First or last route point of a trip. Every `track` row has a position, so this reads one
+// row. The same search in `samples` walks the whole session when the trip never had a fix.
+async function place(env: Env, boot: number, dir: "ASC" | "DESC") {
+  return env.DB.prepare(`SELECT lat, lon FROM track WHERE boot = ? ORDER BY ms ${dir} LIMIT 1`)
+    .bind(boot).first<{ lat: number; lon: number }>();
+}
+
+export async function tripSummary(env: Env, a: { trip_id?: unknown; include_locations?: unknown } = {}, now = nowS()) {
+  let boot: number;
+  if (a.trip_id == null) {
     const last = await env.DB.prepare(
       `SELECT boot FROM trips WHERE engine_n > 0 ORDER BY end_ts DESC LIMIT 1`,
     ).first<{ boot: number }>();
     if (!last) return { error: "No trips recorded yet." };
     boot = last.boot;
+  } else {
+    const id = parseTripId(a.trip_id);
+    if (id == null) {
+      return badInput(`trip_id must be a whole number or a label like "173-12", taken from list_trips, not ${JSON.stringify(a.trip_id)}.`);
+    }
+    boot = id;
   }
   const agg = await tripAgg(env, boot);
-  if (!agg) return { error: `Trip ${boot} not found.` };
-  const [f0, f1, p0, p1, o0, o1] = await Promise.all([
+  if (!agg) return { error: `Trip ${tripLabel(boot)} not found. Use list_trips to see the trip ids.` };
+  const withPlaces = a.include_locations === true || a.include_locations === "true";
+  const [f0, f1, p0, p1, prev, L] = await Promise.all([
     edge(env, boot, "fuel_pct", "ASC"), edge(env, boot, "fuel_pct", "DESC"),
-    edge(env, boot, "lat,lon", "ASC"), edge(env, boot, "lat,lon", "DESC"),
-    edge(env, boot, "odo_km", "ASC"), edge(env, boot, "odo_km", "DESC"),
+    withPlaces ? place(env, boot, "ASC") : null, withPlaces ? place(env, boot, "DESC") : null,
+    tripBefore(env, agg), getLatest(env),
   ]);
-  const t = shapeTrip(env, agg);
+  const n = { ...tripNumbers(agg), unlogged_before_mi: unloggedMiles(prev, agg) };
   return {
-    ...t,
+    ...shapeTrip(env, n, liveBoot(L, now)),
     fuel_level_pct: { start: f0?.fuel_pct ?? null, end: f1?.fuel_pct ?? null },
     fuel_used_by_tank_gauge_gal: f0 && f1 && f0.fuel_pct >= f1.fuel_pct ? r2(((f0.fuel_pct - f1.fuel_pct) / 100) * TANK_GAL) : null,
-    odometer_mi: o0 && o1 ? { start: Math.round(o0.odo_km * KM_TO_MI), end: Math.round(o1.odo_km * KM_TO_MI) } : null,
-    start_location: p0 ? { lat: p0.lat, lon: p0.lon, map: mapsLink(p0.lat, p0.lon) } : null,
-    end_location: p1 ? { lat: p1.lat, lon: p1.lon, map: mapsLink(p1.lat, p1.lon) } : null,
-    note: "Fuel used is integrated from MAF assuming stoichiometric gasoline. The tank gauge figure is a coarse cross-check.",
+    odometer_mi: agg.odo_start != null && agg.odo_end != null
+      ? { start: Math.round(agg.odo_start * KM_TO_MI), end: Math.round(agg.odo_end * KM_TO_MI) } : null,
+    ...(n.nolink_n ? { records_without_adapter_link: n.nolink_n } : {}),
+    ...(withPlaces ? {
+      start_location: p0 ? { lat: p0.lat, lon: p0.lon, map: mapsLink(p0.lat, p0.lon) } : null,
+      end_location: p1 ? { lat: p1.lat, lon: p1.lon, map: mapsLink(p1.lat, p1.lon) } : null,
+    } : {}),
+    note: "Fuel used and MPG are estimates from engine airflow (MAF), assuming E10 pump gasoline. They read low at full " +
+      "throttle and high while coasting. The tank gauge figure is a coarse cross-check. distance_mi is integrated from " +
+      "speed and usually reads about 1% under the odometer.",
   };
 }
 
 // ------------------------------------------------------------ fuel economy
 
-export async function fuelEconomy(env: Env, days: number) {
-  const since = Math.floor(Date.now() / 1000) - days * 86400;
-  const trips = (await tripAggsSince(env, since)).map((t) => shapeTrip(env, t));
-  const miles = trips.reduce((a, t) => a + (t.distance_mi ?? 0), 0);
-  const gal = trips.reduce((a, t) => a + (t.fuel_used_gal ?? 0), 0);
+export async function fuelEconomy(env: Env, days: number, now = nowS()) {
+  const list = (await tripAggsSince(env, now - days * 86400)).map(tripNumbers);
+  const miles = list.reduce((a, t) => a + t.miles, 0);
+  const gal = list.reduce((a, t) => a + t.gallons, 0);
+  const ranked = list.filter((t) => t.mpg != null && t.miles >= RANKED_TRIP_MIN_MILES).map((t) => t.mpg!);
+  const combined = gal > 0.05 ? r1(miles / gal) : null;
+  // A short window is a fair question, so the figure stays. The flag keeps it from being
+  // read as a solid average, which the dashboard only shows from the same minimum on.
+  const fewMiles = combined != null && !enoughMpgMiles(miles);
   return {
     window_days: days,
-    trip_count: trips.length,
+    trip_count: list.length,
     total_miles: r1(miles),
-    total_gallons: r2(gal),
-    combined_mpg: gal > 0.05 ? r1(miles / gal) : null,
-    epa_reference_mpg: { city: 16, highway: 24, combined: EPA_COMBINED_MPG },
-    best_trip_mpg: trips.reduce<number | null>((m, t) => (t.mpg != null && (m == null || t.mpg > m) ? t.mpg : m), null),
-    worst_trip_mpg: trips.reduce<number | null>((m, t) => (t.mpg != null && (m == null || t.mpg < m) ? t.mpg : m), null),
-    trips: trips.slice(0, 20).map((t) => ({ trip_id: t.trip_id, start: t.start, distance_mi: t.distance_mi, mpg: t.mpg })),
+    total_gallons_est: r2(gal),
+    combined_mpg_est: combined,
+    combined_mpg_few_miles: fewMiles,
+    epa_reference_mpg: EPA,
+    best_trip_mpg_est: ranked.length ? Math.max(...ranked) : null,
+    worst_trip_mpg_est: ranked.length ? Math.min(...ranked) : null,
+    // Only the trips that are listed get their time formatted.
+    trips: list.slice(0, 20).map((t) => ({
+      trip_id: t.id, label: tripLabel(t.id), start: fmtTime(env, t.start_ts), distance_mi: t.miles, mpg_est: t.mpg,
+    })),
+    note: `Gallons and MPG are estimates from engine airflow (MAF), not from fill-ups. Best and worst only count trips of ${RANKED_TRIP_MIN_MILES} miles or more. ` +
+      "The trips list holds the 20 newest." +
+      (fewMiles
+        ? ` combined_mpg_est rests on fewer than ${MPG30_MIN_MILES} logged miles, so it is rough and not a solid average. ` +
+          `The dashboard shows no average below ${MPG30_MIN_MILES} miles.`
+        : ""),
+  };
+}
+
+// ------------------------------------------------------------ history
+
+const HISTORY_MAX_TRIPS = 50;
+
+interface DayRow {
+  day: number; km: number | null; maf_g: number | null; engine_s: number | null; moving_s: number | null;
+  max_kph: number | null; max_rpm: number | null; trips: number;
+}
+
+// Totals for a window of whole local days, optionally per day, plus the trips in it.
+// Reads only `minutes` (clipped totals) and `trips` (the list), never `samples`.
+export async function history(
+  env: Env, a: { period?: unknown; from?: unknown; to?: unknown; group_by?: unknown } = {}, now = nowS(),
+) {
+  if (a.group_by != null && a.group_by !== "day") {
+    return badInput(`group_by can only be "day". Leave it out for totals alone.`);
+  }
+  const tz = zoneOf(env);
+  const w = resolveWindow(tz, now, a);
+  if ("error" in w) return w;
+
+  // Minutes are grouped by local day inside SQL. The day changes at local midnight, which is a
+  // different UTC offset on each side of a daylight-saving change, hence the spans.
+  const spans = offsetSpans(tz, w.start, w.end);
+  const [dayRows, touching, first] = await Promise.all([
+    env.DB.prepare(
+      `SELECT ${dayExpr("t", spans)} AS day, SUM(km) AS km, SUM(maf_g) AS maf_g, SUM(engine_s) AS engine_s,
+              SUM(moving_s) AS moving_s, MAX(spd_max) AS max_kph, MAX(rpm_max) AS max_rpm,
+              COUNT(DISTINCT CASE WHEN engine_n > 0 THEN boot END) AS trips
+       FROM minutes WHERE t >= ? AND t < ? GROUP BY 1 ORDER BY 1`,
+    ).bind(w.start, w.end).all<DayRow>(),
+    tripAggsTouching(env, w.start, w.end - 1),
+    // The oldest session of all, one row through the end_ts index.
+    env.DB.prepare(`SELECT start_ts FROM trips WHERE end_ts IS NOT NULL ORDER BY end_ts LIMIT 1`).first<{ start_ts: number | null }>(),
+  ]);
+  const nums = await tripNumbersWithGaps(env, touching);
+  // A window that begins before the logger had any data would read as days without driving.
+  const dataStarts = first?.start_ts ?? null;
+  const uncovered = dataStarts == null || dataStarts > w.start;
+
+  const days = dayRows.results;
+  const sum = (k: "km" | "maf_g" | "engine_s" | "moving_s") => days.reduce((acc, d) => acc + (d[k] ?? 0), 0);
+  const max = (k: "max_kph" | "max_rpm") => days.reduce<number | null>((m, d) => (d[k] != null && (m == null || d[k]! > m) ? d[k] : m), null);
+  const miles = sum("km") * KM_TO_MI, gal = gallonsOf(sum("maf_g"));
+  const driven = days.filter((d) => (d.engine_s ?? 0) > 0 || (d.km ?? 0) > 0);
+  const mph = (kph: number | null) => (kph == null ? null : Math.round(kph * KM_TO_MI));
+  const startedInside = nums.filter((n) => n.start_ts >= w.start && n.start_ts < w.end);
+
+  return {
+    window: {
+      from: dateOfDay(w.from_day), to: dateOfDay(w.to_day), days: w.to_day - w.from_day + 1, time_zone: tz,
+      starts_at: fmtTime(env, w.start), ends_before: fmtTime(env, w.end),
+      ...(uncovered ? { data_starts: fmtTime(env, dataStarts) } : {}),
+    },
+    totals: {
+      distance_mi: r1(miles),
+      fuel_used_gal_est: r2(gal),
+      mpg_est: gal > 0.05 ? r1(miles / gal) : null,
+      engine_on_min: r1(sum("engine_s") / 60),
+      moving_min: r1(sum("moving_s") / 60),
+      idle_min: r1(Math.max(0, sum("engine_s") - sum("moving_s")) / 60),
+      max_speed_mph: mph(max("max_kph")),
+      max_rpm: max("max_rpm"),
+      days_with_driving: driven.length,
+      trip_count: touching.length,
+      // Null when no trip in the window has odometer readings, or when the gap before one of
+      // them is not known, so "none found" and "unknown" differ.
+      unlogged_mi: touching.some((t) => t.odo_start != null) ? unloggedTotal(startedInside) : null,
+    },
+    ...(a.group_by === "day" ? {
+      days: driven.map((d) => {
+        const mi = (d.km ?? 0) * KM_TO_MI, g = gallonsOf(d.maf_g);
+        return {
+          date: dateOfDay(d.day),
+          distance_mi: r1(mi),
+          fuel_used_gal_est: r2(g),
+          mpg_est: g > 0.01 && mi > 0.1 ? r1(mi / g) : null,
+          engine_on_min: r1((d.engine_s ?? 0) / 60),
+          moving_min: r1((d.moving_s ?? 0) / 60),
+          max_speed_mph: mph(d.max_kph),
+          trips: d.trips,
+        };
+      }),
+    } : {}),
+    trips: nums.slice(0, HISTORY_MAX_TRIPS).map((n) => ({
+      trip_id: n.id,
+      label: tripLabel(n.id),
+      start: fmtTime(env, n.start_ts),
+      logger_on_min: r1(n.duration_s / 60),
+      engine_on_min: r1(n.engine_s / 60),
+      distance_mi: n.miles,
+      fuel_used_gal_est: n.gallons,
+      mpg_est: n.mpg,
+      unlogged_before_mi: n.unlogged_before_mi,
+    })),
+    trips_not_listed: Math.max(0, nums.length - HISTORY_MAX_TRIPS),
+    note: "Totals and days count only what happened inside the window. Trips are listed whole, newest first, so a trip that " +
+      "crosses the edge of the window or midnight can show more miles than its day. Fuel and MPG are estimates from engine " +
+      "airflow. Days without driving are left out. unlogged_mi is odometer distance the logger did not record, " +
+      "null when that is not known." +
+      (uncovered
+        ? dataStarts == null
+          ? " The logger has no data at all yet, so zeros here do not mean the car was not driven."
+          : " The logger's data only starts at window.data_starts. Earlier days in the window are not covered, which is not the same as not driven."
+        : ""),
   };
 }

@@ -57,13 +57,17 @@
   .top p { margin: 4px 0 0; color: var(--muted); }
   .status { display: inline-flex; align-items: center; gap: 9px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line2); background: var(--card); font-size: 13px; color: var(--muted); white-space: nowrap; }
   .status b { color: var(--text); font-weight: 600; }
+  .status.bad { border-color: rgba(239,68,68,.55); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
   .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgba(47,191,113,.6); animation: pulse 1.8s infinite; }
+  .dot.warn { background: var(--yellow); }
+  .dot.bad { background: var(--red); }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(47,191,113,.55); } 70% { box-shadow: 0 0 0 9px rgba(47,191,113,0); } 100% { box-shadow: 0 0 0 0 rgba(47,191,113,0); } }
 
   /* ---------- cards ---------- */
   .grid { display: grid; gap: 14px; }
   .kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .two { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; min-width: 0; }
   .card h3 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -100,9 +104,12 @@
   .tip.show { visibility: visible; }
   .tip.below { transform: translate(-50%, 14px); }
   .readout b { color: var(--text); font-weight: 600; }
+  .cnote { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .cnote b { color: var(--text); font-weight: 600; }
 
   /* ---------- map ---------- */
   .map { height: 320px; border-radius: 11px; overflow: hidden; background: #1b1d22; }
+  .maphint { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .leaflet-container { font: inherit; background: #1b1d22; }
   .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.82) contrast(.92) saturate(.6); }
   .leaflet-control-attribution { background: rgba(23,24,29,.8) !important; color: var(--muted) !important; }
@@ -169,7 +176,7 @@
   /* ---------- responsive ---------- */
   @media (max-width: 1180px) { .gauges { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 1020px) {
-    .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kpis, .three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .two { grid-template-columns: minmax(0, 1fr); }
   }
   @media (max-width: 820px) {
@@ -177,6 +184,7 @@
     aside { display: none; }
     main { padding: max(16px, env(safe-area-inset-top)) 16px calc(86px + env(safe-area-inset-bottom)); }
     .top h1 { font-size: 22px; }
+    .status { white-space: normal; }
     .tabs {
       display: grid; grid-template-columns: repeat(5, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
       background: rgba(21,22,26,.94); backdrop-filter: blur(12px); border-top: 1px solid var(--line);
@@ -265,7 +273,7 @@
           <div class="map" id="o-map"></div>
         </div>
         <div class="card">
-          <div class="card-head"><div><h3>Recent trips</h3><div class="sub">Tap one for details</div></div><span class="chip" id="o-trips-chip">–</span></div>
+          <div class="card-head"><div><h3>Recent trips</h3><div class="sub">Engine time shown. Tap one for details</div></div><span class="chip" id="o-trips-chip">–</span></div>
           <ul class="trips" id="o-trips"><li class="empty">Loading…</li></ul>
         </div>
       </div>
@@ -280,7 +288,7 @@
         <div class="card"><div class="card-head"><div><h3>Engine speed</h3><div class="sub">RPM, last 10 minutes</div></div><span class="readout" id="l-rpm-r"></span></div><div class="chart" id="l-rpm"></div></div>
       </div>
       <div class="grid two mt">
-        <div class="card"><div class="card-head"><div><h3>Throttle</h3><div class="sub">Pedal position, %</div></div></div><div class="chart" id="l-thr"></div></div>
+        <div class="card"><div class="card-head"><div><h3>Throttle</h3><div class="sub">Throttle position, %</div></div></div><div class="chart" id="l-thr"></div></div>
         <div class="card"><div class="card-head"><div><h3>Coolant temperature</h3><div class="sub">°F</div></div></div><div class="chart" id="l-cool"></div></div>
       </div>
     </section>
@@ -289,10 +297,10 @@
     <section class="view" id="v-trips">
       <div class="grid two">
         <div class="card">
-          <div class="card-head"><div><h3>Trips</h3><div class="sub">Each ignition cycle is one trip</div></div><span class="chip" id="t-count">–</span></div>
+          <div class="card-head"><div><h3>Trips</h3><div class="sub">A trip is one logger power-up. Times are engine running time.</div></div><span class="chip" id="t-count">–</span></div>
           <ul class="trips" id="t-list" style="max-height:420px"><li class="empty">Loading…</li></ul>
         </div>
-        <div class="card">
+        <div class="card" id="t-route">
           <div class="card-head"><div><h3>Route</h3><div class="sub">Colored by speed</div></div></div>
           <div class="map" id="t-map" style="height:380px"></div>
         </div>
@@ -340,7 +348,6 @@
       <div class="card mt">
         <div class="card-head">
           <div><h3 id="h-metric-title">Speed</h3><div class="sub" id="h-metric-sub">Average per interval</div></div>
-          <span class="readout" id="h-readout"></span>
         </div>
         <div class="seg" id="h-metrics" style="margin-bottom:12px">
           <button data-m="speed">Speed</button>
@@ -352,6 +359,9 @@
           <button data-m="intake">Intake air</button>
           <button data-m="airflow">Airflow</button>
         </div>
+        <!-- On a line of its own with room for two lines. Inside the card head a long value
+             made the head taller and moved the chart under the finger. -->
+        <div class="readout" id="h-readout" style="margin:-4px 0 6px;min-height:2.9em"></div>
         <div class="chart" id="h-chart"></div>
       </div>
 
@@ -377,7 +387,7 @@
           <div class="tablewrap" style="max-height:360px"><table id="h-daytable"></table></div>
         </div>
         <div class="card">
-          <div class="card-head"><div><h3>Trips in this period</h3><div class="sub">Tap one for its full details</div></div><span class="chip" id="h-trips-chip">–</span></div>
+          <div class="card-head"><div><h3>Trips in this period</h3><div class="sub">Engine time shown. Tap one for its full details</div></div><span class="chip" id="h-trips-chip">–</span></div>
           <ul class="trips" id="h-trips" style="max-height:360px"></ul>
         </div>
       </div>
@@ -385,7 +395,7 @@
 
     <!-- ====================================================== LOGS -->
     <section class="view" id="v-logs">
-      <div class="grid kpis" id="g-health"></div>
+      <div class="grid three" id="g-health"></div>
       <div class="card mt">
         <div class="card-head"><div><h3>Upload log</h3><div class="sub">Every batch the logger sent, newest first</div></div><span class="chip" id="g-up-chip">–</span></div>
         <div class="tablewrap" style="max-height:300px"><table id="g-uploads"></table></div>
@@ -417,7 +427,9 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const KM_TO_MI = 0.621371, AFR = 14.7, G_PER_GAL = 2798.7;
+  const KM_TO_MI = 0.621371;
+  // Phones and tablets. There a finger dragged across a map must scroll the page.
+  const TOUCH = !!window.matchMedia && matchMedia("(hover: none) and (pointer: coarse)").matches;
   const PALETTE = ["#3d6ef5", "#2fbf71", "#f0732e", "#e8b423", "#e0457b", "#a855f7", "#22b8cf"];
   const VIEWS = {
     overview: ["Overview", "Your Corvette at a glance"],
@@ -426,10 +438,21 @@
     history: ["History", "Any date or time range"],
     logs: ["Logs", "What the logger sent and when"],
   };
-  const S = { view: null, status: null, trips: [], selected: null, tripData: null, live: null, maps: {} };
+  // err: last failed request that looks like an outage (header and footer). errAt: when the
+  // early retries for an outage last began. note: a failure of one request only (footer).
+  // rows: what the newest request cost. clock: server minus phone time. tripsFails, econFails:
+  // failed loads of the trip list and the economy figures while the server answered.
+  const S = {
+    view: null, status: null, trips: [], selected: null, tripData: null, live: null, maps: {},
+    err: null, errAt: 0, note: null, rows: null, clock: 0, paused: false, shown: null, tripReq: 0, liveReq: 0, reveal: false,
+    tripsFails: 0, econFails: 0,
+  };
 
   // ---------------------------------------------------------------- utils
-  const now = () => Date.now() / 1000;
+  // Server time. Ages are judged against the Worker's clock, so a wrong phone clock cannot flip the state.
+  const now = () => Date.now() / 1000 + S.clock;
+  // Session id as shown. Old firmware: the plain counter. Newer firmware: install id, dash, counter.
+  const sid = (b) => (b < 65536 ? String(b) : `${Math.floor(b / 65536)}-${b % 65536}`);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   function ago(ts) {
     if (!ts) return "never";
@@ -456,41 +479,105 @@
   const f1 = (x) => (x == null || !isFinite(x) ? "–" : (Math.round(x * 10) / 10).toLocaleString());
   const f0 = (x) => (x == null || !isFinite(x) ? "–" : Math.round(x).toLocaleString());
   const cToF = (c) => (c == null ? null : c * 1.8 + 32);
-  const instMpg = (mph, maf) => (maf == null || mph == null || maf < 0.5 ? null : mph / ((maf * 3600) / (AFR * G_PER_GAL)));
+  // The fuel constants come from the server, so the page and the Claude tools use the same ones.
+  function instMpg(mph, maf) {
+    const c = S.status && S.status.car;
+    if (!c || !c.afr || !c.g_per_gal || maf == null || mph == null || maf < 0.5) return null;
+    return mph / ((maf * 3600) / (c.afr * c.g_per_gal));
+  }
   const dbm = (csq) => (csq == null || csq === 99 ? null : -113 + 2 * csq);
   function bars(csq) {
     const n = csq == null || csq === 99 ? 0 : csq >= 20 ? 4 : csq >= 15 ? 3 : csq >= 10 ? 2 : csq >= 5 ? 1 : 0;
     return `<span class="bars">${[5, 8, 11, 14].map((h, i) => `<i class="${i < n ? "on" : ""}" style="height:${h}px"></i>`).join("")}</span>`;
   }
+  // A request that never answers would stop the polling, because the next poll is only set
+  // once this one is done. So each one is given up after 30 s, which still leaves a large
+  // trip or History answer time to arrive on a slow link.
+  const REQUEST_LIMIT_MS = 30000;
+  // Every failure is kept: a rejected fetch (no network) and a server error count as an outage
+  // and go to the header, anything else (a trip that does not exist) only to the footer.
   async function get(path) {
-    const r = await fetch(path, { cache: "no-store" });
-    if (!r.ok) {
-      let msg = `${path} ${r.status}`;
-      try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
-      setFoot(msg, true);
-      throw new Error(msg);
-    }
-    return r.json();
+    const ac = typeof AbortController === "function" ? new AbortController() : null;
+    const limit = ac && setTimeout(() => ac.abort(), REQUEST_LIMIT_MS);
+    let r, d;
+    try {
+      try { r = await fetch(path, { cache: "no-store", signal: ac ? ac.signal : undefined }); }
+      catch { throw fail("No connection to the server", true); }
+      const rr = r.headers.get("X-Rows-Read");
+      if (rr != null && isFinite(+rr)) S.rows = { name: path.split("?")[0], n: +rr };
+      if (!r.ok) {
+        let msg = `Server error ${r.status}`;
+        try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+        throw fail(msg, r.status >= 500);
+      }
+      // The time limit also covers reading the answer. Cut off there, it was the connection.
+      try { d = await r.json(); }
+      catch { throw fail(ac && ac.signal.aborted ? "No connection to the server" : "Unreadable answer from the server", true); }
+    } finally { clearTimeout(limit); }
+    if (d && typeof d.now === "number") S.clock = d.now - Date.now() / 1000;
+    const had = S.err;
+    S.err = null; S.note = null;
+    if (had) renderHeader();
+    renderFoot();
+    return d;
   }
-  function setFoot(msg, bad) {
-    const f = $("foot");
-    f.textContent = msg || "Live data from the OBDLink logger.";
+  function fail(msg, outage) {
+    // A new outage is asked about again soon, whichever request it hit. See schedule(). Not
+    // more than once a minute: one request that keeps failing while the others answer would
+    // otherwise look like a new outage after every poll and keep the page at the fast rate.
+    const fresh = outage && !S.err && Date.now() - S.errAt > RETRY_REST_MS;
+    if (fresh) S.errAt = Date.now();
+    if (outage) S.err = msg; else S.note = msg;
+    renderHeader(); renderFoot();
+    if (fresh) schedule();
+    return new Error(msg);
+  }
+  function renderFoot() {
+    const f = $("foot"), bad = S.err || S.note;
+    let msg = bad || (S.paused ? "Paused to save database reads. Tap anywhere to resume." : "Live data from the OBDLink logger.");
+    if (!bad && S.view === "logs" && S.rows) msg += ` Last request (${S.rows.name}) read ${S.rows.n.toLocaleString()} database rows.`;
+    f.textContent = msg;
     f.style.color = bad ? "var(--red)" : "";
   }
   const L_ = () => (S.status && S.status.latest) || {};
   const lv = (k) => (L_()[k] ? L_()[k].v : null);
   const lt = (k) => (L_()[k] ? L_()[k].ts : null);
-  const engineOn = () => lv("engine_on") === 1 && now() - (lt("engine_on") || 0) < 90;
+  // Takes the car state out of any answer that carries it (status, live, logs).
+  function absorb(d) {
+    S.status = S.status || {};
+    for (const k of ["latest", "state", "rules", "battery", "car", "mpg30", "mpg30_miles", "mpg30_min_miles"]) if (d[k] !== undefined) S.status[k] = d[k];
+  }
+  // The same comparisons as carState() in queries.ts, run again here with the rules the server
+  // sent, so the state keeps moving with the age of the newest record between polls.
+  function carState() {
+    const e = L_().engine_on, R = S.status && S.status.rules, link = L_().link;
+    if (!e) return { state: "unknown", last_seen_ts: null, age_s: null, ended_mid_drive: false, link_down: false };
+    if (!R) return (S.status && S.status.state) || { state: "unknown", last_seen_ts: e.ts, age_s: null, ended_mid_drive: false, link_down: false };
+    const age = Math.max(0, now() - e.ts), on = e.v === 1, lost = age > R.lost_s;
+    return {
+      state: !on || lost ? "parked" : age < R.running_s ? "running" : "no_signal",
+      last_seen_ts: e.ts, age_s: age, ended_mid_drive: on && lost,
+      link_down: !!link && link.v === 0 && age < R.lost_s,
+    };
+  }
+  // Running, or out of contact for a short while: the drive may still be going.
+  const active = () => { const s = carState().state; return s === "running" || s === "no_signal"; };
+  const liveBoot = () => (active() ? L_().engine_on.boot : null);
 
   // ---------------------------------------------------------------- charts
   // Area chart with gradient fill (opts.area) or plain line. Hover shows the nearest point.
+  // What a point is decides the wording: o.minute (1-minute averages), o.bucket = { s, label }
+  // (averages over a longer interval), o.thin (only some of the readings), else every reading.
+  // o.note is a line under the chart that hovering never replaces.
   let gid = 0;
   function chart(el, xs, ys, o) {
     const W = Math.max(260, el.clientWidth || 600), H = o.h || 190, pl = 40, pr = 8, pt = 10, pb = 22;
     const pts = [];
     xs.forEach((x, i) => { if (ys[i] != null) pts.push([x, ys[i]]); });
-    if (pts.length < 2) { el.innerHTML = `<div class="empty">${o.empty || "No data yet"}</div>`; if (o.readout) o.readout.textContent = ""; return; }
-    const x0 = xs[0], x1 = xs[xs.length - 1] > x0 ? xs[xs.length - 1] : x0 + 1;
+    if (!pts.length) { el.innerHTML = `<div class="empty">${o.empty || "No data yet"}</div>`; if (o.readout) o.readout.textContent = ""; return; }
+    let x0 = xs[0], x1 = xs[xs.length - 1];
+    // A single moment has no width. Give it some so its dot sits in the middle.
+    if (!(x1 > x0)) { const pad = o.xpad || 30; x0 -= pad; x1 = x0 + 2 * pad; }
     let y0 = o.min != null ? o.min : Math.min(...pts.map((p) => p[1]));
     let y1 = Math.max(...pts.map((p) => p[1]), o.minMax || 0);
     if (y1 === y0) y1 = y0 + 1;
@@ -499,7 +586,10 @@
     const X = (x) => pl + ((x - x0) / (x1 - x0)) * (W - pl - pr);
     const Y = (y) => pt + (1 - (y - y0) / (y1 - y0)) * (H - pt - pb);
     let line = "", area = "", seg = [];
+    // A stretch with a single point cannot be a line, so it is drawn as a dot.
+    const lone = [];
     const flush = () => {
+      if (seg.length === 1) lone.push(seg[0]);
       if (seg.length < 2) { seg = []; return; }
       line += seg.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join("");
       area += `M${X(seg[0][0]).toFixed(1)},${(H - pb).toFixed(1)}` + seg.map((p) => "L" + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join("") + `L${X(seg[seg.length - 1][0]).toFixed(1)},${(H - pb).toFixed(1)}Z`;
@@ -514,26 +604,36 @@
     const tf = span > 2.5 * 86400 ? (t) => shortDay.format(new Date(t * 1000))
       : span > 8 * 3600 ? (t) => shortDay.format(new Date(t * 1000)) + " " + hourFmt.format(new Date(t * 1000))
       : (t) => timeFmt.format(new Date(t * 1000));
-    const xt = [0, 0.25, 0.5, 0.75, 1].map((f) => x0 + f * (x1 - x0));
+    // Five time labels overlap on a narrow chart (a phone, or one column of a two-column card).
+    const xt = (W < 480 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1]).map((f) => x0 + f * (x1 - x0));
     let svg = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${o.color}" stop-opacity=".45"/><stop offset="1" stop-color="${o.color}" stop-opacity="0"/></linearGradient></defs>`;
     ticks.forEach((v) => { svg += `<line class="gridl" x1="${pl}" x2="${W - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke-dasharray="2 4"/><text x="${pl - 8}" y="${Y(v) + 3.5}" text-anchor="end">${fmt(v)}</text>`; });
-    xt.forEach((t, i) => { svg += `<text x="${X(t)}" y="${H - 5}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${tf(t)}</text>`; });
+    xt.forEach((t, i) => { svg += `<text x="${X(t)}" y="${H - 5}" text-anchor="${i === 0 ? "start" : i === xt.length - 1 ? "end" : "middle"}">${tf(t)}</text>`; });
     if (o.ref != null && o.ref < y1) svg += `<line x1="${pl}" x2="${W - pr}" y1="${Y(o.ref)}" y2="${Y(o.ref)}" stroke="${o.refColor || "#8b8f9a"}" stroke-dasharray="5 4"/>`;
     if (o.area !== false) svg += `<path d="${area}" fill="url(#${id})"/>`;
-    svg += `<path d="${line}" fill="none" stroke="${o.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    if (line) svg += `<path d="${line}" fill="none" stroke="${o.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    // With few points, mark each one, so it is clear how much data the line stands on.
+    const dot = (p, r) => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="${r}" fill="${o.color}"/>`;
+    if (pts.length < 60) svg += pts.map((p) => dot(p, 2.4)).join("");
+    svg += lone.map((p) => dot(p, 3.6)).join("");
     svg += `<line class="hx" y1="${pt}" y2="${H - pb}" stroke="#8b8f9a" opacity="0"/><circle class="hd" r="4.5" fill="${o.color}" stroke="#17181d" stroke-width="2.5" opacity="0"/></svg>`;
-    el.innerHTML = svg;
+    el.innerHTML = svg + (o.note ? `<div class="cnote">${o.note}</div>` : "");
     const s = el.querySelector("svg"), hx = s.querySelector(".hx"), hd = s.querySelector(".hd");
     const avg = pts.reduce((a, p) => a + p[1], 0) / pts.length, mx = Math.max(...pts.map((p) => p[1]));
-    // Per-minute series hold averages, so their highest point is not the true peak. Don't call it max.
+    // Averaged series cannot show the true peak, and a thinned one may have skipped it. Only a
+    // series with every reading may call its highest point "max".
+    const averaged = o.minute || o.bucket;
     const base = o.minute ? `avg <b>${fmt(avg)}</b> ${o.unit} · each point is a 1-minute average`
+      : o.bucket ? `avg <b>${fmt(avg)}</b> · highest average <b>${fmt(mx)}</b> ${o.unit}`
+      : o.thin ? `avg <b>${fmt(avg)}</b> · highest shown <b>${fmt(mx)}</b> ${o.unit}`
       : `avg <b>${fmt(avg)}</b> · max <b>${fmt(mx)}</b> ${o.unit}`;
     if (o.readout) o.readout.innerHTML = base;
     const tip = tipFor(el);
-    // Long ranges show the date as well as the time. Per-minute data shows no seconds.
+    // Long ranges show the date as well as the time. Averages over a minute or more show no seconds.
     const at = span > 20 * 3600 ? (t) => `${dayFmt.format(new Date(t * 1000))}, ${timeFmt.format(new Date(t * 1000))}`
-      : o.minute ? (t) => timeFmt.format(new Date(t * 1000))
+      : o.minute || (o.bucket && o.bucket.s >= 60) ? (t) => timeFmt.format(new Date(t * 1000))
       : (t) => secFmt.format(new Date(t * 1000));
+    const kind = o.minute ? " · 1-min avg" : o.bucket ? ` · ${o.bucket.label} avg` : "";
     const move = (ev) => {
       const r = s.getBoundingClientRect();
       if (!r.width) return;
@@ -543,8 +643,8 @@
       hx.setAttribute("x1", X(b[0])); hx.setAttribute("x2", X(b[0])); hx.setAttribute("opacity", ".45");
       hd.setAttribute("cx", X(b[0])); hd.setAttribute("cy", Y(b[1])); hd.setAttribute("opacity", "1");
       const k = r.width / W;
-      tip.show(X(b[0]) * k, Y(b[1]) * k, `${fmt(b[1])} ${esc(o.unit)}`, at(b[0]) + (o.minute ? " · 1-min avg" : ""));
-      if (o.readout) o.readout.innerHTML = `<b>${fmt(b[1])} ${o.unit}</b> ${o.minute ? "average around" : "at"} ${at(b[0])}`;
+      tip.show(X(b[0]) * k, Y(b[1]) * k, `${fmt(b[1])} ${esc(o.unit)}`, at(b[0]) + kind);
+      if (o.readout) o.readout.innerHTML = `<b>${fmt(b[1])} ${o.unit}</b> ${averaged ? "average around" : "at"} ${at(b[0])}`;
     };
     const clear = () => { hx.setAttribute("opacity", "0"); hd.setAttribute("opacity", "0"); tip.hide(); if (o.readout) o.readout.innerHTML = base; };
     // On a touch screen the value stays up for a moment after the finger lifts.
@@ -589,12 +689,14 @@
     const max = Math.max(epa + 4, ...items.map((t) => t.mpg)) * 1.1;
     const Y = (y) => pt + (1 - y / max) * (H - pt - pb);
     const slot = (W - pl) / items.length, bw = Math.min(46, slot * 0.68);
+    // A date label is about 35 px wide. On a narrow chart only every second or third bar gets one.
+    const every = Math.ceil(40 / slot);
     let svg = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px">`;
     [0, 0.5, 1].forEach((f) => { const v = f * max; svg += `<line class="gridl" x1="${pl}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke-dasharray="2 4"/><text x="${pl - 8}" y="${Y(v) + 3.5}" text-anchor="end">${Math.round(v)}</text>`; });
     items.forEach((t, i) => {
       const x = pl + i * slot + (slot - bw) / 2, y = Y(t.mpg), c = PALETTE[i % PALETTE.length];
       svg += `<rect class="bar" data-i="${i}" x="${x}" y="${y}" width="${bw}" height="${H - pb - y}" rx="7" fill="${c}"/>`;
-      if (items.length <= 12) svg += `<text x="${x + bw / 2}" y="${H - 5}" text-anchor="middle">${esc(dayFmt.format(new Date(t.start_ts * 1000)).replace(/^\w+,?\s*/, ""))}</text>`;
+      if (items.length <= 12 && i % every === 0) svg += `<text x="${x + bw / 2}" y="${H - 5}" text-anchor="middle">${esc(dayFmt.format(new Date(t.start_ts * 1000)).replace(/^\w+,?\s*/, ""))}</text>`;
     });
     svg += `<line x1="${pl}" x2="${W}" y1="${Y(epa)}" y2="${Y(epa)}" stroke="#eceef2" stroke-opacity=".5" stroke-dasharray="5 4"/><text x="${W - 2}" y="${Y(epa) - 5}" text-anchor="end" style="fill:#c4c7cf">EPA ${epa}</text></svg>`;
     el.innerHTML = svg;
@@ -627,7 +729,15 @@
   function getMap(key, elId) {
     if (!window.L) return null;
     if (S.maps[key]) { S.maps[key].map.invalidateSize(); return S.maps[key]; }
-    const map = L.map(elId, { zoomControl: true }).setView([39.5, -98.35], 3);
+    // On a touch screen one finger scrolls the page instead of dragging the map. Two fingers
+    // still reach Leaflet, which pinch-zooms and moves the map with them.
+    const map = L.map(elId, { zoomControl: true, dragging: !TOUCH }).setView([39.5, -98.35], 3);
+    if (TOUCH) {
+      const hint = document.createElement("div");
+      hint.className = "maphint";
+      hint.textContent = "Use two fingers to move the map.";
+      $(elId).after(hint);
+    }
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     }).addTo(map);
@@ -662,18 +772,32 @@
 
   // ---------------------------------------------------------------- status (header + overview)
   async function loadStatus() {
-    try { S.status = await get("api/status"); setFoot(); }
-    catch { return; }
+    let d; try { d = await get("api/status"); } catch { return; }
+    absorb(d);
     renderHeader();
     if (S.view === "overview") renderOverview();
   }
 
+  // The pill shows one thing, the first that applies: paused, a failing connection, then the car.
   function renderHeader() {
-    const on = engineOn(), has = Object.keys(L_()).length > 0;
-    $("dot").className = "dot" + (on ? " on" : "");
-    $("state").textContent = !has ? "Waiting for first upload" : on ? "Engine running" : "Parked";
-    $("updated").textContent = lt("last_upload") ? "· updated " + ago(lt("last_upload")) : "";
-    $("livepill").hidden = !on;
+    const cs = carState(), has = Object.keys(L_()).length > 0;
+    const up = lt("last_upload"), bad = !S.paused && !!S.err;
+    let dot = "", text = "Parked", extra = up ? "· updated " + ago(up) : "";
+    if (S.paused) { text = "Paused"; extra = "· tap to resume"; }
+    else if (S.err) { dot = "bad"; text = S.err; extra = up ? "· last data " + ago(up) : ""; }
+    else if (!S.status) { text = "Loading"; extra = ""; }
+    else if (!has) text = "Waiting for first upload";
+    else if (cs.state === "unknown") text = "No engine data yet";
+    else if (cs.link_down) { dot = "warn"; text = "Adapter link down"; }
+    else if (cs.state === "running") { dot = "on"; text = "Engine running"; }
+    else if (cs.state === "no_signal") { dot = "warn"; text = "No signal since " + timeFmt.format(new Date(cs.last_seen_ts * 1000)); extra = ""; }
+    else if (cs.ended_mid_drive) extra = "· logger went offline mid-drive, " + ago(cs.last_seen_ts);
+    $("dot").className = "dot" + (dot ? " " + dot : "");
+    $("state").textContent = text;
+    $("updated").textContent = extra;
+    $("state").parentNode.classList.toggle("bad", bad);
+    $("livepill").hidden = S.paused || bad || cs.state !== "running";
+    S.shown = text;
     const odo = lv("odo_km");
     $("sideodo").textContent = odo == null ? "Corvette · LT2" : `${f0(odo * KM_TO_MI)} mi`;
   }
@@ -689,27 +813,43 @@
     m.style.background = fuel == null ? "" : fuel < 15 ? "var(--red)" : fuel < 30 ? "var(--yellow)" : "var(--green)";
 
     const basis = s.mpg30 ?? s.car.epa.combined;
+    // The server sends the miles rounded down, so this is the same test it used for mpg30.
+    const few = (s.mpg30_miles || 0) < s.mpg30_min_miles;
     $("k-range").innerHTML = gal == null ? "–" : `${f0(gal * basis)}<small>mi</small>`;
-    $("k-range-d").textContent = gal == null ? "" : s.mpg30 ? `at your ${f1(s.mpg30)} mpg average` : `at EPA ${s.car.epa.combined} mpg, no history yet`;
+    $("k-range-d").textContent = gal == null ? "" : s.mpg30 ? `at your ${f1(s.mpg30)} mpg average`
+      : `at EPA ${s.car.epa.combined} mpg, ${few ? "too few miles logged yet" : "no fuel use readings"}`;
 
     const b = lv("adapter_v");
     $("k-batt").innerHTML = b == null ? "–" : `${f1(b)}<small>V</small>`;
     // Readings only exist while the car is powered, so engine-off values include electrical load.
-    const bs = b == null ? "" : b >= 13 ? '<span class="up">Charging</span>' : b >= 11.8 ? "Engine off, normal" : '<span class="down">Low, check battery</span>';
-    $("k-batt-d").innerHTML = b == null ? "" : `${bs} · ${ago(lt("adapter_v"))}`;
+    // The server says whether the engine ran when this voltage was read. Voltage alone cannot tell.
+    const BATT = {
+      "charging": '<span class="up">Charging</span>', "engine off": "Engine off, normal",
+      "engine on, not charging": "Engine on, not charging", "low": '<span class="down">Low, check battery</span>',
+    };
+    $("k-batt-d").innerHTML = b == null ? "" : [BATT[s.battery], ago(lt("adapter_v"))].filter(Boolean).join(" · ");
 
     $("k-mpg").innerHTML = s.mpg30 == null ? "–" : `${f1(s.mpg30)}<small>mpg</small>`;
-    if (s.mpg30 == null) $("k-mpg-d").textContent = `EPA ${s.car.epa.city} city / ${s.car.epa.highway} hwy`;
-    else {
+    // An empty card says why. The server gives no average under a minimum of logged miles.
+    if (s.mpg30 == null) {
+      const need = s.mpg30_min_miles;
+      $("k-mpg-d").textContent = need == null ? `EPA ${s.car.epa.city} city / ${s.car.epa.highway} hwy`
+        : few ? `Too few miles logged in the last 30 days (${f1(s.mpg30_miles || 0)} of ${need})`
+        : "No fuel use readings in the last 30 days";
+    } else {
       const d = ((s.mpg30 - s.car.epa.combined) / s.car.epa.combined) * 100;
       $("k-mpg-d").innerHTML = `<span class="${d >= 0 ? "up" : "down"}">${d >= 0 ? "+" : ""}${f0(d)}%</span> vs EPA ${s.car.epa.combined} combined`;
     }
 
-    const lat = lv("lat"), lon = lv("lon"), on = engineOn();
+    const lat = lv("lat"), lon = lv("lon"), cs = carState(), st = cs.state, on = st === "running";
     const mp = getMap("o", "o-map");
     if (lat != null && lon != null) {
-      $("o-loc-sub").textContent = (on ? "Live" : "Parked") + " · " + ago(lt("lat"));
-      if (mp) placeMarker(mp, lat, lon, on ? "Now" : "Parked here", on);
+      // Without a signal the car may have moved on, so this is not called parked. With the
+      // adapter link down the position is fresh but nothing is known about the engine.
+      const [word, mark] = cs.link_down ? ["Adapter link down", "Latest position"] : on ? ["Live", "Now"]
+        : st === "no_signal" ? ["Last known", "Last known position"] : ["Parked", "Parked here"];
+      $("o-loc-sub").textContent = word + " · " + ago(lt("lat"));
+      if (mp) placeMarker(mp, lat, lon, mark, on);
       const a = $("o-maps"); a.hidden = false; a.href = `https://maps.google.com/?q=${lat.toFixed(6)},${lon.toFixed(6)}`;
     } else {
       $("o-loc-sub").textContent = "No GPS fix yet";
@@ -723,23 +863,38 @@
     if (t.id === S.selected) li.className = "sel";
     li.innerHTML = `<span class="tico"><svg style="color:${t.miles > 0.2 ? "var(--blue)" : "var(--muted)"}"><use href="#i-car"/></svg></span>
       <div class="w"></div><div class="m"></div><div class="r"></div>`;
-    li.querySelector(".w").textContent = when(t.start_ts);
-    li.querySelector(".m").textContent = `${f1(t.miles)} mi · ${dur(t.duration_s)}` + (t.max_mph ? ` · top ${t.max_mph} mph` : "");
+    li.querySelector(".w").textContent = when(t.start_ts) + (t.id === liveBoot() ? " · in progress" : "");
+    // Engine time, not logger-on time: the logger stays up for a few minutes after the engine stops.
+    li.querySelector(".m").textContent = `${f1(t.miles)} mi · ${dur(t.engine_s)} engine` + (t.max_mph ? ` · top ${t.max_mph} mph` : "") +
+      (t.unlogged_before_mi != null ? ` · ${f1(t.unlogged_before_mi)} mi unlogged before` : "");
     li.querySelector(".r").innerHTML = t.mpg == null ? `–<small>mpg</small>` : `${f1(t.mpg)}<small>mpg</small>`;
-    li.onclick = () => { S.selected = t.id; go("trips"); };
+    li.onclick = () => openTrip(t.id);
     return li;
   }
-  async function loadTrips() {
-    let d; try { d = await get("api/trips?limit=40"); } catch { return; }
-    S.trips = d.trips;
-    if (S.selected == null && d.trips.length) S.selected = d.trips[0].id;
+  // A tap on a trip anywhere. `reveal` makes the details scroll into view once they are drawn.
+  function openTrip(id) {
+    S.selected = id; S.reveal = true;
+    if (S.view === "trips") showTrip(); else go("trips");
+  }
+  // Both trip lists from memory. Also run when the car state flips, for the "in progress" mark.
+  function drawTripLists() {
+    const all = S.trips;
     for (const [id, n] of [["o-trips", 6], ["t-list", 40]]) {
       const ul = $(id); ul.innerHTML = "";
-      if (!d.trips.length) { ul.innerHTML = '<li class="empty">No trips yet. One appears after the engine runs with the logger connected.</li>'; continue; }
-      d.trips.slice(0, n).forEach((t) => ul.appendChild(tripItem(t)));
+      if (!all.length) { ul.innerHTML = '<li class="empty">No trips yet. One appears after the engine runs with the logger connected.</li>'; continue; }
+      all.slice(0, n).forEach((t) => ul.appendChild(tripItem(t)));
     }
-    $("o-trips-chip").textContent = `${d.trips.length} total`;
-    $("t-count").textContent = `${d.trips.length} trips`;
+    // A full list is only the newest part, so it is not called the total.
+    $("o-trips-chip").textContent = S.tripsMore ? `latest ${all.length}` : `${all.length} total`;
+    $("t-count").textContent = S.tripsMore ? `latest ${all.length}` : `${all.length} trip${all.length === 1 ? "" : "s"}`;
+  }
+  async function loadTrips() {
+    // A failure during an outage is not counted. It says nothing about this request.
+    const out = !!S.err;
+    let d; try { d = await get("api/trips?limit=40"); } catch { if (!out) S.tripsFails++; return; }
+    S.trips = d.trips; S.tripsMore = !!d.more; S.tripsLoaded = true;
+    if (S.selected == null && d.trips.length) S.selected = d.trips[0].id;
+    drawTripLists();
     // Refetch the overview chart only when the newest trip actually changed.
     if (d.trips.length) {
       const t0 = d.trips[0], key = `${t0.id}:${t0.end_ts}`;
@@ -750,9 +905,10 @@
 
   async function loadLastDrive(id) {
     // Per-minute series from the rollup: a few dozen rows instead of every reading.
-    let d; try { d = await get(`api/trip/${id}?res=minute`); } catch { return; }
+    // After a failure the key is forgotten, so the next trip list asks again.
+    let d; try { d = await get(`api/trip/${id}?res=minute`); } catch { S.lastDriveKey = null; return; }
     S.lastDrive = d;
-    $("o-drive-sub").textContent = `${when(d.trip.start_ts)} · ${f1(d.trip.miles)} mi · ${dur(d.trip.duration_s)}`;
+    $("o-drive-sub").textContent = `${when(d.trip.start_ts)} · ${f1(d.trip.miles)} mi · ${dur(d.trip.engine_s)} engine`;
     $("o-drive-chip").textContent = d.trip.max_mph ? `top ${d.trip.max_mph} mph` : "parked";
     if (S.view === "overview") drawOverviewCharts();
   }
@@ -763,45 +919,90 @@
   }
 
   async function loadEcon() {
-    try { S.econ = await get("api/economy?days=30"); } catch { return; }
-    $("o-econ-chip").textContent = S.econ.mpg == null ? "no data" : `${f1(S.econ.mpg)} mpg avg`;
+    const out = !!S.err;
+    try { S.econ = await get("api/economy?days=30"); } catch { if (!out) S.econFails++; return; }
+    // No average under the minimum of logged miles, like the Fuel economy card. Then the miles.
+    $("o-econ-chip").textContent = S.econ.mpg != null ? `${f1(S.econ.mpg)} mpg avg` : S.econ.miles > 0 ? `${f1(S.econ.miles)} mi logged` : "no data";
     if (S.view === "overview") drawOverviewCharts();
   }
 
+  const markSelected = () => { for (const li of $("t-list").children) li.classList.toggle("sel", +li.dataset.id === S.selected); };
+
+  // Shows the selected trip. A finished trip that is already loaded (same id and end time) is
+  // drawn from memory. The full-resolution request reads every reading of the trip.
+  function showTrip() {
+    const id = S.selected;
+    if (id == null) return;
+    markSelected();
+    const have = S.tripData && S.tripData.trip.id === id ? S.tripData.trip : null;
+    const listed = S.trips.find((t) => t.id === id);
+    if (have && id !== liveBoot() && (!listed || listed.end_ts === have.end_ts)) {
+      S.tripReq++;  // an answer still on its way for another trip must not replace this one
+      renderTrip();
+    } else loadTrip(id);
+  }
   async function loadTrip(id) {
     S.selected = id;
-    for (const li of $("t-list").children) li.classList.toggle("sel", +li.dataset.id === id);
-    let d; try { d = await get("api/trip/" + id); } catch { return; }
+    markSelected();
+    const req = ++S.tripReq;
+    let d; try { d = await get("api/trip/" + id); } catch { S.reveal = false; return; }
+    if (req !== S.tripReq) return;  // a newer trip was picked while this one loaded
     S.tripData = d;
+    renderTrip();
+  }
+  const tripSub = (t) => `Trip ${sid(t.id)} · ${timeFmt.format(new Date(t.start_ts * 1000))} to ${timeFmt.format(new Date(t.end_ts * 1000))}` +
+    (t.id === liveBoot() ? " · in progress" : "") + (t.fw ? ` · firmware build ${t.fw}` : "");
+  function renderTrip() {
+    const d = S.tripData;
+    // Drawn only while visible. Charts and the map need the real width, and show() comes back here.
+    if (!d || S.view !== "trips") return;
     const t = d.trip;
     $("t-detail").hidden = false;
     $("t-title").textContent = when(t.start_ts);
-    $("t-sub").textContent = `Trip ${t.id} · ${timeFmt.format(new Date(t.start_ts * 1000))} to ${timeFmt.format(new Date(t.end_ts * 1000))}`;
+    $("t-sub").textContent = tripSub(t);
     $("t-csv").href = `api/trip/${t.id}.csv`;
-    $("t-csv").setAttribute("download", `corvette-trip-${t.id}.csv`);
+    $("t-csv").setAttribute("download", `corvette-trip-${sid(t.id)}.csv`);
     const stats = [
-      ["Distance", `${f1(t.miles)} mi`], ["Duration", dur(t.duration_s)], ["Moving", dur(t.moving_s)], ["Engine on", dur(t.engine_s)],
-      ["Fuel used", `${t.gallons.toFixed(2)} gal`], ["MPG", f1(t.mpg)], ["Avg speed", t.avg_mph == null ? "–" : `${f0(t.avg_mph)} mph`],
+      ["Distance", `${f1(t.miles)} mi`], ["By odometer", t.odo_miles == null ? "–" : `${f1(t.odo_miles)} mi`],
+      ["Unlogged before", t.unlogged_before_mi != null ? `${f1(t.unlogged_before_mi)} mi` : d.unlogged_known ? "none" : "–"],
+      ["Engine on", dur(t.engine_s)], ["Moving", dur(t.moving_s)], ["Logger on", dur(t.duration_s)],
+      ["Fuel used (est.)", `${t.gallons.toFixed(2)} gal`], ["MPG (est.)", f1(t.mpg)], ["Avg speed", t.avg_mph == null ? "–" : `${f0(t.avg_mph)} mph`],
       ["Top speed", t.max_mph == null ? "–" : `${t.max_mph} mph`], ["Max RPM", f0(t.max_rpm)], ["Avg RPM", f0(t.avg_rpm)],
       ["Max coolant", t.max_coolant_f == null ? "–" : `${f0(t.max_coolant_f)} °F`],
     ];
     $("t-stats").innerHTML = stats.map(([k, v]) => `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
-    $("t-note").textContent = (t.est ? "Some times in this trip are estimated because the logger had no clock yet. " : "") +
-      "Fuel used is calculated from engine airflow, so it reads high under hard acceleration.";
+    const notes = [];
+    if (t.est) notes.push("Some times in this trip are estimated because the logger had no clock yet.");
+    if (t.unlogged_before_mi != null) notes.push(`The odometer moved ${f1(t.unlogged_before_mi)} mi between the previous trip and this one without being logged.`);
+    if (t.nolink_n) notes.push(`${f0(t.nolink_n)} readings were stored without a link to the OBD adapter.`);
+    if (d.step > 1) notes.push(`The charts show 1 of every ${d.step} readings.`);
+    notes.push("Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.");
+    notes.push("Distance is added up from speed and usually reads about 1% under the odometer.");
+    $("t-note").textContent = notes.join(" ");
     drawTripCharts();
     const m = getMap("t", "t-map");
     if (m && !drawTrack(m, d.track) && m.track == null) {
       const p = d.track && d.track[0];
       if (p) placeMarker(m, p[0], p[1], "Trip position", false);
     }
+    if (S.reveal) { S.reveal = false; revealTrip(); }
+  }
+  // After a tap. Where the layout is one column the route and details sit below the trip list,
+  // so bring the route card up. On a wide screen the map is next to the list already, and the
+  // page only moves when the details are fully below the fold.
+  function revealTrip() {
+    setTimeout(() => {
+      if (matchMedia("(max-width: 1020px)").matches) $("t-route").scrollIntoView({ behavior: "smooth", block: "start" });
+      else if ($("t-detail").getBoundingClientRect().top > innerHeight - 80) $("t-detail").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 60);
   }
   function drawTripCharts() {
     const d = S.tripData; if (!d) return;
-    const s = d.series;
-    chart($("t-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 170, readout: $("t-speed-r") });
-    chart($("t-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 170, readout: $("t-rpm-r") });
-    chart($("t-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, readout: $("t-cool-r"), ref: 220, refColor: "#ef4444" });
-    chart($("t-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, readout: $("t-thr-r"), min: 0 });
+    const s = d.series, thin = d.step > 1;
+    chart($("t-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 170, thin, readout: $("t-speed-r") });
+    chart($("t-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 170, thin, readout: $("t-rpm-r") });
+    chart($("t-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, thin, readout: $("t-cool-r"), ref: 220, refColor: "#ef4444" });
+    chart($("t-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, thin, readout: $("t-thr-r"), min: 0 });
   }
 
   // ---------------------------------------------------------------- live
@@ -819,11 +1020,17 @@
   ];
   function renderLive() {
     const d = S.live; if (!d) return;
-    const on = engineOn();
-    $("l-dot").className = "dot" + (on ? " on" : "");
+    const cs = carState(), on = cs.state === "running" && !cs.link_down;
+    const head = (t) => `<b style="color:var(--text)">${t}</b>`;
+    // The age of the newest reading, as in the header. An upload can be newer than what it carried.
+    const tail = cs.last_seen_ts == null ? "" : `Showing the last readings from ${esc(ago(cs.last_seen_ts))}.`;
+    $("l-dot").className = "dot" + (on ? " on" : cs.state === "no_signal" || cs.link_down ? " warn" : "");
     $("l-banner-t").innerHTML = !d.boot ? "No data yet."
-      : on ? `<b style="color:var(--text)">Engine running.</b> Updates every few seconds as the logger uploads.`
-      : `<b style="color:var(--text)">Engine off.</b> Showing the last readings from ${esc(ago(lt("last_upload")))}.`;
+      : cs.link_down ? `${head("Adapter link down.")} The logger is on but cannot reach the OBD adapter, so engine values are old.`
+      : on ? `${head("Engine running.")} Updates arrive about every 15 s.`
+      : cs.state === "no_signal" ? `${head("No signal since " + esc(timeFmt.format(new Date(cs.last_seen_ts * 1000))) + ".")} The car may be out of coverage or was just switched off. ${tail}`
+      : cs.ended_mid_drive ? `${head("Parked.")} The logger went offline mid-drive, so the end of that drive is missing. ${tail}`
+      : `${head("Engine off.")} ${tail}`;
     const s = d.series || { t: [] };
     const rows = s.t.map((t, i) => ({ t, mph: s.mph[i], rpm: s.rpm[i], throttle: s.throttle[i], coolant_f: s.coolant_f[i], maf: s.maf[i], volts: s.volts[i] }));
     rows.forEach((r) => { r.mpg = instMpg(r.mph, r.maf); if (r.mpg != null) r.mpg = Math.min(r.mpg, 99); });
@@ -859,9 +1066,12 @@
   }
   // Ask only for readings newer than the ones already on screen, then trim to the window.
   async function loadLive() {
-    const prev = S.live;
+    const req = ++S.liveReq, prev = S.live;
     const q = prev && prev.boot != null && prev.last_ms != null ? `&boot=${prev.boot}&since=${prev.last_ms}` : "";
     let d; try { d = await get("api/live?minutes=10" + q); } catch { return; }
+    // Two requests can overlap (opening the view while a poll is out). Both asked for the same
+    // new readings, so only the newest answer is used. An older one would add them twice.
+    if (req !== S.liveReq) return;
     if (d.incremental && prev && prev.series && d.series) {
       for (const k of Object.keys(d.series)) prev.series[k] = prev.series[k].concat(d.series[k]);
       const t = prev.series.t, cut = (t.length ? t[t.length - 1] : 0) - d.window_s;
@@ -872,29 +1082,34 @@
     } else {
       S.live = d;
     }
-    S.status = S.status || { latest: S.live.latest };
-    if (S.status) S.status.latest = S.live.latest;
+    absorb(d);
     renderHeader();
     if (S.view === "live") renderLive();
   }
 
   // ---------------------------------------------------------------- logs
   function flagsTag(f) {
+    if (f & 4) return '<span class="tag bad">no link</span>';
     if (f & 2) return '<span class="tag off">quiet</span>';
     if (f & 1) return '<span class="tag ok">engine</span>';
     return '<span class="tag mid">off</span>';
   }
   async function loadLogs() {
     let d; try { d = await get("api/logs?limit=200"); } catch { return; }
-    S.status = S.status || {}; S.status.latest = d.latest; renderHeader();
+    absorb(d); renderHeader();
     const L = d.latest, h = d.stats.hour || {};
     const lastUp = L.last_upload ? L.last_upload.ts : null;
     const fresh = lastUp && now() - lastUp < 120;
+    // Legacy firmware has no build number and only writes readings while the link is up.
+    const link = L.link ? (L.link.v === 1 ? "Up" : "Down") : "–";
+    const build = L.fw ? (L.fw.v ? `Build ${L.fw.v}` : "Legacy") : "–";
     const cards = [
       ["i-up", "var(--blue)", "Last upload", lastUp ? ago(lastUp) : "never", lastUp ? secFmt.format(new Date(lastUp * 1000)) : "", fresh ? "up" : ""],
       ["i-list", "var(--green)", "Uploads, last hour", f0(h.uploads), `${f0(h.records)} readings · ${f1((h.bytes || 0) / 1024)} KB`, ""],
       ["i-signal", "var(--yellow)", "Cell signal", L.csq ? `${bars(L.csq.v)} ${dbm(L.csq.v) ?? "–"}<small>dBm</small>` : "–", L.csq ? ago(L.csq.ts) : "", ""],
       ["i-sat", "var(--purple)", "GPS", L.sats ? `${L.sats.v}<small>sats</small>` : "No fix", L.lat ? `${L.lat.v.toFixed(5)}, ${L.lon.v.toFixed(5)}` : "Needs a view of the sky", ""],
+      ["i-pulse", "var(--cyan)", "Adapter link", link, L.link ? `Bluetooth to the OBD adapter · ${ago(L.link.ts)}` : "Not reported yet", L.link && L.link.v === 0 ? "down" : ""],
+      ["i-car", "var(--orange)", "Firmware", build, L.fw ? (L.fw.v ? "Build number in the newest reading" : "From before build numbers") : "Not reported yet", ""],
     ];
     $("g-health").innerHTML = cards.map(([ic, col, lab, v, sub, cls]) =>
       `<div class="card kpi"><div class="lab"><span class="ico"><svg style="color:${col}"><use href="#${ic}"/></svg></span>${lab}</div><div class="val ${cls}">${v}</div><div class="delta">${esc(sub)}</div></div>`).join("");
@@ -911,9 +1126,9 @@
     if (!d.ingests.length) $("g-uploads").innerHTML += '<tr><td colspan="5" class="empty">No uploads yet</td></tr>';
 
     $("g-raw-chip").textContent = `newest ${d.samples.length}`;
-    $("g-raw").innerHTML = `<tr><th>Time</th><th class="num">Trip</th><th>State</th><th class="num">mph</th><th class="num">RPM</th><th class="num">Thr %</th><th class="num">MAF g/s</th><th class="num">Coolant °F</th><th class="num">Intake °F</th><th class="num">Fuel %</th><th class="num">Batt V</th><th class="num">ECU V</th><th>Position</th><th class="num">Sats</th><th>Signal</th></tr>` +
+    $("g-raw").innerHTML = `<tr><th>Time</th><th class="num">Session</th><th>State</th><th class="num">mph</th><th class="num">RPM</th><th class="num">Thr %</th><th class="num">MAF g/s</th><th class="num">Coolant °F</th><th class="num">Intake °F</th><th class="num">Fuel %</th><th class="num">Batt V</th><th class="num">ECU V</th><th>Position</th><th class="num">Sats</th><th>Signal</th></tr>` +
       d.samples.map((r) => `<tr><td>${esc(secFmt.format(new Date((r.ts + (r.ms % 1000) / 1000) * 1000)))}${r.ts_est ? ' <span class="tag mid">est</span>' : ""}</td>
-        <td class="num">${r.boot}</td><td>${flagsTag(r.flags)}</td>
+        <td class="num">${sid(r.boot)}</td><td>${flagsTag(r.flags)}</td>
         <td class="num">${r.speed_kph == null ? "–" : Math.round(r.speed_kph * KM_TO_MI)}</td><td class="num">${f0(r.rpm)}</td>
         <td class="num">${f0(r.throttle_pct)}</td><td class="num">${r.maf_gs == null ? "–" : r.maf_gs.toFixed(2)}</td>
         <td class="num">${f0(cToF(r.coolant_c))}</td><td class="num">${f0(cToF(r.intake_c))}</td><td class="num">${f1(r.fuel_pct)}</td>
@@ -922,10 +1137,13 @@
         <td class="num">${r.sats ?? "–"}</td><td>${bars(r.csq)}</td></tr>`).join("");
     if (!d.samples.length) $("g-raw").innerHTML += '<tr><td colspan="15" class="empty">No readings yet</td></tr>';
 
-    $("g-boots").innerHTML = `<tr><th class="num">Session</th><th>Started</th><th>Last reading</th><th class="num">Length</th><th class="num">Readings</th><th class="num">With GPS</th><th class="num">Engine on</th><th>Clock</th></tr>` +
-      d.boots.map((b) => `<tr><td class="num">${b.boot}</td><td>${esc(when(b.first_ts))}</td><td>${esc(ago(b.last_ts))}</td><td class="num">${dur(b.last_ts - b.first_ts)}</td>
+    $("g-boots").innerHTML = `<tr><th class="num">Session</th><th>Started</th><th>Last reading</th><th class="num">Length</th><th class="num">Readings</th><th class="num">With GPS</th><th class="num">Engine on</th><th class="num">No link</th><th>Firmware</th><th>Clock</th></tr>` +
+      d.boots.map((b) => `<tr><td class="num">${sid(b.boot)}</td><td>${esc(when(b.first_ts))}</td><td>${esc(ago(b.last_ts))}</td><td class="num">${dur(b.last_ts - b.first_ts)}</td>
         <td class="num">${f0(b.n)}</td><td class="num">${f0(b.gps)}</td><td class="num">${f0(b.engine)}</td>
+        <td class="num">${b.nolink ? f0(b.nolink) : "–"}</td><td>${b.fw ? "build " + b.fw : "legacy"}</td>
         <td>${b.est ? '<span class="tag mid">partly estimated</span>' : '<span class="tag ok">set</span>'}</td></tr>`).join("");
+    if (!d.boots.length) $("g-boots").innerHTML += '<tr><td colspan="10" class="empty">No sessions yet</td></tr>';
+    renderFoot();
   }
 
   // ---------------------------------------------------------------- history
@@ -959,7 +1177,8 @@
   }
   const toInput = (ts) => { const d = new Date(ts * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
   const fromInput = (v) => (v ? Math.floor(new Date(v).getTime() / 1000) : null);
-  const durShort = (s) => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60); return h ? `${h}h ${m}m` : `${m} min`; };
+  // Whole minutes first, then split. Rounding the minutes after the split could print "1h 60m".
+  const durShort = (s) => { const m = Math.round((s || 0) / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m} min`; };
   const bucketLabel = (b) => (b < 60 ? `${b} s` : b < 3600 ? `${b / 60} min` : b < 86400 ? `${b / 3600} h` : "day");
 
   function setRange(preset, from, to) {
@@ -983,7 +1202,8 @@
     $("h-label").textContent = `${longDay.format(new Date(from * 1000))}, ${timeFmt.format(new Date(from * 1000))}  to  ${longDay.format(new Date(to * 1000))}, ${timeFmt.format(new Date(to * 1000))}`;
     const req = (S.hist.req = (S.hist.req || 0) + 1);
     let d;
-    try { d = await get(`api/history?from=${from}&to=${to}`); } catch { $("h-label").textContent += " · could not load"; return; }
+    // An older range that fails late, for example cut off by the time limit, says nothing about the one on screen.
+    try { d = await get(`api/history?from=${from}&to=${to}`); } catch { if (req === S.hist.req) $("h-label").textContent += " · could not load"; return; }
     if (req !== S.hist.req) return;  // a newer range was picked while this one loaded
     S.hist.data = d;
     renderHistory();
@@ -991,12 +1211,12 @@
 
   function renderHistory() {
     const d = S.hist.data; if (!d) return;
-    const T = d.totals;
+    const T = d.totals, epa = d.epa.combined;
     const k = [
       ["i-route", "var(--blue)", "Distance", `${f1(T.miles)}<small>mi</small>`, `${d.trips.length} trip${d.trips.length === 1 ? "" : "s"}`],
       ["i-clock", "var(--cyan)", "Drive time", durShort(T.engine_s), `${durShort(T.moving_s)} moving · ${durShort(T.idle_s)} idle`],
       ["i-fuel", "var(--green)", "Fuel used", `${T.gallons.toFixed(2)}<small>gal</small>`, T.fuel_min != null ? `tank ${f0(T.fuel_max)}% → ${f0(T.fuel_min)}%` : "&nbsp;"],
-      ["i-drop", "var(--purple)", "Fuel economy", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`, T.mpg == null ? "Needs some driving" : `<span class="${T.mpg >= 19 ? "up" : "down"}">${T.mpg >= 19 ? "+" : ""}${f0(((T.mpg - 19) / 19) * 100)}%</span> vs EPA 19`],
+      ["i-drop", "var(--purple)", "Fuel economy", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`, T.mpg == null ? "Needs some driving" : `<span class="${T.mpg >= epa ? "up" : "down"}">${T.mpg >= epa ? "+" : ""}${f0(((T.mpg - epa) / epa) * 100)}%</span> vs EPA ${epa}`],
       ["i-gauge", "var(--orange)", "Top speed", T.max_mph == null ? "–" : `${T.max_mph}<small>mph</small>`, T.max_rpm ? `max ${f0(T.max_rpm)} rpm` : "&nbsp;"],
       ["i-temp", "var(--yellow)", "Coolant", T.avg_coolant_f == null ? "–" : `${f0(T.avg_coolant_f)}<small>°F avg</small>`, T.max_coolant_f == null ? "&nbsp;" : `max ${f0(T.max_coolant_f)} °F`],
     ];
@@ -1037,6 +1257,7 @@
       ["Max throttle", T.max_throttle == null ? "–" : `${T.max_throttle} %`],
       ["Intake air range", T.iat_min_f == null ? "–" : `${f0(T.iat_min_f)} to ${f0(T.iat_max_f)} °F`],
       ["Idle time", durShort(T.idle_s)], ["Readings", f0(T.samples)], ["GPS points", f0(T.gps_points)],
+      ["Driven but not logged", T.unlogged_mi == null ? "–" : `${f1(T.unlogged_mi)} mi`],
     ];
     $("h-extremes").innerHTML = X.map(([kk, v]) => `<div class="stat"><div class="k">${esc(kk)}</div><div class="v">${esc(v)}</div></div>`).join("");
 
@@ -1044,7 +1265,9 @@
     if (m) {
       if (m.track) { m.map.removeLayer(m.track); m.track = null; }
       const routes = Object.values(d.routes || {});
-      $("h-map-sub").textContent = routes.length ? `${routes.length} drive${routes.length === 1 ? "" : "s"} with GPS, colored by speed` : "No GPS positions in this period";
+      // The server keeps the newest points when a long period has more than the map limit.
+      $("h-map-sub").textContent = (routes.length ? `${routes.length} drive${routes.length === 1 ? "" : "s"} with GPS, colored by speed` : "No GPS positions in this period") +
+        (d.route_cut ? `. Route cut: only the newest ${f0(d.route_limit)} points are drawn, so the oldest drives are missing.` : "");
       if (routes.length) {
         m.track = L.layerGroup().addTo(m.map);
         const all = [];
@@ -1066,17 +1289,21 @@
     const [title, unit, color, key, maxKey, dec] = METRICS[S.hist.metric];
     document.querySelectorAll("#h-metrics button").forEach((b) => b.classList.toggle("active", b.dataset.m === S.hist.metric));
     $("h-metric-title").textContent = title;
-    $("h-metric-sub").textContent = `Average per ${bucketLabel(d.bucket)}` + (maxKey ? ", peak shown in the readout" : "");
+    const every = bucketLabel(d.bucket);
+    $("h-metric-sub").textContent = `Average per ${every}`;
     // Break the line wherever there is no data for more than a couple of intervals.
     const xs = [], ys = [];
     d.series.t.forEach((t, i) => {
       if (i && t - d.series.t[i - 1] > d.bucket * 2.5) { xs.push(t - d.bucket); ys.push(null); }
       xs.push(t); ys.push(d.series[key][i]);
     });
+    // The line is made of averages, so the true peak goes in the note under the chart, where
+    // hovering does not replace it.
     const peak = maxKey ? Math.max(...d.series[maxKey].filter((v) => v != null)) : null;
+    const note = `Each point is the average over ${every === "day" ? "one day" : every}.` +
+      (maxKey && isFinite(peak) ? ` Highest single reading in this period: <b>${dec ? peak.toFixed(dec) : f0(peak)} ${esc(unit)}</b>.` : "");
     chart($("h-chart"), xs, ys, { color, unit, h: 230, dec, readout: $("h-readout"), min: key === "battery" ? null : 0,
-      empty: "No readings in this period" });
-    if (maxKey && isFinite(peak)) $("h-readout").innerHTML += ` · peak <b>${dec ? peak.toFixed(dec) : f0(peak)}</b>`;
+      bucket: { s: d.bucket, label: every }, xpad: d.bucket / 2, note, empty: "No readings in this period" });
   }
 
   function dayBars(el, list) {
@@ -1087,7 +1314,8 @@
     const slot = (W - pl) / list.length, bw = Math.max(3, Math.min(44, slot * 0.7));
     let svg = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px">`;
     [0, 0.5, 1].forEach((f) => { const v = f * max; svg += `<line class="gridl" x1="${pl}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke-dasharray="2 4"/><text x="${pl - 8}" y="${Y(v) + 3.5}" text-anchor="end">${f0(v)}</text>`; });
-    const every = Math.ceil(list.length / 10);
+    // At most ten labels, and none closer than about one label width (a phone).
+    const every = Math.max(Math.ceil(list.length / 10), Math.ceil(40 / slot));
     list.forEach((e, i) => {
       const x = pl + i * slot + (slot - bw) / 2, y = Y(e.miles), c = PALETTE[i % PALETTE.length];
       svg += `<rect class="dbar" data-i="${i}" data-day="${e.day}" x="${x}" y="${y}" width="${bw}" height="${Math.max(1, H - pb - y)}" rx="${Math.min(7, bw / 3)}" fill="${c}" style="cursor:pointer"/>`;
@@ -1113,16 +1341,20 @@
   function show(hash) {
     const [first, arg] = String(hash || "").split("/");
     const view = VIEWS[first] ? first : "overview";
+    const changed = view !== S.view;
     S.view = view;
     document.querySelectorAll(".view").forEach((v) => v.classList.toggle("show", v.id === "v-" + view));
     document.querySelectorAll("[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
     $("title").textContent = VIEWS[view][0]; $("subtitle").textContent = VIEWS[view][1];
+    // A new view starts at its top, not at the scroll offset of the one before.
+    if (changed) window.scrollTo(0, 0);
     if (view === "overview") { renderOverview(); drawOverviewCharts(); }
     if (view === "live") { renderLive(); loadLive(); }
-    if (view === "trips" && S.selected != null) loadTrip(S.selected);
+    if (view === "trips") showTrip();
     if (view === "logs") loadLogs();
     if (view === "history") parseHistoryHash(arg);
     setTimeout(() => Object.values(S.maps).forEach((m) => m.map.invalidateSize()), 50);
+    renderFoot();
     schedule();
   }
   document.querySelectorAll("[data-view]").forEach((b) => (b.onclick = () => go(b.dataset.view)));
@@ -1132,19 +1364,35 @@
   // so poll no faster than the logger uploads (every 15 s), slow down while parked, stop while
   // the tab is hidden, and pause entirely after 15 minutes without any interaction.
   const IDLE_PAUSE_MS = 15 * 60 * 1000;
-  let timer = null, lastInput = Date.now(), paused = false;
+  const LONG_AWAY_MS = 5 * 60 * 1000;
+  const RETRY_MS = 5000, RETRY_WINDOW_MS = 8000, RETRY_REST_MS = 60000;
+  const WATCH_GAP_S = 2 * 3600;
+  let timer = null, lastInput = Date.now(), hiddenAt = 0;
   function schedule() {
     clearTimeout(timer);
-    if (document.hidden || paused) return;
-    const on = engineOn();
-    const ms = S.view === "live" ? (on ? 15000 : 60000) : S.view === "logs" ? (on ? 30000 : 120000) : on ? 20000 : 60000;
+    if (document.hidden || S.paused) return;
+    // A car that just lost signal may come back any moment, so it keeps the fast rate.
+    const on = active();
+    let ms = S.view === "live" ? (on ? 15000 : 60000) : S.view === "logs" ? (on ? 30000 : 120000) : on ? 20000 : 60000;
+    // Right after a request failed, ask again soon: often it was one lost request and the
+    // header would say "no connection" for a whole poll period. A failed request reads no
+    // database rows. If the retries fail too, the normal rate is back after a few seconds.
+    if (S.err && Date.now() - S.errAt < RETRY_WINDOW_MS) ms = RETRY_MS;
     timer = setTimeout(tick, ms);
+  }
+  // A drive being watched on the Live view is never paused, however long the phone lies
+  // untouched. That holds through a long gap in the uploads too (no coverage): the last
+  // reading had the engine on, so the drive may still be going and its readings may arrive later.
+  function watchingDrive() {
+    const cs = carState();
+    return S.view === "live" && (active() || (cs.ended_mid_drive && cs.age_s < WATCH_GAP_S));
   }
   let n = 0;
   async function tick() {
-    if (Date.now() - lastInput > IDLE_PAUSE_MS) {
-      paused = true;
-      setFoot("Paused to save database reads. Tap anywhere to resume.");
+    clearTimeout(timer);
+    if (Date.now() - lastInput > IDLE_PAUSE_MS && !watchingDrive()) {
+      S.paused = true;
+      renderHeader(); renderFoot();
       return;
     }
     n++;
@@ -1153,18 +1401,48 @@
     else await loadStatus();
     // Short ranges that end now move with the clock. Long and past ranges only reload on demand.
     if (S.view === "history" && (S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) setRange(S.hist.preset);
-    if (n % 6 === 0) { loadTrips(); loadEcon(); }
+    // Every sixth poll. A first load that failed while the server answered is asked once more
+    // on the next poll, not on every one: a request that keeps failing would otherwise keep
+    // the header on the error and the polls at the fast rate.
+    if (n % 6 === 0 || (!S.tripsLoaded && S.tripsFails < 2)) loadTrips();
+    if (n % 6 === 0 || (!S.econ && S.econFails < 2)) loadEcon();
     schedule();
+  }
+  // Back after a pause or a long time in the background: the trip list and the economy figures
+  // are stale too, not only the view that polls.
+  function resume() {
+    lastInput = Date.now();
+    S.paused = false;
+    renderHeader(); renderFoot();
+    tick();
+    loadTrips(); loadEcon();
   }
   function wake() {
     lastInput = Date.now();
-    if (paused) { paused = false; setFoot(); tick(); }
+    if (S.paused) resume();
   }
   ["pointerdown", "keydown", "wheel", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { clearTimeout(timer); return; }
-    lastInput = Date.now(); paused = false; tick();
+    if (document.hidden) { clearTimeout(timer); hiddenAt = Date.now(); return; }
+    if (S.paused || Date.now() - hiddenAt > LONG_AWAY_MS) resume();
+    else { lastInput = Date.now(); tick(); }
   });
+  // The state depends on the age of the newest reading, so the header is re-evaluated between
+  // polls without a request. When the state has changed since the last look (by age or by a
+  // poll), the open view, the "in progress" marks and the poll rate follow.
+  let handled = null;
+  setInterval(() => {
+    renderHeader();
+    if (S.shown === handled) return;
+    const first = handled === null;
+    handled = S.shown;
+    if (S.view === "overview") renderOverview();
+    if (S.view === "live") renderLive();
+    if (S.tripsLoaded) drawTripLists();
+    if (S.view === "trips" && S.tripData) $("t-sub").textContent = tripSub(S.tripData.trip);
+    // The first look is not a change, and the poll timer is already set for it.
+    if (!first) schedule();
+  }, 10000);
   let rt;
   addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (S.view === "overview") drawOverviewCharts(); if (S.view === "trips") drawTripCharts(); if (S.view === "live") renderLive(); if (S.view === "history") renderHistory(); }, 150); });
 
@@ -1172,8 +1450,9 @@
   (async () => {
     show(location.hash.slice(1) || "overview");
     await loadStatus();
+    // show() set the poll timer before the car state was known, so at the parked rate.
+    schedule();
     loadTrips(); loadEcon();
-    if (S.view === "overview") renderOverview();
   })();
 })();
 </script>
