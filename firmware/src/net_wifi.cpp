@@ -12,7 +12,13 @@ namespace net {
 static uint32_t s_lastTry = 0;
 
 bool begin() {
-  if (strlen(WIFI_SSID) == 0) { Serial.println("[wifi] no SSID configured, upload disabled"); return false; }
+  if (strlen(WIFI_SSID) == 0) {
+    // The net task calls this again every NET_BEGIN_RETRY_MS. Say it once.
+    static bool said = false;
+    if (!said) Serial.println("[wifi] no SSID configured, upload disabled");
+    said = true;
+    return false;
+  }
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");

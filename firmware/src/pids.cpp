@@ -4,15 +4,23 @@
 
 namespace pids {
 
-// A supported PID that keeps answering NO DATA is dropped for the session. Timeouts and
-// bus errors do not count, since they say nothing about the PID itself.
+// A supported PID that answers NO DATA 3 times in a row is skipped. Timeouts and bus
+// errors do not count, since they say nothing about the PID itself. Once a minute while
+// polling the strikes are cleared and a skipped PID is asked again: an ECU that is slow
+// to answer at the start of a drive once cost a whole drive of speed and temperatures.
+// A PID the car never answers then costs at most 3 requests a minute. RPM (0C) is
+// never skipped: the engine gate runs on it, and three NO DATA answers during a short
+// stop would otherwise end all polling until the gate has gone quiet and come back.
 static uint8_t s_noData[256];
 static const uint8_t kMaxNoData = 3;
+static const uint32_t kClearStrikesEveryMs = 60000;
+static uint32_t s_strikesSince = 0;  // millis() when the strikes were last cleared
+static bool s_lastRpmOk = false;     // the last pollFast() had an RPM reply
 
 // Supported-PID bitmasks from 0100, 0120, ... 01E0. Bit 31 of mask[i] is PID i*0x20+1.
 static uint32_t s_mask[8];
 static bool s_haveMask = false;
-static uint32_t s_lastSearchMs = 0;
+static bool s_searched = false;  // the automatic protocol search has run in this boot
 
 static uint8_t  s_fuelRaw;
 static uint16_t s_ecuMv;
@@ -21,11 +29,17 @@ static uint16_t s_slowValid;
 
 static const uint8_t kOurPids[] = {0x0C, 0x0D, 0x05, 0x0F, 0x10, 0x11, 0x2F, 0x42, 0xA6};
 
-void reset() {
+static void clearStrikes() {
   memset(s_noData, 0, sizeof(s_noData));
+  s_strikesSince = millis();
+}
+
+void reset() {
+  clearStrikes();
   memset(s_mask, 0, sizeof(s_mask));
   s_haveMask = false;
   s_slowValid = 0;
+  s_lastRpmOk = false;
 }
 
 static int hexNibble(char c) {
@@ -79,15 +93,16 @@ static bool supported(uint8_t pid) {
 }
 
 // "010C1": trailing response count makes the STN return after the first reply
-// instead of waiting out the timeout for other ECUs.
+// instead of waiting out the timeout for other ECUs. RPM skips the support mask too:
+// a mask that lost the ECM's line must not silence the one PID the gate runs on.
 static bool query(uint8_t pid, uint8_t* out, int nbytes) {
-  if (!supported(pid) || s_noData[pid] >= kMaxNoData) return false;
+  if ((pid != 0x0C && !supported(pid)) || s_noData[pid] >= kMaxNoData) return false;
   char c[8];
   snprintf(c, sizeof(c), "01%02X1", pid);
   String r = obd::cmd(c, OBD_CMD_TIMEOUT_MS);
   if (parseMode01(r, pid, out, nbytes)) { s_noData[pid] = 0; return true; }
-  if (r.indexOf("NO DATA") >= 0 && ++s_noData[pid] == kMaxNoData) {
-    Serial.printf("[pid] 01%02X keeps returning NO DATA, dropped for this session\n", pid);
+  if (pid != 0x0C && r.indexOf("NO DATA") >= 0 && ++s_noData[pid] == kMaxNoData) {
+    Serial.printf("[pid] 01%02X keeps returning NO DATA, skipped until the next minute\n", pid);
   }
   return false;
 }
@@ -126,33 +141,49 @@ static void report() {
   Serial.printf("[pid] ECU supports: %s| not supported: %s\n", yes.c_str(), no.length() ? no.c_str() : "none");
 }
 
-bool probe(bool allowSearch) {
-  memset(s_noData, 0, sizeof(s_noData));
+bool probe() {
+  clearStrikes();
   String why;
   if (readMasks(OBD_PROBE_TIMEOUT_MS, why)) { report(); return true; }
   why.replace("\n", " / ");
   Serial.printf("[pid] no answer to 0100 on protocol %c (%s)\n", obd::protocol(), why.c_str());
+  return false;
+}
 
-  // Fallback: let the adapter search every protocol, at most once a minute.
-  if (!allowSearch || (s_lastSearchMs && millis() - s_lastSearchMs < 60000)) return false;
-  s_lastSearchMs = millis();
+// Ends the search mode: fixes the adapter on the protocol in use. An adapter left on
+// automatic would turn every later probe into a search of its own. So the answer is
+// checked, and without an OK the link is dropped: the reconnect sets the protocol from
+// a clean ATZ.
+static void fixProtocol() {
+  String r = obd::cmd((String("ATSP") + obd::protocol()).c_str(), OBD_CMD_TIMEOUT_MS);
+  if (r.indexOf("OK") >= 0) return;
+  Serial.println("[pid] the adapter did not confirm the protocol, reconnecting");
+  obd::disconnect();
+}
+
+// At most once per boot, because the search puts traffic on the bus for seconds and a
+// parked car should not see that twice.
+bool searchProtocol() {
+  if (s_searched) return false;
+  s_searched = true;
+  String why;
   Serial.println("[pid] trying the adapter's automatic protocol search (up to 12 s)");
   obd::cmd("ATSP0", OBD_CMD_TIMEOUT_MS);
   bool ok = readMasks(OBD_SEARCH_TIMEOUT_MS, why);
   if (ok) {
-    // ATDPN answers like "A7": automatic, protocol 7. Lock it in and remember it.
+    // ATDPN answers like "A7": automatic, protocol 7. Lock it in and remember it. An
+    // answer that is not understood changes nothing, and the stored protocol is set again.
     String p = obd::cmd("ATDPN", OBD_CMD_TIMEOUT_MS);
     p.trim();
     Serial.printf("[pid] search found protocol %s\n", p.c_str());
     if (p.length() == 2 && p[0] == 'A') p = p.substring(1);
-    if (p.length() == 1) {
-      obd::setProtocol(p[0]);
-      obd::cmd((String("ATSP") + p).c_str(), OBD_CMD_TIMEOUT_MS);
-    }
+    if (p.length() == 1) obd::setProtocol(p[0]);
+    fixProtocol();
     report();
     return true;
   }
-  obd::cmd((String("ATSP") + obd::protocol()).c_str(), OBD_CMD_TIMEOUT_MS);
+  Serial.println("[pid] search found nothing, back to the stored protocol");
+  fixProtocol();
   return false;
 }
 
@@ -173,7 +204,22 @@ float adapterVolts() {
 
 void pollFast(Record& r) {
   uint8_t b[4];
-  if (query(0x0C, b, 2)) { r.rpm = ((b[0] << 8) | b[1]) / 4; r.valid |= V_RPM; }
+  // Polling is the only caller, so this never runs while quiet, and it sends nothing.
+  if (millis() - s_strikesSince >= kClearStrikesEveryMs) clearStrikes();
+  // No RPM reply in this tick and the one before: no further questions. A car that is
+  // shutting down gets one request per second for the 20 s until the gate goes quiet,
+  // after one round of the others in the first tick without RPM. That round adds at most
+  // one NO DATA strike per PID. One lost RPM reply on a running engine costs only the
+  // RPM value: the backend counts a record without speed and airflow as no distance and
+  // no fuel.
+  bool ok = query(0x0C, b, 2);
+  bool prev = s_lastRpmOk;
+  s_lastRpmOk = ok;
+  if (!ok && !prev) return;
+  if (ok) {
+    r.rpm = ((b[0] << 8) | b[1]) / 4;
+    r.valid |= V_RPM;
+  }
   if (query(0x0D, b, 1)) { r.speed_kph = b[0]; r.valid |= V_SPEED; }
   if (query(0x10, b, 2)) { r.maf_cgs = (b[0] << 8) | b[1]; r.valid |= V_MAF; }  // (256A+B)/100 g/s
   if (query(0x11, b, 1)) { r.throttle_pct = (uint8_t)(b[0] * 100 / 255); r.valid |= V_THROTTLE; }

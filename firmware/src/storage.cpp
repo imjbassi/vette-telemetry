@@ -1,148 +1,183 @@
 #include "storage.h"
 #include <LittleFS.h>
-#include <vector>
-#include <algorithm>
+#include <sys/stat.h>
 #include "config.h"
+#include "seg_queue.h"
 
+// The queue's rules live in include/seg_queue.h, where the host tests can run them. This
+// file gives that logic the LittleFS calls, one mutex around everything, and the log lines.
 namespace storage {
+
+static const char* kMount = "/littlefs";  // LittleFS mount point. stat() needs the full path.
+
+// The bench build stores scripted records: a made-up drive, position and odometer. They
+// go to a folder of their own, so a normal build flashed onto the same board later can
+// never find them and upload them as a real drive.
+#if BENCH
+#define QUEUE_DIR "/qbench"
+#else
+#define QUEUE_DIR "/q"
+#endif
+
+static String segPath(uint32_t n) {
+  char p[24];  // "/qbench/4294967295.bin" is 22 characters
+  snprintf(p, sizeof(p), QUEUE_DIR "/%08lu.bin", (unsigned long)n);
+  return String(p);
+}
+
+struct LittleFsSegments : segq::Fs {
+  File cur;
+
+  // Reads the directory only. Opening every file here made each upload cycle slower as
+  // the queue grew, with the writer waiting on the same mutex.
+  std::vector<uint32_t> list() override {
+    std::vector<uint32_t> v;
+    File d = LittleFS.open(QUEUE_DIR);
+    if (!d) return v;
+    for (String path = d.getNextFileName(); path.length(); path = d.getNextFileName()) {
+      const char* name = path.c_str() + path.lastIndexOf('/') + 1;  // "/q/00000042.bin"
+      uint32_t n = strtoul(name, nullptr, 10);
+      if (n) v.push_back(n);
+    }
+    return v;
+  }
+
+  // The committed size, without opening the file.
+  long sizeOf(uint32_t n) override {
+    struct stat st;
+    String p = String(kMount) + segPath(n);
+    return stat(p.c_str(), &st) == 0 ? (long)st.st_size : -1;
+  }
+
+  bool openForAppend(uint32_t n) override {
+    cur = LittleFS.open(segPath(n), FILE_APPEND, true);
+    return (bool)cur;
+  }
+
+  bool write(const uint8_t* p, size_t n) override { return cur.write(p, n) == n; }
+  void flush() override { cur.flush(); }
+  void close() override { cur.close(); }
+
+  size_t read(uint32_t n, size_t off, uint8_t* buf, size_t len) override {
+    File f = LittleFS.open(segPath(n));
+    if (!f) return 0;
+    if (off && !f.seek(off)) return 0;
+    return f.read(buf, len);
+  }
+
+  bool remove(uint32_t n) override { return LittleFS.remove(segPath(n)); }
+  size_t usedBytes() override { return LittleFS.usedBytes(); }
+};
 
 static SemaphoreHandle_t s_mtx;
 static bool s_ok = false;  // false = no filesystem, records are dropped (logged once)
-static File s_cur;
-static uint32_t s_curSeg = 0;
-static uint32_t s_unflushed = 0;
+static LittleFsSegments s_fs;
+static segq::Queue s_q(s_fs);
+static uint32_t s_noFs = 0;  // records dropped because there is no filesystem
+static size_t s_fsTotal = 0;
 
 struct Lock {
   Lock() { xSemaphoreTake(s_mtx, portMAX_DELAY); }
   ~Lock() { xSemaphoreGive(s_mtx); }
 };
 
-static String segPath(uint32_t n) {
-  char p[24];
-  snprintf(p, sizeof(p), "/q/%08lu.bin", (unsigned long)n);
-  return String(p);
-}
-
-// Sorted list of segment numbers on disk (including the open one).
-static std::vector<uint32_t> listSegs() {
-  std::vector<uint32_t> v;
-  File d = LittleFS.open("/q");
-  if (!d) return v;
-  for (File f = d.openNextFile(); f; f = d.openNextFile()) {
-    const char* name = f.name();  // "00000042.bin" (no dir on arduino-esp32 2.x)
-    const char* slash = strrchr(name, '/');
-    if (slash) name = slash + 1;
-    v.push_back(strtoul(name, nullptr, 10));
+// Says what the queue just did, by comparing its counters with their values before the call.
+struct Report {
+  uint32_t lost = s_q.lostWrites(), capped = s_q.capSegments(), noFile = s_q.openFailures();
+  uint32_t unread = s_q.unreadable(), gaveUp = s_q.lostSegments(), stuck = s_q.stuckSegments();
+  ~Report() {
+    if (s_q.lostSegments() != gaveUp) {
+      Serial.printf("[fs] a segment could not be read in %u tries and is skipped, %lu records counted as dropped\n",
+                    (unsigned)segq::kReadTries + 1, (unsigned long)(s_q.unreadable() - unread));
+    }
+    if (s_q.stuckSegments() != stuck) {
+      Serial.println("[fs] an uploaded segment could not be deleted. It will not be sent again");
+    }
+    if (s_q.lostWrites() != lost) {
+      Serial.printf("[fs] write failed, %lu records lost (%lu since boot)\n", (unsigned long)(s_q.lostWrites() - lost),
+                    (unsigned long)s_q.lostWrites());
+    }
+    if (s_q.capSegments() != capped) {
+      Serial.printf("[fs] flash over %d%% full, deleted the %lu oldest segments (%lu records dropped since boot)\n",
+                    QUEUE_MAX_PCT, (unsigned long)(s_q.capSegments() - capped), (unsigned long)s_q.dropped());
+    }
+    // Once a minute at 1 Hz is enough.
+    if (s_q.openFailures() != noFile && noFile % 60 == 0) {
+      Serial.println("[fs] cannot open a segment file, records are being dropped");
+    }
   }
-  std::sort(v.begin(), v.end());
-  return v;
-}
-
-static void openNext() {
-  s_curSeg++;
-  s_cur = LittleFS.open(segPath(s_curSeg), FILE_APPEND, true);
-  s_unflushed = 0;
-}
-
-static void enforceCap() {
-  size_t total = 0;
-  auto segs = listSegs();
-  std::vector<std::pair<uint32_t, size_t>> sizes;
-  for (auto n : segs) {
-    File f = LittleFS.open(segPath(n));
-    size_t s = f ? f.size() : 0;
-    sizes.push_back({n, s});
-    total += s;
-  }
-  for (auto& [n, s] : sizes) {
-    if (total <= QUEUE_MAX_BYTES || n == s_curSeg) break;
-    LittleFS.remove(segPath(n));
-    total -= s;
-    Serial.printf("[fs] queue full, dropped segment %lu\n", (unsigned long)n);
-  }
-}
+};
 
 bool begin() {
   s_mtx = xSemaphoreCreateMutex();
   // A fresh board still holds the factory firmware's data in this partition, which
   // LittleFS reports as a corrupted dir pair. begin(true) does not always recover from
   // that, so format explicitly and retry.
-  if (!LittleFS.begin(false)) {
+  if (!LittleFS.begin(false, kMount)) {
     Serial.println("[fs] mount failed, formatting partition (normal on first boot)");
-    if (!LittleFS.format() || !LittleFS.begin(false)) {
+    if (!LittleFS.format() || !LittleFS.begin(false, kMount)) {
       Serial.println("[fs] format failed, running without flash buffering");
       return false;
     }
   }
   s_ok = true;
-  LittleFS.mkdir("/q");
-  auto segs = listSegs();
-  s_curSeg = segs.empty() ? 0 : segs.back();
-  // Never append to a segment from a previous boot. Its tail may be torn.
-  openNext();
-  Serial.printf("[fs] %u pending segments, %u bytes, writing seg %lu\n",
-                (unsigned)segs.size(), (unsigned)pendingBytes(), (unsigned long)s_curSeg);
+  LittleFS.mkdir(QUEUE_DIR);
+  s_fsTotal = LittleFS.totalBytes();
+  segq::Config cfg;
+  cfg.recBytes = sizeof(Record);
+  cfg.segRecords = MAX_UPLOAD_BYTES / sizeof(Record);  // 341, one upload body
+  cfg.flushEvery = FLUSH_EVERY;
+  cfg.capBytes = s_fsTotal / 100 * QUEUE_MAX_PCT;
+  {
+    Report rep;
+    s_q.begin(cfg);
+  }
+  Stats st = stats();
+  Serial.printf("[fs] %u segments waiting, %u bytes, flash %u of %u bytes used, writing seg %lu\n",
+                (unsigned)(st.segments ? st.segments - 1 : 0), (unsigned)st.bytes, (unsigned)st.fsUsed,
+                (unsigned)st.fsTotal, (unsigned long)s_q.curSeg());
   return true;
 }
 
-void append(const Record& r) {
-  if (!s_ok) return;
+void append(const Record& r, bool flushNow) {
   Lock l;
-  if (!s_cur) openNext();
-  s_cur.write(reinterpret_cast<const uint8_t*>(&r), sizeof(r));
-  if (++s_unflushed >= FLUSH_EVERY) { s_cur.flush(); s_unflushed = 0; }
+  if (!s_ok) { s_noFs++; return; }
+  Report rep;
+  s_q.append(reinterpret_cast<const uint8_t*>(&r), flushNow);
 }
 
-void rotate() {
-  if (!s_ok) return;
+bool rotate() {
   Lock l;
-  if (s_cur) {
-    size_t sz = s_cur.size();
-    s_cur.close();
-    if (sz == 0) LittleFS.remove(segPath(s_curSeg));
-  }
-  openNext();
-  enforceCap();
+  if (!s_ok) return false;
+  Report rep;
+  return s_q.rotate();
 }
 
-size_t readBatch(uint8_t* buf, size_t cap, uint32_t& lastSeg) {
-  size_t used = 0;
+size_t readBatch(uint8_t* buf, size_t cap, uint32_t& lastSeg, bool& retrying) {
   lastSeg = 0;
-  if (!s_ok) return 0;
+  retrying = false;
   Lock l;
-  for (auto n : listSegs()) {
-    if (n >= s_curSeg) break;
-    File f = LittleFS.open(segPath(n));
-    if (!f) continue;
-    size_t sz = f.size();
-    if (sz == 0) { f.close(); LittleFS.remove(segPath(n)); continue; }
-    if (used + sz > cap) {
-      if (used == 0) sz = cap - (cap % sizeof(Record));  // oversized: send head, rest is lost on ack
-      else break;
-    }
-    used += f.read(buf + used, sz);
-    lastSeg = n;
-  }
-  return used;
+  if (!s_ok) return 0;
+  Report rep;
+  return s_q.readBatch(buf, cap, lastSeg, retrying);
 }
 
 void ack(uint32_t lastSeg) {
-  if (!s_ok) return;
   Lock l;
-  for (auto n : listSegs()) {
-    if (n > lastSeg || n >= s_curSeg) break;
-    LittleFS.remove(segPath(n));
-  }
+  if (!s_ok) return;
+  Report rep;
+  s_q.ack(lastSeg);
 }
 
-size_t pendingBytes() {
-  size_t total = 0;
-  if (!s_ok) return 0;
-  for (auto n : listSegs()) {
-    File f = LittleFS.open(segPath(n));
-    if (f) total += f.size();
-  }
-  return total;
+Stats stats() {
+  Lock l;
+  Stats s = {};
+  s.dropped = s_noFs + s_q.dropped();
+  if (!s_ok) return s;
+  s_q.count(s.segments, s.bytes);
+  s.fsUsed = LittleFS.usedBytes();
+  s.fsTotal = s_fsTotal;
+  return s;
 }
 
 }  // namespace storage

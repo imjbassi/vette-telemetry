@@ -1,8 +1,10 @@
+#include "config.h"
+#if !BENCH  // the bench build has a scripted adapter instead, see bench_obd.cpp
 #include "obd_ble.h"
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <nvs.h>
-#include "config.h"
+#include "ble_match.h"
 
 namespace obd {
 
@@ -33,6 +35,8 @@ static const uint32_t kLegacyPin = 123456;
 static const uint8_t kBondVersion = 3;  // bump to force a one-time pairing wipe
 static const uint8_t kMaxHeals = 3;     // wipe-and-reboot attempts before giving up
 static uint8_t s_heals = 0;
+static const uint8_t kNullScans = 5;    // scans in a row with only a null-address match before a wipe
+static uint8_t s_nullScans = 0;
 
 void disconnect();
 
@@ -165,10 +169,16 @@ bool connect(uint32_t scanSeconds) {
   Serial.printf("[ble] scanning %us for \"%s*\"\n", scanSeconds, OBD_NAME_PREFIX);
   NimBLEScanResults res = scan->start(scanSeconds, false);
 
-  // Match on name prefix (case-insensitive) or the advertised FFF0 service, since some
-  // adapters only put the name in the scan response or not at all.
+  // Which result is the adapter: see blematch::rank() in ble_match.h. An address with a
+  // stored pairing is the adapter whatever its name. The name is only there when the scan
+  // response was heard, and a paired adapter must not wait for that. Then a name that
+  // starts with OBDLink (case-insensitive). A device that only advertises the generic
+  // FFF0 service is used only while nothing is paired yet.
   static const NimBLEUUID kSvc(OBD_SERVICE_UUID);
+  bool anyPaired = NimBLEDevice::getNumBonds() != 0;
   NimBLEAdvertisedDevice* target = nullptr;
+  int best = 0;
+  bool nullMatch = false, strayFff0 = false;
   for (auto it = res.begin(); it != res.end(); ++it) {
     std::string name = (*it)->getName();
     std::string lower = name;
@@ -176,34 +186,52 @@ bool connect(uint32_t scanSeconds) {
     std::string prefix = OBD_NAME_PREFIX;
     for (auto& ch : prefix) ch = (char)tolower((unsigned char)ch);
     bool svc = (*it)->isAdvertisingService(kSvc);
-    bool match = svc || (!name.empty() && lower.rfind(prefix, 0) == 0);
-    if (!name.empty() || svc) {
-      Serial.printf("  seen %s \"%s\" rssi %d%s\n", (*it)->getAddress().toString().c_str(), name.c_str(),
-                    (*it)->getRSSI(), svc ? " [FFF0]" : "");
+    bool named = !name.empty() && lower.rfind(prefix, 0) == 0;
+    bool nullAddr = (*it)->getAddress().toString() == "00:00:00:00:00:00";
+    // A null address is never treated as paired, so a bad stored identity cannot match.
+    bool paired = !nullAddr && NimBLEDevice::isBonded((*it)->getAddress());
+    if (!name.empty() || svc || paired) {
+      Serial.printf("  seen %s \"%s\" rssi %d%s%s\n", (*it)->getAddress().toString().c_str(), name.c_str(),
+                    (*it)->getRSSI(), svc ? " [FFF0]" : "", paired ? " [paired]" : "");
     }
-    if (!target && match) target = *it;
+    if (!named && !svc && !paired) continue;
+    // A null address means a stored bond has a bad identity for this adapter. There is
+    // nothing to connect to, so skip it. One such advert no longer wipes the pairings.
+    if (nullAddr) { nullMatch = true; continue; }
+    int r = blematch::rank(paired, named, svc, anyPaired);
+    if (r == 0) strayFff0 = true;
+    if (r > best) { best = r; target = *it; }  // the first one seen wins a tie
+  }
+  if (!target && strayFff0) {
+    Serial.println("[ble] ignoring an unnamed FFF0 device: a pairing is stored and this is not its address");
   }
   if (!target) {
-    Serial.println("[ble] OBDLink not found");
     scan->clearResults();
-    return false;
-  }
-
-  // Self-heal: a null address means a stored bond has a bad identity for this adapter.
-  if (target->getAddress().toString() == "00:00:00:00:00:00") {
-    scan->clearResults();
-    if (s_heals >= kMaxHeals) {
-      Serial.println("[ble] adapter still shows a null address after erasing pairings.");
-      Serial.println("      Run: pio run -e atoms3 -t erase   then flash again.");
+    if (!nullMatch) {
+      s_nullScans = 0;
+      Serial.println("[ble] OBDLink not found");
       return false;
     }
-    Serial.printf("[ble] adapter resolved to a null address, erasing pairings and rebooting (%u/%u)\n",
-                  s_heals + 1, kMaxHeals);
+    // Self-heal, only when scan after scan shows the adapter with a null address and
+    // nothing usable.
+    if (++s_nullScans < kNullScans) {
+      Serial.printf("[ble] adapter shows a null address, skipped (%u/%u)\n", s_nullScans, kNullScans);
+      return false;
+    }
+    s_nullScans = 0;
+    if (s_heals >= kMaxHeals) {
+      Serial.println("[ble] adapter still shows a null address after erasing pairings.");
+      Serial.println("      Erase the whole flash (pio run -e <this board's env> -t erase), then flash again.");
+      return false;
+    }
+    Serial.printf("[ble] adapter resolved to a null address %u scans in a row, erasing pairings and rebooting (%u/%u)\n",
+                  kNullScans, s_heals + 1, kMaxHeals);
     setHeals(s_heals + 1);
     wipeBleStore();
     delay(200);
     ESP.restart();
   }
+  s_nullScans = 0;
 
   if (!s_client) {
     s_client = NimBLEDevice::createClient();
@@ -211,7 +239,8 @@ bool connect(uint32_t scanSeconds) {
     s_client->setConnectTimeout(10);
     s_client->setConnectionParams(12, 24, 0, 400);  // 15-30 ms interval
   }
-  Serial.printf("[ble] connecting %s\n", target->getAddress().toString().c_str());
+  Serial.printf("[ble] connecting %s (%s)\n", target->getAddress().toString().c_str(),
+                best >= 3 ? "paired address" : best == 2 ? "by name" : "FFF0 only, nothing paired yet");
   bool ok = s_client->connect(target, true);
   scan->clearResults();
   if (!ok) { Serial.println("[ble] connect failed"); return false; }
@@ -360,3 +389,4 @@ bool initElm() {
 }
 
 }  // namespace obd
+#endif  // !BENCH
