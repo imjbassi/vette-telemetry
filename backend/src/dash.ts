@@ -428,12 +428,24 @@ async function api(env: Env, rest: string, url: URL): Promise<Response> {
   return new Response("not found", { status: 404 });
 }
 
+// An id of the page text. The page carries it, and every /api answer names it in X-Page, so a
+// page left open on a phone across a deploy sees an id that is not its own and can reload.
+// FNV-1a over the whole text: any edit of dash.html gives a new id. Worked out once, when the
+// Worker loads. The page has one placeholder for it, __PAGE_ID__.
+function pageId(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+const PAGE_ID = pageId(page);
+const PAGE = page.replace("__PAGE_ID__", PAGE_ID);
+
 // `rest` is the path after /dash/<secret>, e.g. "", "/", "/api/status".
 export async function handleDash(req: Request, env: Env, rest: string, base: string): Promise<Response> {
   if (req.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   if (rest === "") return Response.redirect(new URL(base + "/", req.url).toString(), 301);
   if (rest === "/") {
-    return new Response(page, {
+    return new Response(PAGE, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
@@ -461,5 +473,6 @@ export async function handleDash(req: Request, env: Env, rest: string, base: str
     res = json({ error: limit ? "Database read limit reached for today. It resets at midnight UTC." : msg }, 503);
   }
   res.headers.set("X-Rows-Read", String(count.rows));
+  res.headers.set("X-Page", PAGE_ID);
   return res;
 }

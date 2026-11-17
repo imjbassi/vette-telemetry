@@ -8,7 +8,8 @@
 //    fetch and Leaflet are fakes) against the real dashboard API of src/dash.ts, on the sqlite
 //    database double of the tests, filled through the real ingest handler. Those are
 //    TypeScript, so this file bundles itself with the esbuild that wrangler installed, like
-//    run-tests.mjs does for the tests, and runs the bundle with CHECK_DASH_STAGE=behavior.
+//    run-tests.mjs does for the tests, and runs the bundle with CHECK_DASH_STAGE=behavior and
+//    TZ=America/Los_Angeles.
 //
 // The stand-in has no layout and no real Leaflet. How the page looks still needs a browser.
 // Nothing here talks to Cloudflare or to the network. Exits non-zero when a check fails.
@@ -43,8 +44,10 @@ if (!failed) {
       sourcemap: "inline",
       logLevel: "warning",
     });
+    // The car's zone (LOCAL_TZ of wrangler.toml), so local days and midnights come out the same
+    // on every machine.
     const run = spawnSync(process.execPath, ["--enable-source-maps", "--disable-warning=ExperimentalWarning", bundle],
-      { stdio: "inherit", env: { ...process.env, CHECK_DASH_STAGE: "behavior" } });
+      { stdio: "inherit", env: { ...process.env, CHECK_DASH_STAGE: "behavior", TZ: "America/Los_Angeles" } });
     failed = run.status ?? 1;
   } catch {
     // esbuild has already printed what is wrong.
@@ -116,31 +119,42 @@ async function behavior() {
   // An error inside one of the page's async functions surfaces here.
   const stray = [];
   process.on("unhandledRejection", (e) => stray.push(e));
+  // The pages the running check opened, for the run loop to look at afterwards.
+  const opened = [];
 
   // Element methods the page calls that need no real behavior here. Any other method is
   // undefined, so calling it throws as it would in a browser.
   const NOOP_METHODS = new Set(["addEventListener", "removeEventListener", "setAttribute", "getAttribute", "removeAttribute", "scrollIntoView"]);
 
   // The page in a stand-in browser. Timers do not run by themselves: a check fires the poll
-  // timer when it wants the next poll, and moves the clock with setNow(). Only the page's
-  // short layout delays (up to 200 ms) run at once. `touch` makes it a phone with a touch
-  // screen, `page` replaces the page text (to prove that a broken page fails). `reject` and
-  // `hold` (see net below) apply from the first request on.
+  // timer when it wants the next poll, and moves the clock with setNow(). new Date() reads
+  // that clock too. Only the page's short layout delays (up to 200 ms) run at once. `width` is
+  // the window width, which page.setWidth() changes later. The page reads it as
+  // window.innerWidth or an element's clientWidth, never as a bare innerWidth, which does not
+  // exist here. `touch` makes it a phone with a touch screen, `page` replaces the page text (to
+  // prove that a broken page fails). `reject` and `hold` (see net below) apply from the first
+  // request on.
   function openPage(env, { hash = "", width = 600, touch = false, page: text = html, reject = null, hold = null } = {}) {
     const script = /<script>([\s\S]*?)<\/script>/.exec(text)[1];
     // Only ids that the page has. Ids built by the script appear in it as id="..." as well.
     const ids = new Set([...text.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
     const els = new Map();
     function makeEl() {
-      const store = { id: "", textContent: "", html: "", hidden: false, className: "", style: {}, dataset: {}, children: [], value: "", found: {}, classes: new Set(), next: [] };
+      const store = { id: "", textContent: "", html: "", hidden: false, style: {}, dataset: {}, children: [], value: "", found: {}, classes: new Set(), next: [] };
+      // className and classList are two views of the same classes, as in a browser.
+      const classList = {
+        add: (...cs) => { for (const c of cs) store.classes.add(c); },
+        remove: (...cs) => { for (const c of cs) store.classes.delete(c); },
+        toggle: (c, on) => { const want = on ?? !store.classes.has(c); if (want) store.classes.add(c); else store.classes.delete(c); return want; },
+        contains: (c) => store.classes.has(c),
+      };
       return new Proxy(store, {
         get(t, p) {
           if (p === "innerHTML") return t.html;
+          if (p === "className") return [...t.classes].join(" ");
+          if (p === "classList") return classList;
           if (p in t) return t[p];
           if (p === "clientWidth" || p === "offsetWidth") return width;
-          if (p === "classList") {
-            return { toggle: (c, on) => { (on ?? !t.classes.has(c)) ? t.classes.add(c) : t.classes.delete(c); }, add: (c) => t.classes.add(c), remove: (c) => t.classes.delete(c) };
-          }
           if (p === "querySelector") return (sel) => (t.found[sel] ??= makeEl());
           if (p === "querySelectorAll") return () => [];
           if (p === "getBoundingClientRect") return () => ({ top: 2000, left: 0, width, height: 200 });
@@ -152,7 +166,9 @@ async function behavior() {
           return undefined;
         },
         set(t, p, v) {
-          if (p === "innerHTML") { t.html = String(v); t.children = []; t.found = {}; } else t[p] = v;
+          if (p === "innerHTML") { t.html = String(v); t.children = []; t.found = {}; }
+          else if (p === "className") t.classes = new Set(String(v).split(/\s+/).filter(Boolean));
+          else t[p] = v;
           return true;
         },
       });
@@ -176,8 +192,9 @@ async function behavior() {
 
     // reject(path) and hold(path) decide per request. reject may answer "late": the request
     // then fails after the others of the same moment were answered. A held request never
-    // answers, so only the page's own time limit can end it.
-    const net = { log: [], busy: 0, reject, hold };
+    // answers, so only the page's own time limit can end it. edit(path, answer) may change a
+    // JSON answer in place before the page reads it, as a newer Worker would answer.
+    const net = { log: [], busy: 0, reject, hold, edit: null };
     const fetch = async (path, init = {}) => {
       net.log.push(path);
       if (net.hold && net.hold(path)) {
@@ -188,11 +205,17 @@ async function behavior() {
         const verdict = net.reject && net.reject(path);
         if (verdict === "late") await sleep(20);
         if (verdict) throw new TypeError("Failed to fetch");
-        return await call(env, path);
+        const res = await call(env, path);
+        if (!net.edit || !res.ok) return res;
+        const answer = await res.json();
+        net.edit(path, answer);
+        return new Response(JSON.stringify(answer), { status: res.status, headers: res.headers });
       } finally { net.busy--; }
     };
 
-    const timers = [], errors = [], listeners = {}, tooltips = [];
+    // calls: the name of every Leaflet method the page called, in order.
+    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [];
+    let reloads = 0;
     let every10s = null;
     const fire = (t) => { if (t.dead) return; t.dead = true; try { return t.fn(); } catch (e) { errors.push(e); } };
     const fakeSetTimeout = (fn, ms) => {
@@ -207,7 +230,11 @@ async function behavior() {
 
     // Every Leaflet call answers with Leaflet itself, so any chain of calls works.
     const leaflet = new Proxy(function () {}, {
-      get: (_, k) => (typeof k === "symbol" ? undefined : (...args) => { if (k === "bindTooltip") tooltips.push(args[0]); return leaflet; }),
+      get: (_, k) => (typeof k === "symbol" ? undefined : (...args) => {
+        calls.push(k);
+        if (k === "bindTooltip") tooltips.push(args[0]);
+        return leaflet;
+      }),
     });
     const doc = {
       hidden: false,
@@ -216,7 +243,8 @@ async function behavior() {
       createElement: makeEl,
       addEventListener: (ev, fn) => { listeners["doc:" + ev] = fn; },
     };
-    // Setting the hash fires hashchange a moment later, as in a browser. replaceState does not.
+    // Setting the hash fires hashchange a moment later, as in a browser. replaceState and
+    // pushState do not. reload() only counts: the page stays as it is.
     let hashNow = hash ? "#" + hash : "";
     const loc = {
       get hash() { return hashNow; },
@@ -227,20 +255,38 @@ async function behavior() {
         hashNow = v;
         realSetTimeout(() => { try { listeners.hashchange && listeners.hashchange(); } catch (e) { errors.push(e); } }, 0);
       },
+      reload: () => { reloads++; },
+    };
+    const hist = {
+      replaceState: (a, b, h) => { hashNow = h; },
+      pushState: (a, b, h) => { pushed.push(h); hashNow = h; },
     };
     // A touch screen matches the hover query. A max-width query is tested against `width`.
     const matchMedia = (q) => {
       const max = /max-width:\s*(\d+)px/.exec(q);
       return { matches: (touch && /hover:\s*none/.test(q)) || (!!max && width <= +max[1]) };
     };
-    const win = { matchMedia, scrollTo: () => {}, L: leaflet };
+    const win = {
+      matchMedia, scrollTo: () => {}, L: leaflet,
+      get innerWidth() { return width; },
+      set innerWidth(w) { width = w; },
+    };
+    // Without arguments a Date is the pinned clock of setNow(), like Date.now(), so ranges
+    // such as "7 days" follow it.
+    const PageDate = class extends Date { constructor(...a) { super(...(a.length ? a : [Date.now()])); } };
     new Function("window", "document", "location", "history", "fetch", "setTimeout", "clearTimeout", "setInterval",
-      "matchMedia", "addEventListener", "innerHeight", "L", script)(
-      win, doc, loc, { replaceState: (a, b, h) => { hashNow = h; } }, fetch, fakeSetTimeout, (t) => { if (t) t.dead = true; },
-      (fn) => { every10s = fn; return 1; }, matchMedia, (ev, fn) => { listeners[ev] = fn; }, 800, leaflet);
+      "matchMedia", "addEventListener", "innerHeight", "L", "Date", script)(
+      win, doc, loc, hist, fetch, fakeSetTimeout, (t) => { if (t) t.dead = true; },
+      (fn) => { every10s = fn; return 1; }, matchMedia, (ev, fn) => { listeners[ev] = fn; }, 800, leaflet, PageDate);
 
     const page = {
-      $, net, errors, tooltips, location: loc,
+      $, net, errors, tooltips, calls, pushed, listeners, doc, groups, location: loc,
+      // How often the page asked for a reload.
+      reloads: () => reloads,
+      // The window becomes `w` wide. Nothing is fired: a check fires listeners.resize() itself.
+      setWidth: (w) => { win.innerWidth = w; },
+      // The tab goes to the background (false) or comes back (true).
+      visible: (on) => { doc.hidden = !on; listeners["doc:visibilitychange"](); },
       // A tap on a button of the side bar or the bottom bar.
       nav: (view) => groups["[data-view]"].find((b) => b.dataset.view === view).onclick(),
       shown: () => groups[".view"].filter((v) => v.classes.has("show")).map((v) => v.id),
@@ -267,6 +313,7 @@ async function behavior() {
       // The header re-check the page runs every 10 s.
       interval: () => every10s(),
     };
+    opened.push(page);
     return page;
   }
 
@@ -431,6 +478,13 @@ async function behavior() {
     assert.ok(open <= closed, "h-readout is inside a card head again");
     // Room for two lines, so a long value cannot push the chart down either.
     assert.match(html.slice(tag, html.indexOf(">", id)), /^<div class="readout"[^>]*min-height/);
+  });
+
+  check("the hidden attribute hides an element whatever its class", async () => {
+    // .btn sets display and comes later. Without !important "Open in Maps" is drawn as a dead
+    // button until there is a position.
+    assert.match(html, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
+    assert.match(html, /<a class="btn" id="o-maps"[^>]* hidden>/);
   });
 
   check("live: a watched drive is not paused by a long gap in the uploads", async () => {
@@ -668,12 +722,23 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
-  check("every view opens from its button, a trip opens from the list, and each view polls", async () => {
+  check("every view opens from its button, a trip opens from the list, and each view polls and redraws on a resize", async () => {
     const env = makeEnv();
     await threeTrips(env, 126800);
     // A wide desktop and a phone with a touch screen.
     for (const [width, touch] of [[1200, false], [375, true]]) {
       const p = openPage(env, { width, touch });
+      // The phone turns or the window is resized: the open view draws its charts again for the
+      // new width. `chart` is one chart of the view. Logs has none.
+      let w = width;
+      const resize = async (chart) => {
+        w = w === width ? width - 40 : width;
+        p.setWidth(w);
+        const before = chart && p.$(chart).innerHTML;
+        p.listeners.resize();
+        await p.settle();
+        if (chart) assert.notEqual(p.$(chart).innerHTML, before, `${chart} is drawn again after a resize`);
+      };
       await p.settle();
       assert.deepEqual(p.shown(), ["v-overview"]);
       p.$("o-trips").children[0].onclick();
@@ -682,8 +747,9 @@ async function behavior() {
       assert.equal(p.$("t-detail").hidden, false);
       assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
       assert.match(p.$("t-stats").innerHTML, /Distance/);
+      await resize("t-speed");
       await p.poll();
-      for (const view of ["live", "history", "logs", "overview"]) {
+      for (const [view, chart] of [["live", "l-speed"], ["history", "h-chart"], ["logs", null], ["overview", "o-drive"]]) {
         p.nav(view);
         await p.settle();
         assert.deepEqual(p.shown(), ["v-" + view]);
@@ -691,12 +757,149 @@ async function behavior() {
           assert.match(p.$("g-health").innerHTML, /Last upload/);
           assert.equal((p.$("g-boots").innerHTML.match(/<tr>/g) ?? []).length, 4);
         }
+        await resize(chart);
         await p.poll();
       }
       // On a touch screen each map says how to move it.
       assert.deepEqual(p.$("o-map").next.map((e) => e.textContent), touch ? ["Use two fingers to move the map."] : []);
       assert.deepEqual(p.errors, []);
     }
+  });
+
+  check("back from the background: after 2 minutes only the status is asked, after 7 the trips and the economy too", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    // Two minutes away. One status poll at once, then the usual rate.
+    const before = p.net.log.length;
+    p.visible(false);
+    assert.equal(p.polls().length, 0, "no poll while hidden");
+    setNow(T0 + 4120);
+    p.visible(true);
+    await p.settle();
+    assert.deepEqual(p.net.log.slice(before), ["api/status"]);
+    assert.equal(p.nextPoll(), 60000);
+    // Seven minutes away. The trip list and the economy figures may be out of date as well.
+    const asked = () => ["api/status", "api/trips", "api/economy"].map((k) => p.requests(k));
+    const [status, trips, econ] = asked();
+    p.visible(false);
+    setNow(T0 + 4540);
+    p.visible(true);
+    await p.settle();
+    assert.deepEqual(asked(), [status + 1, trips + 1, econ + 1]);
+    assert.equal(p.nextPoll(), 60000);
+    assert.match(p.header(), /^Parked · updated /);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("after 15 idle minutes the page pauses, and a tap brings back the car, the trips and the economy", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    setNow(T0 + 4960);
+    await p.poll();
+    assert.equal(p.header(), "Paused · tap to resume");
+    assert.equal(p.polls().length, 0);
+    const [trips, econ] = [p.requests("api/trips"), p.requests("api/economy")];
+    p.listeners.pointerdown();
+    await p.settle();
+    assert.match(p.header(), /^Parked · updated /);
+    assert.equal(p.nextPoll(), 60000);
+    assert.deepEqual([p.requests("api/trips"), p.requests("api/economy")], [trips + 1, econ + 1]);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("history: every preset and metric button draws, and 7 days asks for the last 7 x 24 hours", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const p = openPage(env, { hash: "history" });
+    await p.settle();
+    const drawn = () => /^(<svg |<div class="empty">No readings in this period<)/.test(p.$("h-chart").innerHTML);
+    const now = T0 + 8000;
+    for (const b of p.groups["#h-presets button"]) {
+      const before = p.net.log.length;
+      b.onclick();
+      await p.settle();
+      const asked = p.net.log.slice(before).filter((path) => path.startsWith("api/history?"));
+      assert.equal(asked.length, 1, `preset ${b.dataset.p}`);
+      // 7 days are the last 168 hours, counted from the pinned clock.
+      if (b.dataset.p === "7d") assert.equal(asked[0], `api/history?from=${now - 7 * 86400}&to=${now}`);
+      assert.ok(b.classList.contains("active"), `preset ${b.dataset.p} is marked`);
+      assert.ok(drawn(), `preset ${b.dataset.p}: ${p.$("h-chart").innerHTML.slice(0, 60)}`);
+    }
+    assert.ok(p.$("h-chart").innerHTML.startsWith("<svg "), "the last preset has readings to draw");
+    for (const b of p.groups["#h-metrics button"]) {
+      b.onclick();
+      assert.ok(b.classList.contains("active"), `metric ${b.dataset.m} is marked`);
+      assert.ok(drawn(), `metric ${b.dataset.m}`);
+    }
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("a page older than the deployed one says so, and reloads when it comes back from the background", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // The Worker wrote the id into the page it serves, and names the same id in its answers.
+    const id = /const PAGE_ID = "([0-9a-f]{8})";/.exec(html)?.[1];
+    assert.ok(id, "the served page carries its id");
+    assert.ok(!html.includes("__PAGE_ID__"), "no placeholder is left in the served page");
+    assert.equal((await call(env, "api/status")).headers.get("X-Page"), id);
+
+    // The deployed page: no notice, and its id at the end of the Logs footer.
+    const cur = openPage(env, { hash: "logs" });
+    await cur.settle();
+    assert.match(cur.header(), /^Parked · updated /);
+    assert.equal(cur.$("reload").hidden, true);
+    assert.ok(cur.$("foot").textContent.endsWith(` Page ${id}.`), cur.$("foot").textContent);
+    cur.visible(false);
+    cur.visible(true);
+    await cur.settle();
+    assert.equal(cur.reloads(), 0);
+
+    // A page from before the last deploy.
+    const old = openPage(env, { page: html.replace(`const PAGE_ID = "${id}";`, () => 'const PAGE_ID = "old";') });
+    await old.settle();
+    assert.equal(old.header(), "Parked · new version, tap to reload");
+    assert.equal(old.$("reload").hidden, false);
+    old.visible(false);
+    old.visible(true);
+    assert.equal(old.reloads(), 1);
+    old.$("reload").onclick();
+    assert.equal(old.reloads(), 2);
+    assert.deepEqual([...cur.errors, ...old.errors], []);
+  });
+
+  check("a draw that throws during a poll leaves the next poll set, and the error is still seen", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const [from, to] = ["d.stats.hour || {}", "d.stats.hourly.x || {}"];
+    assert.ok(html.includes(from), "the page changed, so this no longer applies");
+    const p = openPage(env, { hash: "logs", page: html.replace(from, () => to) });
+    await p.settle();
+    await sleep(0);
+    assert.ok(p.errors.length + stray.splice(0).length > 0, "no error for the broken Logs view at open");
+    await p.poll();
+    await sleep(0);
+    assert.equal(p.polls().length, 1, "the poll after the error is set");
+    assert.ok(p.errors.length + stray.splice(0).length > 0, "no error for the broken Logs view in the poll");
+  });
+
+  check("live: a series the page does not know yet starts with gaps, and the polling goes on", async () => {
+    const env = makeEnv();
+    await upload(env, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    // A deploy adds a series to the live answer while the page stays open.
+    p.net.edit = (path, d) => { if (path.startsWith("api/live") && d.series) d.series.extra = d.series.t.map(() => 1); };
+    await upload(env, drive({ n: 20, ms0: 140000 }), T0 + 165);
+    setNow(T0 + 166);
+    await p.poll();
+    assert.equal(p.nextPoll(), 15000);
+    assert.equal(p.header(), "Engine running · updated just now");
+    assert.deepEqual(p.errors, []);
   });
 
   check("the stand-in fails a page with a missing id or a broken Trips or Logs view", async () => {
@@ -720,10 +923,18 @@ async function behavior() {
   // ---------------------------------------------------------------- run
   let bad = 0;
   for (const [name, fn] of checks) {
+    // Nothing left over from the check before counts against this one.
+    stray.length = 0;
+    opened.length = 0;
     try {
       await fn();
       await sleep(0);
       if (stray.length) throw stray.splice(0)[0];
+      // However a check ends, no page it opened is left with two polls on the way.
+      for (const p of opened) {
+        const ms = p.polls().map((t) => t.ms);
+        assert.ok(ms.length <= 1, `a page of this check ended with ${ms.length} poll timers (${ms})`);
+      }
       console.log(`check-dash: ok    ${name}`);
     } catch (e) {
       bad++;

@@ -1,16 +1,18 @@
 // Deploys the Worker:   npm run deploy
 //
-//   1. rebuilds wrangler.local.toml from wrangler.toml and keeps the database id it holds, so
+//   1. runs the local checks: typecheck, the tests and check:dash. A failure stops the deploy
+//      before anything remote is touched. --skip-checks leaves them out.
+//   2. rebuilds wrangler.local.toml from wrangler.toml and keeps the database id it holds, so
 //      every edit of wrangler.toml reaches the Worker
-//   2. checks that the remote database has every column this code needs (REQUIRED_COLUMNS).
+//   3. checks that the remote database has every column this code needs (REQUIRED_COLUMNS).
 //      A missing schema change stops the deploy and prints the command to run.
-//   3. wrangler deploy --config wrangler.local.toml
+//   4. wrangler deploy --config wrangler.local.toml
 //
-// Needs a logged-in wrangler and a checkout that npm run setup has run on. Arguments are
-// handed to wrangler deploy. The database id is never printed.
+// Needs a logged-in wrangler and a checkout that npm run setup has run on. Arguments other
+// than --skip-checks are handed to wrangler deploy. The database id is never printed.
 //
 // setup.mjs and db-backup.mjs import their config, wrangler and schema helpers from here.
-// Importing this file runs nothing.
+// Importing this file runs nothing. Setup deploys through deployWorker(), without the local checks.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -165,6 +167,34 @@ export function checkSchema(target = REMOTE, cwd = backend) {
   if (message) throw new Error(message);
 }
 
+// ---- local checks ------------------------------------------------------------------
+
+// What `npm run typecheck`, `npm test` and `npm run check:dash` run, started through node
+// itself with no shell, like wrangler() above. Their output goes straight to the terminal.
+const LOCAL_CHECKS = [
+  ["npm run typecheck", ["node_modules/typescript/bin/tsc", "--noEmit"]],
+  ["npm test", ["scripts/run-tests.mjs"]],
+  ["npm run check:dash", ["scripts/check-dash.mjs"]],
+];
+
+// Runs the checks in `cwd` and throws at the first one that fails. Only the main block below
+// calls it. The tests import this file and run-tests.mjs runs the tests, so a call at import
+// would start itself again. deployWorker() does not call it either, because setup uses that.
+export function localChecks(cwd = backend) {
+  for (const [step, [file, ...args]] of LOCAL_CHECKS) {
+    if (!fs.existsSync(path.join(cwd, file))) throw new Error(`${step}: ${file} not found. Run npm install in backend/ first.`);
+    console.log(`\n${step}`);
+    const r = spawnSync(process.execPath, [file, ...args], { cwd, stdio: "inherit" });
+    if (r.status !== 0) throw new Error(`${step} failed. Nothing was deployed.`);
+  }
+}
+
+// The command line of npm run deploy. --skip-checks is for this script and never reaches
+// wrangler. Everything else is handed to wrangler deploy as it was given.
+export function deployArgs(argv) {
+  return { skipChecks: argv.includes("--skip-checks"), wranglerArgs: argv.filter((a) => a !== "--skip-checks") };
+}
+
 // ---- deploy ------------------------------------------------------------------------
 
 // Schema check, then wrangler deploy. Returns wrangler's output (setup reads the Worker URL
@@ -196,9 +226,12 @@ export function storedSecretsVerdict({ newSecrets, created, live, workerHasIt })
 // Only when started as a script. The name test keeps an import from ever deploying.
 if (path.basename(process.argv[1] ?? "") === "deploy.mjs") {
   try {
+    const { skipChecks, wranglerArgs } = deployArgs(process.argv.slice(2));
+    if (skipChecks) console.log("--skip-checks: typecheck, tests and check:dash were not run");
+    else { localChecks(); console.log("\nlocal checks passed"); }
     console.log(syncLocalConfig() ? `${CONFIG} rebuilt from wrangler.toml` : `${CONFIG} is up to date`);
     console.log("checking the remote database, then deploying the Worker");
-    console.log(hideIds(deployWorker(process.argv.slice(2))).trim());
+    console.log(hideIds(deployWorker(wranglerArgs)).trim());
     console.log("\nDone.");
   } catch (e) {
     console.error(`\nDEPLOY FAILED: ${e.message}`);

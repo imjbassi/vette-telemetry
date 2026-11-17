@@ -20,6 +20,8 @@
     --radius: 14px;
   }
   * { box-sizing: border-box; }
+  /* A class that sets display, like .btn, beats the browser's own rule for the attribute. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; background: var(--bg); color: var(--text); height: 100%; }
   body {
     font: 14px/1.45 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -58,6 +60,7 @@
   .status { display: inline-flex; align-items: center; gap: 9px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line2); background: var(--card); font-size: 13px; color: var(--muted); white-space: nowrap; }
   .status b { color: var(--text); font-weight: 600; }
   .status.bad { border-color: rgba(239,68,68,.55); }
+  .status button { font-size: 12px; padding: 3px 10px; border-radius: 7px; border: 1px solid var(--line2); background: var(--card2); color: var(--text); cursor: pointer; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
   .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgba(47,191,113,.6); animation: pulse 1.8s infinite; }
   .dot.warn { background: var(--yellow); }
@@ -239,7 +242,7 @@
   <main>
     <div class="top">
       <div><h1 id="title">Overview</h1><p id="subtitle">Your Corvette at a glance</p></div>
-      <div class="status"><i class="dot" id="dot"></i><b id="state">Loading</b><span id="updated"></span></div>
+      <div class="status"><i class="dot" id="dot"></i><b id="state">Loading</b><span id="updated"></span><button id="reload" hidden>Reload</button></div>
     </div>
 
     <!-- ====================================================== OVERVIEW -->
@@ -427,6 +430,9 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  // Written in by the Worker as it serves the page. Every API answer names the deployed page
+  // (X-Page), so a page left open across a deploy can tell that it is out of date.
+  const PAGE_ID = "__PAGE_ID__";
   const KM_TO_MI = 0.621371;
   // Phones and tablets. There a finger dragged across a map must scroll the page.
   const TOUCH = !!window.matchMedia && matchMedia("(hover: none) and (pointer: coarse)").matches;
@@ -441,11 +447,12 @@
   // err: last failed request that looks like an outage (header and footer). errAt: when the
   // early retries for an outage last began. note: a failure of one request only (footer).
   // rows: what the newest request cost. clock: server minus phone time. tripsFails, econFails:
-  // failed loads of the trip list and the economy figures while the server answered.
+  // failed loads of the trip list and the economy figures while the server answered. stale:
+  // the newest answer names another page, so a newer one is deployed.
   const S = {
     view: null, status: null, trips: [], selected: null, tripData: null, live: null, maps: {},
     err: null, errAt: 0, note: null, rows: null, clock: 0, paused: false, shown: null, tripReq: 0, liveReq: 0, reveal: false,
-    tripsFails: 0, econFails: 0,
+    tripsFails: 0, econFails: 0, stale: false,
   };
 
   // ---------------------------------------------------------------- utils
@@ -503,6 +510,10 @@
     try {
       try { r = await fetch(path, { cache: "no-store", signal: ac ? ac.signal : undefined }); }
       catch { throw fail("No connection to the server", true); }
+      // Not sticky: while a deploy rolls out, old and new versions both answer, and the newest
+      // answer decides.
+      const pid = r.headers.get("X-Page");
+      if (pid) S.stale = pid !== PAGE_ID;
       const rr = r.headers.get("X-Rows-Read");
       if (rr != null && isFinite(+rr)) S.rows = { name: path.split("?")[0], n: +rr };
       if (!r.ok) {
@@ -536,6 +547,8 @@
     const f = $("foot"), bad = S.err || S.note;
     let msg = bad || (S.paused ? "Paused to save database reads. Tap anywhere to resume." : "Live data from the OBDLink logger.");
     if (!bad && S.view === "logs" && S.rows) msg += ` Last request (${S.rows.name}) read ${S.rows.n.toLocaleString()} database rows.`;
+    // The page that is running, so a deploy can be seen to have arrived on the phone.
+    if (S.view === "logs") msg += `${/[.!?]$/.test(msg) ? "" : "."} Page ${PAGE_ID}.`;
     f.textContent = msg;
     f.style.color = bad ? "var(--red)" : "";
   }
@@ -779,6 +792,7 @@
   }
 
   // The pill shows one thing, the first that applies: paused, a failing connection, then the car.
+  // When a newer page is deployed, the car state stays and the notice replaces the text after it.
   function renderHeader() {
     const cs = carState(), has = Object.keys(L_()).length > 0;
     const up = lt("last_upload"), bad = !S.paused && !!S.err;
@@ -792,9 +806,12 @@
     else if (cs.state === "running") { dot = "on"; text = "Engine running"; }
     else if (cs.state === "no_signal") { dot = "warn"; text = "No signal since " + timeFmt.format(new Date(cs.last_seen_ts * 1000)); extra = ""; }
     else if (cs.ended_mid_drive) extra = "· logger went offline mid-drive, " + ago(cs.last_seen_ts);
+    const stale = S.stale && !S.paused && !S.err && !!S.status;
+    if (stale) extra = "· new version, tap to reload";
     $("dot").className = "dot" + (dot ? " " + dot : "");
     $("state").textContent = text;
     $("updated").textContent = extra;
+    $("reload").hidden = !stale;
     $("state").parentNode.classList.toggle("bad", bad);
     $("livepill").hidden = S.paused || bad || cs.state !== "running";
     S.shown = text;
@@ -1077,7 +1094,10 @@
     // new readings, so only the newest answer is used. An older one would add them twice.
     if (req !== S.liveReq) return;
     if (d.incremental && prev && prev.series && d.series) {
-      for (const k of Object.keys(d.series)) prev.series[k] = prev.series[k].concat(d.series[k]);
+      // A series this page has not had yet (the Worker was deployed meanwhile) starts with
+      // gaps where the readings already on screen are.
+      const n0 = prev.series.t.length;
+      for (const k of Object.keys(d.series)) prev.series[k] = (prev.series[k] || Array(n0).fill(null)).concat(d.series[k]);
       const t = prev.series.t, cut = (t.length ? t[t.length - 1] : 0) - d.window_s;
       let i = 0; while (i < t.length && t[i] < cut) i++;
       if (i) for (const k of Object.keys(prev.series)) prev.series[k] = prev.series[k].slice(i);
@@ -1352,17 +1372,22 @@
     $("title").textContent = VIEWS[view][0]; $("subtitle").textContent = VIEWS[view][1];
     // A new view starts at its top, not at the scroll offset of the one before.
     if (changed) window.scrollTo(0, 0);
-    if (view === "overview") { renderOverview(); drawOverviewCharts(); }
-    if (view === "live") { renderLive(); loadLive(); }
-    if (view === "trips") showTrip();
-    if (view === "logs") loadLogs();
-    if (view === "history") parseHistoryHash(arg);
-    setTimeout(() => Object.values(S.maps).forEach((m) => m.map.invalidateSize()), 50);
-    renderFoot();
-    schedule();
+    // As in tick(): an error while drawing still reaches the console, and the poll is set anyway.
+    try {
+      if (view === "overview") { renderOverview(); drawOverviewCharts(); }
+      if (view === "live") { renderLive(); loadLive(); }
+      if (view === "trips") showTrip();
+      if (view === "logs") loadLogs();
+      if (view === "history") parseHistoryHash(arg);
+    } finally {
+      setTimeout(() => Object.values(S.maps).forEach((m) => m.map.invalidateSize()), 50);
+      renderFoot();
+      schedule();
+    }
   }
   document.querySelectorAll("[data-view]").forEach((b) => (b.onclick = () => go(b.dataset.view)));
   addEventListener("hashchange", () => show(location.hash.slice(1)));
+  $("reload").onclick = () => location.reload();
 
   // Polling. Every request costs database reads (the free plan allows 5 million rows a day),
   // so poll no faster than the logger uploads (every 15 s), slow down while parked, stop while
@@ -1399,18 +1424,23 @@
       renderHeader(); renderFoot();
       return;
     }
-    n++;
-    if (S.view === "live") await loadLive();
-    else if (S.view === "logs") await loadLogs();
-    else await loadStatus();
-    // Short ranges that end now move with the clock. Long and past ranges only reload on demand.
-    if (S.view === "history" && (S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) setRange(S.hist.preset);
-    // Every sixth poll. A first load that failed while the server answered is asked once more
-    // on the next poll, not on every one: a request that keeps failing would otherwise keep
-    // the header on the error and the polls at the fast rate.
-    if (n % 6 === 0 || (!S.tripsLoaded && S.tripsFails < 2)) loadTrips();
-    if (n % 6 === 0 || (!S.econ && S.econFails < 2)) loadEcon();
-    schedule();
+    // The next poll is set even when drawing an answer throws. The error still reaches the
+    // console, but the page does not stop polling without a word.
+    try {
+      n++;
+      if (S.view === "live") await loadLive();
+      else if (S.view === "logs") await loadLogs();
+      else await loadStatus();
+      // Short ranges that end now move with the clock. Long and past ranges only reload on demand.
+      if (S.view === "history" && (S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) setRange(S.hist.preset);
+      // Every sixth poll. A first load that failed while the server answered is asked once more
+      // on the next poll, not on every one: a request that keeps failing would otherwise keep
+      // the header on the error and the polls at the fast rate.
+      if (n % 6 === 0 || (!S.tripsLoaded && S.tripsFails < 2)) loadTrips();
+      if (n % 6 === 0 || (!S.econ && S.econFails < 2)) loadEcon();
+    } finally {
+      schedule();
+    }
   }
   // Back after a pause or a long time in the background: the trip list and the economy figures
   // are stale too, not only the view that polls.
@@ -1428,6 +1458,8 @@
   ["pointerdown", "keydown", "wheel", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { clearTimeout(timer); hiddenAt = Date.now(); return; }
+    // A newer page was deployed while this one was open. Coming back is the moment to load it.
+    if (S.stale) { location.reload(); return; }
     if (S.paused || Date.now() - hiddenAt > LONG_AWAY_MS) resume();
     else { lastInput = Date.now(); tick(); }
   });

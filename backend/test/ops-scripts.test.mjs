@@ -38,6 +38,24 @@ test("npm run deploy calls deploy.mjs, and the scripts import only what it expor
   assert.equal(typeof bak.dumpDatabase, "function");
 });
 
+test("npm run deploy runs the local checks first, and --skip-checks never reaches wrangler", () => {
+  assert.deepEqual(dep.deployArgs([]), { skipChecks: false, wranglerArgs: [] });
+  assert.deepEqual(dep.deployArgs(["--skip-checks"]), { skipChecks: true, wranglerArgs: [] });
+  assert.deepEqual(dep.deployArgs(["--dry-run", "--skip-checks", "--outdir", "dist"]),
+    { skipChecks: true, wranglerArgs: ["--dry-run", "--outdir", "dist"] });
+  // localChecks() is never called here: it runs the tests, this file among them. The source
+  // shows where it runs instead: in the main block before anything remote, and not inside
+  // deployWorker(), which setup uses.
+  assert.equal(typeof dep.localChecks, "function");
+  const src = fs.readFileSync(path.join(backend, "scripts", "deploy.mjs"), "utf8");
+  const main = src.slice(src.indexOf("if (path.basename(process.argv[1]"));
+  const at = (s) => main.indexOf(s);
+  assert.ok(at("localChecks(") > 0, "the main block runs the checks");
+  assert.ok(at("localChecks(") < at("syncLocalConfig(") && at("syncLocalConfig(") < at("deployWorker(wranglerArgs)"), "the checks come first");
+  const deployFn = src.slice(src.indexOf("export function deployWorker("), src.indexOf("// ---- stored secrets"));
+  assert.ok(deployFn.length > 0 && !deployFn.includes("localChecks"), "setup is not gated");
+});
+
 // ---- wrangler.local.toml -------------------------------------------------------------
 
 test("config rebuild keeps the id and picks up a new section", () => {

@@ -1,5 +1,7 @@
-// The Worker's fetch handler in front of ingest: the token check, and above all that a
+// The Worker's fetch handler. In front of ingest: the token check, and above all that a
 // failure reaches the logger as an error status. The logger deletes its copy on any 2xx.
+// In front of the dashboard and the connector: the secret paths, which are their only lock,
+// and the headers of the page.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
@@ -103,6 +105,58 @@ test("a crash in the MCP route answers 500 with a JSON-RPC internal error", asyn
   assert.equal(res.status, 500);
   assert.deepEqual(await res.json(), { jsonrpc: "2.0", id: null, error: { code: -32603, message: "Internal error" } });
   assert.equal(logged.mock.callCount(), 1);
+});
+
+test("the dashboard and the connector open only under their secret paths, and the page keeps its headers", async () => {
+  setNow(T0 + 100);
+  const env = makeEnv();
+  const send = (path, e = env, method = "GET", body) => worker.fetch(new Request(`https://logger.test${path}`, { method, body }), e);
+  const notFound = async (res, what) => {
+    assert.equal(res.status, 404, what);
+    assert.equal(await res.text(), "not found", what);
+  };
+  // A wrong secret, one character off at the same length or one too long, looks like any
+  // unknown path, also with a method the dashboard refuses.
+  assert.equal(env.DASH_SECRET.length, "test-dash-secreX".length);
+  for (const path of ["/dash/", "/dash/not-the-secret/", "/dash/not-the-secret/api/status", "/dash/test-dash-secreX/", "/dash/test-dash-secretx/api/status"]) {
+    await notFound(await send(path), `GET ${path}`);
+  }
+  await notFound(await send("/dash/not-the-secret/api/status", env, "POST"), "POST with a wrong secret");
+  // Without a secret set nothing opens, an empty secret path included.
+  const unset = { ...env, DASH_SECRET: "", MCP_SECRET: "" };
+  for (const path of ["/dash//", "/dash/test-dash-secret/"]) await notFound(await send(path, unset), `${path} with no secret set`);
+  // The connector, the same way.
+  const list = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+  for (const path of ["/mcp/", "/mcp/test-mcp-secreX", "/mcp/test-mcp-secretx"]) await notFound(await send(path, env, "POST", list), `POST ${path}`);
+  for (const path of ["/mcp/", "/mcp/test-mcp-secret"]) await notFound(await send(path, unset, "POST", list), `${path} with no secret set`);
+  // None of that read the database.
+  assert.equal(env.DB.statements, 0);
+
+  // The right secret.
+  const bare = await send("/dash/test-dash-secret");
+  assert.equal(bare.status, 301);
+  assert.equal(bare.headers.get("Location"), "https://logger.test/dash/test-dash-secret/");
+  const page = await send("/dash/test-dash-secret/");
+  assert.equal(page.status, 200);
+  // strict-origin, not no-referrer: the map tile servers refuse requests without a referrer.
+  for (const [name, value] of [["Content-Type", "text/html; charset=utf-8"], ["Cache-Control", "no-store"],
+    ["Referrer-Policy", "strict-origin"], ["X-Robots-Tag", "noindex"], ["X-Content-Type-Options", "nosniff"]]) {
+    assert.equal(page.headers.get(name), value, name);
+  }
+  const html = await page.text();
+  assert.ok(html.includes('<meta name="referrer" content="strict-origin">'));
+  assert.equal((await send("/dash/test-dash-secret/api/status", env, "POST")).status, 405);
+  const api = await send("/dash/test-dash-secret/api/status");
+  assert.equal(api.status, 200);
+  assert.match(api.headers.get("Content-Type"), /^application\/json/);
+  assert.equal(api.headers.get("Cache-Control"), "no-store");
+  assert.match(api.headers.get("X-Rows-Read") ?? "", /^\d+$/);
+  // The answer names the page that is served, so an open page can tell when it is out of date.
+  assert.match(api.headers.get("X-Page") ?? "", /^[0-9a-f]{8}$/);
+  assert.ok(html.includes(`const PAGE_ID = "${api.headers.get("X-Page")}";`));
+  const mcp = await send("/mcp/test-mcp-secret", env, "POST", list);
+  assert.equal(mcp.status, 200);
+  assert.ok((await mcp.json()).result.tools.length > 0);
 });
 
 // ------------------------------------------------------------ scripts/fake-device.mjs

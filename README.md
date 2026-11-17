@@ -184,13 +184,14 @@ These files exist only on your machine (gitignored): `backend/.secrets/`, `backe
 
 ### Deploying
 
-`npm run deploy` runs `scripts/deploy.mjs`. It does three things:
+`npm run deploy` runs `scripts/deploy.mjs`. It does four things:
 
-1. It rebuilds `wrangler.local.toml` from `wrangler.toml` and keeps the real database id the old copy holds. An edit of `wrangler.toml` (for example `LOCAL_TZ`, the zone used for times and day boundaries) goes live with the next deploy.
-2. It reads the columns of the remote database and refuses to deploy when a schema change is missing. The message names the missing columns and gives the command to run.
-3. It runs `wrangler deploy --config wrangler.local.toml`.
+1. It runs `npm run typecheck`, `npm test` and `npm run check:dash`, and stops before anything remote when one of them fails. `npm run deploy -- --skip-checks` leaves them out. Every other argument still goes to wrangler.
+2. It rebuilds `wrangler.local.toml` from `wrangler.toml` and keeps the real database id the old copy holds. An edit of `wrangler.toml` (for example `LOCAL_TZ`, the zone used for times and day boundaries) goes live with the next deploy.
+3. It reads the columns of the remote database and refuses to deploy when a schema change is missing. The message names the missing columns and gives the command to run.
+4. It runs `wrangler deploy --config wrangler.local.toml`.
 
-The columns it asks for are `REQUIRED_COLUMNS` in `scripts/deploy.mjs`. Add to that list with every new file in `schema-changes/`. `npm run setup` deploys through the same code, so it stops the same way. The database id is not printed. In wrangler's output ids show as `<id>` and email addresses as `<email>`.
+The columns it asks for are `REQUIRED_COLUMNS` in `scripts/deploy.mjs`. Add to that list with every new file in `schema-changes/`. `npm run setup` deploys through the same code from step 3 on, so it stops the same way on a missing schema change. It does not run the checks of step 1. The database id is not printed. In wrangler's output ids show as `<id>` and email addresses as `<email>`.
 
 State on 2026-11-12: schema change 0001 is applied to the live database and the Worker is deployed. A synthetic 341-record upload was stored in one D1 batch in about 0.3 s on the Free plan. Every API endpoint and all six Claude tools answered. The three leftover backup tables of 2026-11-11 were dropped after an export. The car still runs the old firmware (build 0).
 
@@ -242,9 +243,10 @@ npm run check:dash   # scripts/check-dash.mjs
 ```
 
 - `npm test` bundles every `test/*.test.mjs` with the esbuild that wrangler installed and runs them with `node --test`. The database is a D1 look-alike on `node:sqlite` (`test/helpers/d1.mjs`). No network and no Cloudflare login.
-- Covered: the record decoder against the golden record, a flipped byte and a torn tail, the ingest rules below, one drive posted at once or in pieces giving the same rollups, the rebuild script and schema change 0001, the car state rule, local-day handling across clock changes, and every Claude tool.
+- Covered: the record decoder against the golden record, a flipped byte and a torn tail, the ingest rules below, one drive posted at once or in pieces giving the same rollups, the rebuild script and schema change 0001, the car state rule, local-day handling across clock changes, every Claude tool, the secret paths of the dashboard and connector, and the page headers.
 - The look-alike counts rows returned, not rows scanned. It says nothing about the real D1 cost of a query.
-- `npm run check:dash` runs `node --check` on the inline script of `src/dash.html`, then runs the page script in a stand-in browser against the real dashboard API on the test database. It opens all five views through their nav buttons and a trip from the list, on a desktop and on a touch phone width, and fails when the page uses an element id that is not in the markup. Nothing else runs that script before a browser does. Layout still needs a real browser.
+- `npm run check:dash` runs `node --check` on the inline script of `src/dash.html`, then runs the page script in a stand-in browser against the real dashboard API on the test database. It opens all five views through their nav buttons and a trip from the list, on a desktop and on a touch phone width, and redraws the charts of each view for a new window width. It clicks every History preset and metric button, brings the page back from the background after 2 and after 7 minutes, and ends the 15-minute pause with a tap. It opens a page older than the deployed one, a page whose drawing throws during a poll, and a live answer with a series the page does not know. It fails when the page uses an element id that is not in the markup, or when a page is left with two polls on the way. The clock is pinned and the zone is America/Los_Angeles, so the result does not depend on the machine or the hour. Nothing else runs that script before a browser does. Layout still needs a real browser.
+- `npm run deploy` runs all three and deploys nothing when one fails.
 
 ### Ingest rules
 
@@ -309,7 +311,7 @@ D1 Free allows 5,000,000 rows read and 100,000 rows written per day, and 500 MB 
 
 Raw readings live in `samples` (one per second while driving), but nothing that refreshes reads them in bulk. Each upload folds its readings into three rollups (`src/rollup.ts`): `trips` (one row per session), `minutes` (per-minute aggregates) and `track` (a GPS point every 15 s). The dashboard and Claude tools read those, so a 30-day trips lookup reads a handful of rows instead of thousands. Raw readings are only read for one trip's detail or CSV, the newest readings in Logs, live updates newer than what the page already has, and History windows of an hour or less.
 
-Every `/api/*` answer of the dashboard carries `X-Rows-Read`, the rows D1 reported for that request.
+Every `/api/*` answer of the dashboard carries `X-Rows-Read`, the rows D1 reported for that request, and `X-Page`, the id of the page that is deployed. The id costs no rows.
 
 ### Dashboard
 
@@ -319,7 +321,8 @@ Five views. **Overview**: fuel, range, battery, 30-day MPG, last drive's speed, 
 
 - The header shows running, no signal or parked, from a rule shared with the Claude tools (`STATE_RULES` in `src/queries.ts`). Engine flag on and newest record under 90 s old: running. 90 s to 10 minutes: no signal. Older: parked, marked as ended mid-drive. Engine flag off: parked. No record at all: unknown.
 - Range uses the 30-day MPG once at least 25 miles are logged in that window. Before that it uses the EPA combined figure (19), and the Estimated range card says `at EPA 19 mpg, too few miles logged yet`. With enough miles but no fuel readings it says `at EPA 19 mpg, no fuel use readings`, like the Fuel economy card. The 30-day miles are shown rounded down to one decimal (24.96 shows as 24.9), so they never show 25.0 while the 30-day MPG is still missing.
-- Polling: every 15 s on Live while driving, slower on the other views and when parked. It stops while the tab is hidden and pauses after 15 minutes without interaction. If the trip list or the fuel economy figures fail to load while the server is answering, the page asks for them once more on the next poll, then on every sixth poll. A failure during a full outage does not count, so both load on the first poll after the connection returns.
+- Polling: every 15 s on Live while driving, slower on the other views and when parked. It stops while the tab is hidden and pauses after 15 minutes without interaction. If the trip list or the fuel economy figures fail to load while the server is answering, the page asks for them once more on the next poll, then on every sixth poll. A failure during a full outage does not count, so both load on the first poll after the connection returns. An error while drawing an answer does not stop the polling.
+- A page left open across a deploy notices it. Back from the background it reloads itself. Until then the header says `new version, tap to reload` next to the car state, with a Reload button. The Logs footer ends with the id of the page that is running (`Page <id>.`), so a deploy can be seen to have arrived on the phone.
 - Trips show odometer distance next to logged distance, and the unlogged miles between two trips when the odometer shows a gap.
 - A trip that logged under 0.1 mi but whose GPS route moved shows its distance along the route instead, marked "by GPS". This covers drives where the speed readings failed. Route points are 15 s apart, so it reads a little short on curves. Steps under 2 m/s (drift while standing), over 70 m/s or more than 60 s apart do not count. Fuel and MPG stay empty for such a trip, and totals and the 30-day MPG use logged distance only. The Claude trip tools add `gps_distance_mi` with a note in the same case.
 - The page is `backend/src/dash.html` (no build step) and its JSON API is in `backend/src/dash.ts`. Map tiles come from OpenStreetMap and Leaflet from unpkg. The page sends `Referrer-Policy: strict-origin`, so those hosts see the Worker's hostname and never the secret path. `no-referrer` would hide the hostname too, but the tile servers refuse requests without a referrer.
