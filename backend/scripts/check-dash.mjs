@@ -1213,6 +1213,63 @@ async function behavior() {
     }
   });
 
+  check("charts: the y labels are whole steps of 1, 2, 2.5 or 5, every value is inside the plot, and a steady reading stays flat", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // The page writes the labels with toLocaleString, so the same separators read them back.
+    const group = (1000).toLocaleString().replace(/\d/g, ""), point = (1.5).toLocaleString().replace(/\d/g, "");
+    const num = (s) => +s.split(group).join("").replace(point, ".");
+    // The y labels from the bottom up. They end 8 px left of the plot: at 32 in a line chart, 26 in a bar chart.
+    const ylabels = (svg, x) => [...svg.matchAll(new RegExp(`<text x="${x}" y="[\\d.]+" text-anchor="end">([^<]*)</text>`, "g"))].map((m) => num(m[1]));
+    // `least` is 4 for a bar chart: from 0 the steps always give at least four labels.
+    const whole = (name, vals, least = 3) => {
+      assert.ok(vals.length >= least, `${name}: ${vals.length} y labels (${vals})`);
+      const step = vals[1] - vals[0], k = step / 10 ** Math.floor(Math.log10(step) + 1e-9);
+      assert.ok([1, 2, 2.5, 5].some((m) => Math.abs(k - m) < 1e-6), `${name}: a step of ${step} (${vals})`);
+      vals.forEach((v, i) => {
+        assert.ok(Math.abs(v - (vals[0] + i * step)) < 1e-6, `${name}: ${vals} are not one step apart`);
+        assert.ok(Math.abs(v / step - Math.round(v / step)) < 1e-6, `${name}: ${v} is not a whole multiple of ${step}`);
+      });
+      return vals;
+    };
+    // Every dot and every point of the line and its fill lies between the top (10) and the bottom of the plot.
+    const inside = (name, svg, h) => {
+      const ys = [...svg.matchAll(/<circle cx="[\d.]+" cy="(-?[\d.]+)"/g)].map((m) => +m[1]);
+      for (const d of svg.matchAll(/<path d="([^"]*)"/g)) for (const m of d[1].matchAll(/[ML](-?[\d.]+),(-?[\d.]+)/g)) ys.push(+m[2]);
+      assert.ok(ys.length > 0, `${name}: nothing drawn`);
+      assert.ok(ys.every((y) => y >= 10 && y <= h - 22), `${name}: drawn at ${ys.filter((y) => y < 10 || y > h - 22)}`);
+    };
+    const p = openPage(env);
+    await p.settle();
+    whole("Last drive", ylabels(p.$("o-drive").innerHTML, 32));
+    inside("Last drive", p.$("o-drive").innerHTML, 200);
+    assert.equal(whole("MPG by trip", ylabels(p.$("o-econ").innerHTML, 26), 4)[0], 0);
+    // History over the ten minutes of that drive, so the chart has many points and not one average.
+    const h = openPage(env, { hash: `history/${T0}-${T0 + 600}` });
+    await h.settle();
+    assert.equal(whole("By day", ylabels(h.$("h-days").innerHTML, 26), 4)[0], 0);
+    const metric = (m) => { h.groups["#h-metrics button"].find((b) => b.dataset.m === m).onclick(); return h.$("h-chart").innerHTML; };
+    // The battery reads 14.10 to 14.16 V. Its axis spans at least 1 V, so that wobble draws a flat line.
+    const volts = whole("History battery", ylabels(metric("battery"), 32));
+    assert.ok(volts[volts.length - 1] - volts[0] >= 1, `battery axis ${volts}`);
+    inside("History battery", h.$("h-chart").innerHTML, 230);
+    // The tank against its full range, and the coolant on its own range instead of from 0.
+    assert.deepEqual(whole("History fuel", ylabels(metric("fuel"), 32)), [0, 25, 50, 75, 100]);
+    assert.ok(whole("History coolant", ylabels(metric("coolant"), 32))[0] > 0, "the coolant axis starts at 0");
+    inside("History coolant", h.$("h-chart").innerHTML, 230);
+    // A cold morning: the intake air reads -22 °F. Its axis goes below 0, and the readings stay inside the plot.
+    const cold = makeEnv();
+    await upload(cold, drive({ n: 120 }).map((r) => ({ ...r, intake_c: -30 })), T0 + 140);
+    setNow(T0 + 4000);
+    const q = openPage(cold, { hash: "history" });
+    await q.settle();
+    q.groups["#h-metrics button"].find((b) => b.dataset.m === "intake").onclick();
+    const air = whole("History intake", ylabels(q.$("h-chart").innerHTML, 32));
+    assert.ok(air[0] < -22, `intake axis ${air}`);
+    inside("History intake", q.$("h-chart").innerHTML, 230);
+    assert.deepEqual([...p.errors, ...h.errors, ...q.errors], []);
+  });
+
   check("history: the hover value has a line of its own, outside the card head", async () => {
     const id = html.indexOf('id="h-readout"');
     assert.ok(id > 0, "no element with id h-readout");
@@ -1900,6 +1957,125 @@ async function behavior() {
     assert.equal(p.nextPoll(), 60000);
     assert.deepEqual([p.requests("api/trips"), p.requests("api/economy")], [trips + 1, econ + 1]);
     assert.deepEqual(p.errors, []);
+  });
+
+  check("when a drive ends the trip list and the fuel figures are read once, and an open trip catches up", async () => {
+    const env = makeEnv();
+    // Two minutes into a drive the trip is opened.
+    const start = drive({ n: 120 });
+    await upload(env, start, T0 + 140);
+    setNow(T0 + 145);
+    const p = openPage(env, { hash: "trips" });
+    await p.settle();
+    p.interval();
+    assert.match(p.$("t-sub").textContent, / · in progress/);
+    // Reads of a whole trip (not the per-minute series of the Last drive card), and of the list and the fuel figures.
+    const full = () => p.net.log.filter((path) => /^api\/trip\/\d+$/.test(path)).length;
+    const lists = () => [p.requests("api/trips"), p.requests("api/economy")];
+    assert.equal(full(), 1);
+    // Eleven more minutes in six uploads, with a poll and a 10 s check after each. The sixth poll
+    // reads the list, but the trip in progress is not read again.
+    const rest = drive({ n: 660, ms0: 140000, odo0: Math.round(start[start.length - 1].odo_km * 10) });
+    for (let k = 0; k < 6; k++) {
+      await upload(env, rest.slice(k * 110, (k + 1) * 110), T0 + 250 + 110 * k);
+      setNow(T0 + 252 + 110 * k);
+      await p.poll();
+      p.interval();
+      await p.settle();
+      assert.match(p.header(), /^Engine running · /);
+    }
+    assert.equal(full(), 1);
+    const before = lists();
+    // The engine stops. The next 10 s check reads the list and the fuel figures, and the trip again.
+    await upload(env, drive({ n: 10, ms0: 800000, stepMs: 2000, flags: F.QUIET }).map((r) => ({ ...r, rpm: null, speed_kph: null })), T0 + 820);
+    setNow(T0 + 825);
+    await p.poll();
+    p.interval();
+    await p.settle();
+    assert.match(p.header(), /^Parked · /);
+    assert.deepEqual(lists(), [before[0] + 1, before[1] + 1]);
+    assert.equal(full(), 2);
+    // The details now agree with the trip's row: the same distance, and the end of the drive.
+    const row = (await api(env, "api/trips?limit=40")).trips[0];
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const sub = p.$("t-sub").textContent;
+    assert.ok(sub.includes(` to ${time.format(new Date(row.end_ts * 1000))}`) && !sub.includes("in progress"), sub);
+    const tile = /Distance<\/div><div class="v">([^<]+)</.exec(p.$("t-stats").innerHTML)[1];
+    assert.equal(tile, p.$("t-list").children[0].querySelector(".r").innerHTML.replace("<small>", " ").replace("</small>", ""));
+    assert.ok(parseFloat(tile) > 5, tile);
+    // Only once: the next poll and check read nothing more.
+    const after = [...lists(), full()];
+    setNow(T0 + 885);
+    await p.poll();
+    p.interval();
+    await p.settle();
+    assert.deepEqual([...lists(), full()], after);
+
+    // The poll brings the stop, then the tab goes to the background before the 10 s check. The
+    // hidden page asks for nothing. Back in view the header is the same as at the last check,
+    // and the check still reads the list and the fuel figures.
+    const env2 = makeEnv();
+    await upload(env2, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const q = openPage(env2);
+    await q.settle();
+    q.interval();
+    await upload(env2, drive({ n: 10, ms0: 142000, stepMs: 2000, flags: F.QUIET }).map((r) => ({ ...r, rpm: null, speed_kph: null })), T0 + 180);
+    setNow(T0 + 185);
+    await q.poll();
+    assert.match(q.header(), /^Parked · /);
+    q.visible(false);
+    const asked = q.net.log.length;
+    q.interval();
+    await q.settle();
+    assert.equal(q.net.log.length, asked, "a hidden page asked for something");
+    q.visible(true);
+    await q.settle();
+    const was = [q.requests("api/trips"), q.requests("api/economy")];
+    q.interval();
+    await q.settle();
+    assert.deepEqual([q.requests("api/trips"), q.requests("api/economy")], [was[0] + 1, was[1] + 1]);
+
+    // A page paused by 15 idle minutes asks for nothing either, though by then the drive counts as cut off.
+    const env3 = makeEnv();
+    await upload(env3, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const s = openPage(env3);
+    await s.settle();
+    s.interval();
+    setNow(T0 + 1050);
+    await s.poll();
+    assert.equal(s.header(), "Paused · tap to resume");
+    const idle = s.net.log.length;
+    s.interval();
+    await s.settle();
+    assert.equal(s.net.log.length, idle, "a paused page asked for something");
+
+    // No answers while the drive ends: nothing is tried during the outage, and the first check
+    // after the server answers again reads the list and the fuel figures.
+    const env4 = makeEnv();
+    await upload(env4, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const r = openPage(env4);
+    await r.settle();
+    r.interval();
+    r.net.reject = () => true;
+    await r.poll();
+    // Ten minutes after the last reading the drive counts as cut off: parked, offline mid-drive.
+    setNow(T0 + 800);
+    const tried = r.net.log.length;
+    r.interval();
+    await r.settle();
+    assert.match(r.header(), /^No connection to the server/);
+    assert.equal(r.net.log.length, tried, "the lists were asked for during the outage");
+    r.net.reject = null;
+    await r.poll();
+    assert.match(r.header(), /^Parked · offline mid-drive/);
+    const then = [r.requests("api/trips"), r.requests("api/economy")];
+    r.interval();
+    await r.settle();
+    assert.deepEqual([r.requests("api/trips"), r.requests("api/economy")], [then[0] + 1, then[1] + 1]);
+    assert.deepEqual([...p.errors, ...q.errors, ...s.errors, ...r.errors], []);
   });
 
   check("history: every preset and metric button draws, and 7 days asks from local midnight 6 days back", async () => {
