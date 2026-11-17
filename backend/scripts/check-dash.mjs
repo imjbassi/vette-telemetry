@@ -464,6 +464,12 @@ async function behavior() {
     setNow(T0 + 200);
     const t = await api(env, `api/trip/${sid(12, INST)}`);
     assert.equal(t.battery_start_v, 12.3);
+    // The trip view gives it a note line, not a tile.
+    const p = openPage(env, { hash: "trips" });
+    await p.settle();
+    assert.match(p.$("t-note").innerHTML, /<div>Battery at power-up 12\.3 V, engine off\.<\/div>/);
+    assert.equal((p.$("t-stats").innerHTML.match(/class="stat"/g) ?? []).length, 12);
+    assert.deepEqual(p.errors, []);
     // A session whose first record already has the engine running says nothing.
     const running = makeEnv();
     await upload(running, drive({ n: 60 }), T0 + 100);
@@ -509,6 +515,31 @@ async function behavior() {
 
   // ---------------------------------------------------------------- the page (src/dash.html)
 
+  check("header: the Overview subtitle carries the odometer, a phone hides the others, and the footer stays empty", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const odo = Math.round((await api(env, "api/status")).latest.odo_km.v * 0.621371).toLocaleString();
+    const p = openPage(env, { width: 375, touch: true });
+    await p.settle();
+    assert.equal(p.$("subtitle").textContent, `2024 Stingray · ${odo} mi`);
+    assert.ok(!p.$("subtitle").classList.contains("opt"), "the Overview subtitle is hidden");
+    // Nothing went wrong and nothing is paused, so the footer has nothing to say.
+    assert.equal(p.$("foot").textContent, "");
+    p.nav("trips");
+    await p.settle();
+    assert.equal(p.$("subtitle").textContent, "Each trip with its route and charts");
+    assert.ok(p.$("subtitle").classList.contains("opt"), "the Trips subtitle is not marked as optional");
+    assert.equal(p.$("t-list-sub").textContent, "A trip is one power-up of the logger in which the engine ran.");
+    assert.equal(p.$("foot").textContent, "");
+    // A header re-check on another view keeps that view's subtitle.
+    p.interval();
+    assert.equal(p.$("subtitle").textContent, "Each trip with its route and charts");
+    p.nav("overview");
+    await p.settle();
+    assert.equal(p.$("subtitle").textContent, `2024 Stingray · ${odo} mi`);
+    assert.deepEqual(p.errors, []);
+  });
+
   check("overview: the empty Fuel economy card says why, and the chip beside it shows no average", async () => {
     const env = makeEnv();
     await parkedCar(env);
@@ -519,6 +550,50 @@ async function behavior() {
     assert.match(p.$("k-mpg-d").textContent, /^Too few miles logged in the last 30 days \(3\.\d of 25\)$/);
     assert.match(p.$("o-econ-chip").textContent, /^3\.\d mi logged$/);
     assert.deepEqual(p.errors, []);
+  });
+
+  check("overview: the Last drive card is the newest drive that moved, and a trip row leads with its distance", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // An hour later the engine idles for two minutes and the car does not move.
+    await upload(env, drive({ boot: 12, n: 120, gps: false, base: T0 + 3600 }).map((r) => ({ ...r, speed_kph: 0 })), T0 + 3760);
+    setNow(T0 + 4000);
+    const p = openPage(env);
+    await p.settle();
+    assert.match(p.$("o-drive-chip").textContent, /^top \d+ mph$/);
+    assert.match(p.$("o-drive-sub").textContent, / · [\d.]+ mi · 5 min engine$/);
+    // The idle session is the newest row. It has no distance and no top speed.
+    const rows = p.$("o-trips").children;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].querySelector(".m").textContent, "Idle only · 2 min engine");
+    assert.equal(rows[0].querySelector(".r").innerHTML, "");
+    assert.match(rows[1].querySelector(".r").innerHTML, /^[\d.]+<small>mi<\/small>$/);
+    assert.match(rows[1].querySelector(".m").textContent, /^5 min engine · top \d+ mph · [\d.]+ mpg$/);
+    // Only the Trips list marks the selected trip.
+    assert.ok(rows.every((li) => !li.classList.contains("sel")), "a Recent trips row is marked");
+
+    assert.equal(p.$("o-drive-open").hidden, false);
+    p.$("o-drive-open").onclick();
+    await p.settle();
+    assert.deepEqual(p.shown(), ["v-trips"]);
+    assert.match(p.$("t-sub").textContent, /^Trip 11 · /);
+    assert.match(p.$("t-list").children[0].querySelector(".m").textContent, /idle only/i);
+    const marked = () => p.$("t-list").children.filter((li) => li.classList.contains("sel")).map((li) => li.dataset.id);
+    assert.deepEqual(marked(), [11]);
+    // The first 10 s re-check draws the lists again. The selection stays marked.
+    p.interval();
+    assert.deepEqual(marked(), [11]);
+
+    // A drive whose speed readings all failed: its distance comes from the GPS route.
+    const gps = makeEnv();
+    await upload(gps, drive({ n: 120 }).map((r) => ({ ...r, speed_kph: null })), T0 + 200);
+    setNow(T0 + 4000);
+    const q = openPage(gps);
+    await q.settle();
+    assert.match(q.$("o-drive-sub").textContent, / · about [\d.]+ mi by GPS · 2 min engine$/);
+    assert.equal(q.$("o-drive-chip").textContent, "no speed readings");
+    assert.match(q.$("o-trips").children[0].querySelector(".r").innerHTML, /^[\d.]+<small>mi by GPS<\/small>$/);
+    assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
   check("overview: with the adapter link down the location is not called parked", async () => {
@@ -543,7 +618,7 @@ async function behavior() {
     setNow(T0 + 740);
     const a = openPage(cut);
     await a.settle();
-    assert.match(a.header(), /^Parked · logger went offline mid-drive/);
+    assert.match(a.header(), /^Parked · offline mid-drive, 11 min ago$/);
     assert.equal(a.$("o-loc-sub").textContent, "Last known · 11 min ago");
     assert.deepEqual(a.tooltips, ["Last position before the logger went offline"]);
     assert.deepEqual(a.fills, ["#ef4444"]);
@@ -574,7 +649,9 @@ async function behavior() {
     const c = openPage(garage);
     await c.settle();
     assert.match(c.header(), /^Parked · updated /);
-    assert.equal(c.$("o-loc-sub").textContent, "Parked · 5 min ago");
+    // Since the last RPM reading, not since the quiet readings after it.
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    assert.equal(c.$("o-loc-sub").textContent, `Parked since ${time.format(new Date((T0 + 259) * 1000))}`);
     assert.deepEqual(c.tooltips, ["Parked here"]);
     assert.deepEqual(c.fills, ["#ef4444"]);
 
@@ -595,6 +672,137 @@ async function behavior() {
     await d.settle();
     assert.match(d.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix since the logger started</);
     assert.deepEqual([...a.errors, ...b.errors, ...c.errors, ...d.errors], []);
+  });
+
+  check("overview: a parked car says since when, as a time today, a weekday this week, else a date", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // The last RPM reading of the drive. The quiet readings after it have none.
+    const stop = new Date((T0 + 319) * 1000);
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const wday = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+    const date = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+    const seen = [];
+    for (const later of [3600, 2 * 86400, 8 * 86400]) {
+      setNow(T0 + 340 + later);
+      const p = openPage(env);
+      await p.settle();
+      assert.match(p.header(), /^Parked · updated /);
+      seen.push(p.$("o-loc-sub").textContent);
+      assert.deepEqual(p.errors, []);
+    }
+    assert.deepEqual(seen, [`Parked since ${time.format(stop)}`, `Parked since ${wday.format(stop)} ${time.format(stop)}`, `Parked since ${date.format(stop)}`]);
+    // The Location card comes first on a phone, after the cards at the top.
+    const narrow = html.slice(html.indexOf("@media (max-width: 1020px) {"));
+    assert.match(narrow.slice(0, narrow.indexOf("\n  }")), /#o-loc-card \{ order: -1; \}/);
+  });
+
+  check("overview: the map moves to the car after a drive the page did not see, and stays put without one", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    // The first view of a new map, then the parked car.
+    assert.equal(p.calls.filter((k) => k === "setView").length, 2, "the map is centered on the parked car");
+    // A drive ends while the page waits for its next poll. Its end never arrives, so the
+    // position is not live when the page sees it. Within 15 minutes of the page open, or it pauses.
+    let before = p.calls.length;
+    await upload(env, drive({ boot: 12, n: 200, base: T0 + 4005 }), T0 + 4225);
+    setNow(T0 + 4830);
+    await p.poll();
+    assert.match(p.$("o-loc-sub").textContent, /^Last known · /);
+    assert.ok(p.calls.slice(before).includes("panTo"), "the map follows the car to where the drive ended");
+    // Nothing new: the view stays where it is.
+    before = p.calls.length;
+    setNow(T0 + 4850);
+    await p.poll();
+    assert.deepEqual(p.calls.slice(before).filter((k) => k === "panTo" || k === "setView"), []);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("maps: no map without a position, and a trip with one position gets a dot that leaves with it", async () => {
+    // Stand-in elements start with hidden false, so each box is read after the page drew it.
+    const none = makeEnv();
+    await upload(none, drive({ n: 60, gps: false }), T0 + 100);
+    setNow(T0 + 4000);
+    const p = openPage(none, { hash: "trips" });
+    await p.settle();
+    assert.equal(p.$("t-detail").hidden, false);
+    assert.equal(p.$("t-mapbox").hidden, true);
+    assert.equal(p.$("t-route-sub").textContent, "No GPS positions were recorded on this trip");
+    // Overview and History make no map either.
+    const o = openPage(none);
+    await o.settle();
+    assert.equal(o.$("o-loc-sub").textContent, "No GPS fix yet");
+    assert.equal(o.$("o-map").innerHTML, '<div class="empty">No GPS position yet.</div>');
+    const h = openPage(none, { hash: `history/${T0 - 600}-${T0 + 4000}` });
+    await h.settle();
+    assert.equal(h.$("h-mapbox").hidden, true);
+    assert.equal(h.$("h-map-sub").textContent, "No GPS positions in this period");
+    assert.ok(![...p.calls, ...o.calls, ...h.calls].includes("map"), "a map was made with nothing to draw");
+
+    // One reading in the middle of the drive had a fix.
+    const one = makeEnv();
+    const fix = drive({ n: 60 })[30];
+    await upload(one, drive({ n: 60, gps: false }).map((r, i) => (i === 30 ? { ...r, lat: fix.lat, lon: fix.lon, sats: 9 } : r)), T0 + 100);
+    setNow(T0 + 4000);
+    const q = openPage(one, { hash: "trips" });
+    await q.settle();
+    assert.equal(q.$("t-mapbox").hidden, false);
+    assert.equal(q.$("t-route-sub").textContent, "Only one GPS position was recorded on this trip");
+    assert.deepEqual(q.tooltips, ["Only GPS position"]);
+    // The dot is in the track layer, which goes when the trip is drawn again.
+    const layers = () => q.calls.filter((k) => k === "removeLayer").length;
+    const removed = layers();
+    q.listeners.hashchange();
+    await q.settle();
+    assert.equal(layers(), removed + 1);
+    assert.deepEqual([...p.errors, ...o.errors, ...h.errors, ...q.errors], []);
+  });
+
+  check("trips: twelve tiles, the unlogged gap on a line of its own, and one note per line that applies", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const p = openPage(env, { hash: "trips" });
+    await p.settle();
+    assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
+    assert.match(p.$("t-gap").innerHTML,
+      /^<div class="notice"><i class="dot warn"><\/i><span>The odometer moved [\d.]+ mi before this trip without being logged\.<\/span><\/div>$/);
+    // The trip's row in the list shows the gap as a tag, and leads with the distance.
+    assert.match(p.$("t-list").children[0].innerHTML, /<div class="gap"><span class="tag mid">[\d.]+ mi unlogged before<\/span><\/div>$/);
+    assert.match(p.$("o-trips").children[0].querySelector(".r").innerHTML, /^[\d.]+<small>mi<\/small>$/);
+    const stats = p.$("t-stats").innerHTML;
+    assert.equal((stats.match(/class="stat"/g) ?? []).length, 12);
+    assert.match(stats, /Idle<\/div><div class="v">\d+ s \(\d+ %\)</);
+    assert.equal(p.$("t-note").innerHTML, "<div>Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.</div>" +
+      "<div>Distance is added up from speed, about 1% under the odometer.</div>");
+    // No trip came before the first one, so there is no gap line.
+    p.$("t-list").children[2].onclick();
+    await p.settle();
+    assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-12 · `));
+    assert.equal(p.$("t-gap").innerHTML, "");
+
+    // The trip before has no odometer, so the gap is not known. A note says so.
+    const unknown = makeEnv();
+    await threeTrips(unknown, null);
+    const q = openPage(unknown, { hash: "trips" });
+    await q.settle();
+    assert.equal(q.$("t-gap").innerHTML, "");
+    assert.match(q.$("t-note").innerHTML, /^<div>Not known if miles went unlogged before this trip\. An odometer reading is missing\.<\/div>/);
+
+    // A drive whose speed readings failed has no moving time, so no idle time and no average.
+    const gps = makeEnv();
+    await upload(gps, drive({ n: 120 }).map((r) => ({ ...r, speed_kph: null })), T0 + 200);
+    setNow(T0 + 4000);
+    const g = openPage(gps, { hash: "trips" });
+    await g.settle();
+    const gs = g.$("t-stats").innerHTML;
+    assert.match(gs, /Distance<\/div><div class="v">[\d.]+ mi by GPS</);
+    assert.match(gs, /Avg moving speed<\/div><div class="v">–</);
+    assert.match(gs, /Idle<\/div><div class="v">–</);
+    assert.equal(g.$("t-note").innerHTML, "<div>No speed readings on this trip. The distance is measured along the GPS route and reads a little short on curves. " +
+      "There is no MPG figure.</div><div>Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.</div>");
+    assert.deepEqual([...p.errors, ...q.errors, ...g.errors], []);
   });
 
   check("logs: the GPS card gives the age of the fix, and no card or table prints coordinates", async () => {
@@ -744,7 +952,9 @@ async function behavior() {
     p.interval();
     assert.match(p.header(), /^No connection to the server · last data 1\.7 h ago$/);
     assert.match(p.$("k-fuel-d").textContent, / · 1\.7 h ago$/);
-    assert.match(p.$("o-loc-sub").textContent, / · 1\.7 h ago$/);
+    // A parked car gives the time it stopped, which does not age.
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    assert.equal(p.$("o-loc-sub").textContent, `Parked since ${time.format(new Date((T0 + 319) * 1000))}`);
     assert.deepEqual(p.errors, []);
   });
 
@@ -775,7 +985,7 @@ async function behavior() {
   });
 
   check("the hidden attribute hides an element whatever its class", async () => {
-    // .btn sets display and comes later. Without !important "Open in Maps" is drawn as a dead
+    // .btn sets display and comes later. Without !important "Google Maps" is drawn as a dead
     // button until there is a position.
     assert.match(html, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
     assert.match(html, /<a class="btn" id="o-maps"[^>]* hidden>/);
@@ -810,7 +1020,7 @@ async function behavior() {
     // 11 minutes without an upload. The state falls back to parked, the polling goes on.
     setNow(T0 + 1099 + 660);
     await p.poll();
-    assert.match(p.header(), /^Parked · logger went offline mid-drive/);
+    assert.match(p.header(), /^Parked · offline mid-drive, /);
     assert.equal(p.nextPoll(), 60000);
 
     // Coverage is back and the stored readings arrive.
@@ -832,28 +1042,59 @@ async function behavior() {
     const env = makeEnv();
     await parkedCar(env);
     const failedOnce = new Set();
-    const p = openPage(env);
     // The first request of each kind fails. "api/trip/" is the per-minute series of the last drive.
-    p.net.reject = (path) => {
-      const kind = ["api/trips", "api/economy", "api/trip/"].find((k) => path.startsWith(k));
-      if (!kind || failedOnce.has(kind)) return false;
-      failedOnce.add(kind);
-      return true;
-    };
+    // Given at open: the trips and the economy are asked for at once, beside the status.
+    const p = openPage(env, {
+      reject: (path) => {
+        const kind = ["api/trips", "api/economy", "api/trip/"].find((k) => path.startsWith(k));
+        if (!kind || failedOnce.has(kind)) return false;
+        failedOnce.add(kind);
+        return true;
+      },
+    });
     await p.settle();
     assert.deepEqual([p.requests("api/trips"), p.requests("api/economy"), p.requests("api/trip/")], [1, 1, 0]);
+    // What did not load says so.
+    for (const id of ["o-trips", "t-list"]) assert.equal(p.$(id).innerHTML, '<li class="empty">Could not load the trips. Trying again.</li>');
+    assert.equal(p.$("o-econ").innerHTML, '<div class="empty">Could not load the MPG figures.</div>');
 
     // The next poll asks for trips and economy again. The trip list then asks for the last drive.
     await p.poll();
     assert.deepEqual([p.requests("api/trips"), p.requests("api/economy"), p.requests("api/trip/")], [2, 2, 1]);
     assert.equal(p.$("o-trips-chip").textContent, "1 total");
     assert.match(p.$("o-econ-chip").textContent, /mi logged$/);
+    assert.match(p.$("o-econ").innerHTML, /^<svg /);
     assert.equal(p.$("o-drive-chip").textContent, "");
+    assert.equal(p.$("o-drive").innerHTML, '<div class="empty">Could not load the last drive.</div>');
 
     // That one failed too. It is asked again with the next trip list, on the sixth poll.
     for (let i = 0; i < 5; i++) await p.poll();
     assert.deepEqual([p.requests("api/trips"), p.requests("api/trip/")], [3, 2]);
     assert.match(p.$("o-drive-chip").textContent, /^top \d+ mph$/);
+    assert.equal(p.header(), "Parked · updated 1.0 h ago");
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("page open: the trips and the economy are asked for while the status is still on its way", async () => {
+    // Room is kept for the two Overview charts, so the cards below them do not jump.
+    assert.match(html, /#o-drive \{ min-height: 200px; \}/);
+    assert.match(html, /#o-econ \{ min-height: 190px; \}/);
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env, { hold: (path) => path.startsWith("api/status") });
+    await p.settle();
+    assert.deepEqual([p.requests("api/status"), p.requests("api/trips"), p.requests("api/economy")], [1, 1, 1]);
+    // The lists and both charts are drawn without the car state.
+    assert.equal(p.$("o-trips-chip").textContent, "1 total");
+    assert.match(p.$("o-drive-chip").textContent, /^top \d+ mph$/);
+    assert.match(p.$("o-econ").innerHTML, /^<svg /);
+    // The status is given up after 30 s. The next poll brings the car.
+    p.net.hold = null;
+    assert.deepEqual(p.limits().map((t) => t.ms), [30000]);
+    p.limits()[0].fn();
+    await p.settle();
+    assert.match(p.header(), /^No connection to the server/);
+    await p.poll();
     assert.equal(p.header(), "Parked · updated 1.0 h ago");
     assert.deepEqual(p.errors, []);
   });
@@ -1010,6 +1251,30 @@ async function behavior() {
     }
   });
 
+  check("charts: MPG by trip keeps its dates past 12 bars, gives each day one label, and says when trips were left out", async () => {
+    const env = makeEnv();
+    // Two short trips a day, an hour apart, on each of the last 8 days. Only the newest 14 are drawn.
+    for (let k = 7; k >= 0; k--) {
+      for (const h of [0, 3600]) {
+        const base = T0 - k * 86400 + h;
+        await upload(env, drive({ boot: 20 + 2 * k + h / 3600, n: 60, base, odo0: null }), base + 100);
+      }
+    }
+    setNow(T0 + 4000);
+    const labels = (svg) => [...svg.matchAll(/<text [^>]*y="185"[^>]*>([^<]*)<\/text>/g)].map((m) => m[1]);
+    for (const [width, count] of [[600, 7], [305, 4]]) {
+      const p = openPage(env, { width });
+      await p.settle();
+      const svg = p.$("o-econ").innerHTML;
+      assert.equal((svg.match(/<rect class="bar"/g) ?? []).length, 14);
+      const days = labels(svg);
+      assert.equal(days.length, count, `width ${width}: ${days}`);
+      assert.equal(new Set(days).size, days.length, `a date is drawn twice: ${days}`);
+      assert.equal(p.$("o-econ-sub").textContent, "Newest 14 of 16 trips in the last 30 days");
+      assert.deepEqual(p.errors, []);
+    }
+  });
+
   check("overview: with enough miles but no fuel readings, the range card and the economy card agree", async () => {
     const env = makeEnv();
     // About 29 miles with no airflow readings, so no fuel use.
@@ -1022,6 +1287,53 @@ async function behavior() {
     assert.equal(p.$("k-mpg-d").textContent, "No fuel use readings in the last 30 days");
     assert.equal(p.$("k-range-d").textContent, "at EPA 19 mpg, no fuel use readings");
     assert.deepEqual(p.errors, []);
+  });
+
+  check("overview: under 25 logged miles a rough MPG below EPA sets the range, and both cards call it rough", async () => {
+    const f1 = (x) => (Math.round(x * 10) / 10).toLocaleString();
+    // About 14 miles at about 10 mpg: more airflow for the same speeds.
+    const env = makeEnv();
+    await upload(env, drive({ n: 1200 }).map((r) => ({ ...r, maf_gs: Math.round(r.maf_gs * 370) / 100 })), T0 + 1300);
+    setNow(T0 + 4000);
+    const st = await api(env, "api/status");
+    assert.ok(st.mpg30 == null && st.mpg30_rough > 9 && st.mpg30_rough < 11, JSON.stringify([st.mpg30, st.mpg30_rough]));
+    const p = openPage(env);
+    await p.settle();
+    const gal = (st.latest.fuel_pct.v / 100) * 18.5;
+    assert.equal(p.$("k-range").innerHTML, `${Math.round(gal * st.mpg30_rough).toLocaleString()}<small>mi</small>`);
+    assert.equal(p.$("k-range-d").textContent, `rough, at ${f1(st.mpg30_rough)} mpg`);
+    assert.equal(p.$("k-mpg").innerHTML, `${f1(st.mpg30_rough)}<small>mpg</small>`);
+    assert.ok(p.$("k-mpg").classList.contains("rough"), "the rough figure is grey");
+    assert.equal(p.$("k-mpg-d").textContent, `rough, ${f1(st.mpg30_miles)} of 25 mi logged`);
+    assert.match(p.$("k-fuel-d").textContent, /^about [\d.]+ of 18\.5 gal · /);
+
+    // A rough figure above EPA: the range stays at EPA, the card still shows it as rough.
+    const high = makeEnv();
+    await upload(high, drive({ n: 1200 }), T0 + 1300);
+    setNow(T0 + 4000);
+    const q = openPage(high);
+    await q.settle();
+    assert.equal(q.$("k-range-d").textContent, "at EPA 19 mpg, too few miles logged yet");
+    assert.ok(q.$("k-mpg").classList.contains("rough"));
+    assert.match(q.$("k-mpg-d").textContent, /^rough, [\d.]+ of 25 mi logged$/);
+
+    // From 25 miles on: the 30-day estimate, in plain text.
+    const far = makeEnv();
+    await upload(far, drive({ n: 2400 }), T0 + 2500);
+    setNow(T0 + 4000);
+    const r = openPage(far);
+    await r.settle();
+    assert.match(r.$("k-range-d").textContent, /^at your [\d.]+ mpg average$/);
+    assert.match(r.$("k-mpg-d").textContent, /^30-day estimate · \+\d+% vs EPA 19$/);
+    assert.ok(!r.$("k-mpg").classList.contains("rough"));
+
+    // No status answer yet, only a live one: the EPA figure without a reason.
+    const live = openPage(env, { hash: "live", reject: (path) => path.startsWith("api/status") });
+    await live.settle();
+    live.nav("overview");
+    await live.settle();
+    assert.equal(live.$("k-range-d").textContent, "at EPA 19 mpg");
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors, ...live.errors], []);
   });
 
   check("every view opens from its button, a trip opens from the list, and each view polls and redraws on a resize", async () => {
@@ -1049,6 +1361,8 @@ async function behavior() {
       assert.equal(p.$("t-detail").hidden, false);
       assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
       assert.match(p.$("t-stats").innerHTML, /Distance/);
+      assert.equal((p.$("t-stats").innerHTML.match(/class="stat"/g) ?? []).length, 12);
+      assert.match(p.$("t-stats").innerHTML, /Avg moving speed<\/div><div class="v">\d+ mph/);
       await resize("t-speed");
       await p.poll();
       for (const [view, chart] of [["live", "l-speed"], ["history", "h-chart"], ["logs", null], ["overview", "o-drive"]]) {
