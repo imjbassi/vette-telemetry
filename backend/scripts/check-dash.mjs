@@ -364,10 +364,29 @@ async function behavior() {
     }
   });
 
+  check("history: 0 % fuel readings from one bad reply are left out of the fuel figures", async () => {
+    const env = makeEnv();
+    // The tank reads about 62 %. One bad PID 2F reply is carried into ten records.
+    const fields = drive({ n: 180 }).map((r, i) => (i >= 90 && i < 100 ? { ...r, fuel_raw: 0 } : r));
+    await upload(env, fields, T0 + 300);
+    setNow(T0 + 400);
+    // The raw readings, then the per-minute rollup.
+    for (const [from, to] of [[T0, T0 + 600], [T0 - 3600, T0 + 3600]]) {
+      const h = await api(env, `api/history?from=${from}&to=${to}`);
+      const fuel = h.series.fuel.filter((v) => v != null);
+      assert.ok(fuel.length > 1, `${h.source}: ${fuel.length} fuel points`);
+      assert.ok(Math.min(...fuel) > 60, `${h.source}: lowest fuel point ${Math.min(...fuel)}`);
+      assert.ok(h.totals.fuel_min > 60 && h.totals.fuel_max < 63, `${h.source}: fuel ${h.totals.fuel_min} to ${h.totals.fuel_max}`);
+    }
+  });
+
   check("history: unlogged miles are unknown, not 0, when a trip in the chain has no odometer", async () => {
     const env = makeEnv();
     await threeTrips(env, null);
-    assert.equal((await api(env, `api/history?${WINDOW}`)).totals.unlogged_mi, null);
+    const unknown = await api(env, `api/history?${WINDOW}`);
+    assert.equal(unknown.totals.unlogged_mi, null);
+    // No gap of this chain is known, so there is no floor either.
+    assert.equal(unknown.totals.unlogged_mi_at_least, null);
 
     const known = makeEnv();
     await threeTrips(known, 126800);
@@ -375,6 +394,48 @@ async function behavior() {
     assert.equal(h.trips.length, 3);
     assert.ok(h.totals.unlogged_mi > 40, `unlogged_mi ${h.totals.unlogged_mi}`);
     assert.equal(h.totals.unlogged_mi, Math.round(h.trips.reduce((a, t) => a + (t.unlogged_before_mi ?? 0), 0) * 10) / 10);
+    assert.equal(h.totals.unlogged_mi_at_least, null);
+  });
+
+  check("history: odometer distance, a floor for unlogged miles, rough MPG and where the data starts", async () => {
+    const env = makeEnv();
+    // Four trips an hour apart. The odometer is ahead before the second one, and the third never
+    // answered it, so one gap is known and the two around the third are not.
+    const trips = [
+      drive({ boot: 12, n: 60 }),
+      drive({ boot: 13, n: 60, base: T0 + 3600, odo0: 127000 }),
+      drive({ boot: 14, n: 60, base: T0 + 7200, odo0: null }),
+      drive({ boot: 15, n: 60, base: T0 + 10800, odo0: 127600 }),
+    ];
+    for (const [i, fields] of trips.entries()) await upload(env, fields, T0 + 100 + i * 3600);
+    setNow(T0 + 11500);
+    const h = await api(env, `api/history?from=${T0 - 600}&to=${T0 + 11500}`);
+    const gap = h.trips.find((t) => t.id === sid(13, INST)).unlogged_before_mi;
+    assert.ok(gap > 15, `gap before the second trip ${gap}`);
+    assert.deepEqual([h.totals.unlogged_mi, h.totals.unlogged_mi_at_least], [null, gap]);
+    // From the first odometer reading of the first trip to the last of the fourth.
+    const span = Math.round((trips[3].at(-1).odo_km - trips[0][0].odo_km) * 0.621371 * 10) / 10;
+    assert.equal(h.totals.odometer_mi, span);
+    assert.ok(span > h.totals.miles + 30, `${span} mi by odometer, ${h.totals.miles} logged`);
+    // Under 3 logged miles: the MPG is there, flagged as resting on too few miles.
+    assert.equal(typeof h.totals.mpg, "number");
+    assert.equal(h.totals.mpg_few_miles, true);
+    assert.ok(h.totals.miles_down <= h.totals.miles && h.totals.miles_down > h.totals.miles - 0.11, `miles_down ${h.totals.miles_down}`);
+    // The first trip starts inside this window.
+    assert.equal(h.data_starts, T0 + 20);
+
+    // A window that holds only part of a trip has no odometer figure for it.
+    assert.equal((await api(env, `api/history?from=${T0 + 30}&to=${T0 + 3000}`)).totals.odometer_mi, null);
+    // No data at all yet.
+    assert.equal((await api(makeEnv(), `api/history?${WINDOW}`)).data_starts, null);
+
+    // About 29 logged miles: a solid figure.
+    const far = makeEnv();
+    await upload(far, drive({ n: 2400 }), T0 + 2500);
+    setNow(T0 + 4000);
+    const solid = await api(far, `api/history?from=${T0}&to=${T0 + 4000}`);
+    assert.ok(solid.totals.miles_down >= 25, `miles ${solid.totals.miles_down}`);
+    assert.deepEqual([typeof solid.totals.mpg, solid.totals.mpg_few_miles], ["number", false]);
   });
 
   check("trip: unlogged_known says the same inside the trip and beside it", async () => {
@@ -393,6 +454,24 @@ async function behavior() {
     assert.deepEqual([unknown.unlogged_known, unknown.trip.unlogged_known, unknown.trip.unlogged_before_mi], [false, false, null]);
   });
 
+  check("trip: the battery at power-up comes from a quiet first reading under 13 V", async () => {
+    const env = makeEnv();
+    // The logger wakes up 10 s before the engine starts: one quiet record at 12.3 V.
+    const wake = { boot: 12, inst: INST, fw: 2, ms: 10000, epoch: T0 + 10, flags: F.QUIET, adapter_v: 12.3, csq: 20 };
+    await upload(env, [wake, ...drive({ n: 60 })], T0 + 100);
+    setNow(T0 + 200);
+    const t = await api(env, `api/trip/${sid(12, INST)}`);
+    assert.equal(t.battery_start_v, 12.3);
+    // A session whose first record already has the engine running says nothing.
+    const running = makeEnv();
+    await upload(running, drive({ n: 60 }), T0 + 100);
+    assert.equal((await api(running, `api/trip/${sid(12, INST)}`)).battery_start_v, null);
+    // Neither does a first record at a charger's voltage.
+    const charger = makeEnv();
+    await upload(charger, [{ ...wake, adapter_v: 13.6 }, ...drive({ n: 60 })], T0 + 100);
+    assert.equal((await api(charger, `api/trip/${sid(12, INST)}`)).battery_start_v, null);
+  });
+
   check("economy: no 30-day average under the minimum of logged miles, same as status", async () => {
     const env = makeEnv();
     await parkedCar(env);
@@ -402,6 +481,17 @@ async function behavior() {
     assert.deepEqual([few.mpg, st.mpg30], [null, null]);
     // Both round the miles down, so the chip and the card show the same number.
     assert.equal(few.miles, st.mpg30_miles);
+    // Under 5 miles there is not even a rough figure.
+    assert.equal(st.mpg30_rough, null);
+
+    // About 14 miles: no average yet, but a rough figure from the same miles and gallons.
+    const mid = makeEnv();
+    await upload(mid, drive({ n: 1200 }), T0 + 1300);
+    setNow(T0 + 4000);
+    const [some, st1] = [await api(mid, "api/economy?days=30"), await api(mid, "api/status")];
+    assert.ok(some.miles >= 5 && some.miles < 25, `miles ${some.miles}`);
+    assert.equal(st1.mpg30, null);
+    assert.equal(st1.mpg30_rough, Math.round((some.miles / some.gallons) * 10) / 10);
 
     // About 29 miles in one drive.
     const far = makeEnv();
@@ -412,6 +502,7 @@ async function behavior() {
     assert.equal(typeof enough.mpg, "number");
     assert.equal(enough.mpg, st2.mpg30);
     assert.equal(enough.miles, st2.mpg30_miles);
+    assert.equal(st2.mpg30_rough, null);
   });
 
   // ---------------------------------------------------------------- the page (src/dash.html)

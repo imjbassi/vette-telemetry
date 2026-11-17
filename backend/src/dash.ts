@@ -2,8 +2,9 @@
 import page from "./dash.html";
 import { Env, getLatest, Latest } from "./ingest";
 import {
-  CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, recentTripAggs, STATE_RULES, tripAgg, tripAggsBetween,
-  tripAggsSince, tripAggsTouching, tripLabel, tripNumbers, tripNumbersList, tripNumbersWithGaps, unloggedTotal, withGpsMiles,
+  CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, odometerSpanMiles, powerUpBattery,
+  recentTripAggs, roughMpg, STATE_RULES, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching, tripLabel, tripNumbers,
+  tripNumbersList, tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, withGpsMiles,
 } from "./queries";
 
 const json = (data: unknown, status = 200) =>
@@ -75,6 +76,9 @@ async function status(env: Env) {
     mpg30: econ.mpg,
     mpg30_miles: econ.miles,
     mpg30_min_miles: MPG30_MIN_MILES,
+    // While mpg30 is null: a rough figure from the miles there are, from 5 miles on. Wherever
+    // the page shows it, it has to say that it is rough.
+    mpg30_rough: roughMpg(econ),
   };
 }
 
@@ -87,7 +91,7 @@ async function trips(env: Env, limit: number) {
 
 interface Row {
   ms: number; ts: number; lat: number | null; lon: number | null; speed_kph: number | null; rpm: number | null;
-  coolant_c: number | null; fuel_pct: number | null; throttle_pct: number | null; adapter_v: number | null;
+  coolant_c: number | null; fuel_pct: number | null; throttle_pct: number | null; adapter_v: number | null; flags: number;
 }
 
 // `coarse`: per-minute series from the rollup (a few dozen rows) for overview charts that
@@ -118,7 +122,7 @@ async function trip(env: Env, id: number, coarse = false) {
   const [[nums], all] = await Promise.all([
     tripNumbersWithGaps(env, [agg]).then((n) => withGpsMiles(env, n)),
     env.DB.prepare(
-      `SELECT ms, ts, lat, lon, speed_kph, rpm, coolant_c, fuel_pct, throttle_pct, adapter_v
+      `SELECT ms, ts, lat, lon, speed_kph, rpm, coolant_c, fuel_pct, throttle_pct, adapter_v, flags
        FROM samples WHERE boot = ? ORDER BY ms`,
     ).bind(id).all<Row>(),
   ]);
@@ -147,6 +151,9 @@ async function trip(env: Env, id: number, coarse = false) {
     // False when an odometer reading is missing, so the page can tell "none" from "unknown".
     // The same value as trip.unlogged_known. The page reads this one.
     unlogged_known: nums.unlogged_known,
+    // The battery before the engine started, from the first reading of the session. Null when
+    // that reading already had the engine on or a charger's voltage (see powerUpBattery).
+    battery_start_v: rows.length ? round(powerUpBattery(rows[0]), 100) : null,
     // Only every `step`-th reading is in `series`, so its highest point may miss the true peak.
     step,
     series,
@@ -232,12 +239,14 @@ async function history(env: Env, from: number, to: number) {
   const B = bucket | 0;
   const m0 = Math.floor(from / 60) * 60;
 
+  // Fuel leaves out 0 % readings (the stray-zero rule in ingest.ts). A minute row only keeps
+  // its lowest reading, so the rollup path drops every minute that holds one.
   const seriesSql = raw
     ? `SELECT (ts / ${B}) * ${B} AS t,
               AVG(speed_kph) AS spd, MAX(speed_kph) AS spd_max,
               AVG(CASE WHEN rpm > 0 THEN rpm END) AS rpm, MAX(rpm) AS rpm_max,
               AVG(coolant_c) AS cool, MAX(coolant_c) AS cool_max,
-              AVG(fuel_pct) AS fuel, AVG(adapter_v) AS volt,
+              AVG(NULLIF(fuel_pct, 0)) AS fuel, AVG(adapter_v) AS volt,
               AVG(throttle_pct) AS thr, MAX(throttle_pct) AS thr_max,
               AVG(intake_c) AS iat, AVG(maf_gs) AS maf, MAX(maf_gs) AS maf_max
        FROM samples WHERE ts BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`
@@ -245,19 +254,21 @@ async function history(env: Env, from: number, to: number) {
               SUM(spd_sum) / NULLIF(SUM(spd_n), 0) AS spd, MAX(spd_max) AS spd_max,
               SUM(rpm_sum) / NULLIF(SUM(rpm_n), 0) AS rpm, MAX(rpm_max) AS rpm_max,
               SUM(cool_sum) / NULLIF(SUM(cool_n), 0) AS cool, MAX(cool_max) AS cool_max,
-              SUM(fuel_sum) / NULLIF(SUM(fuel_n), 0) AS fuel, SUM(volt_sum) / NULLIF(SUM(volt_n), 0) AS volt,
+              SUM(CASE WHEN fuel_min > 0 THEN fuel_sum END) / NULLIF(SUM(CASE WHEN fuel_min > 0 THEN fuel_n END), 0) AS fuel,
+              SUM(volt_sum) / NULLIF(SUM(volt_n), 0) AS volt,
               SUM(thr_sum) / NULLIF(SUM(thr_n), 0) AS thr, MAX(thr_max) AS thr_max,
               SUM(iat_sum) / NULLIF(SUM(iat_n), 0) AS iat,
               SUM(maf_sum) / NULLIF(SUM(maf_n), 0) AS maf, MAX(maf_max) AS maf_max
        FROM minutes WHERE t BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`;
   const extremesSql = raw
     ? `SELECT COUNT(*) AS n, MAX(speed_kph) AS spd_max, MAX(rpm) AS rpm_max, MAX(coolant_c) AS cool_max,
-              AVG(CASE WHEN flags & 1 THEN coolant_c END) AS cool_avg, MIN(fuel_pct) AS fuel_min, MAX(fuel_pct) AS fuel_max,
+              AVG(CASE WHEN flags & 1 THEN coolant_c END) AS cool_avg, MIN(NULLIF(fuel_pct, 0)) AS fuel_min, MAX(fuel_pct) AS fuel_max,
               MIN(adapter_v) AS volt_min, MAX(adapter_v) AS volt_max, MAX(throttle_pct) AS thr_max,
               MIN(intake_c) AS iat_min, MAX(intake_c) AS iat_max, SUM(lat IS NOT NULL) AS gps
        FROM samples WHERE ts BETWEEN ? AND ?`
     : `SELECT SUM(n) AS n, MAX(spd_max) AS spd_max, MAX(rpm_max) AS rpm_max, MAX(cool_max) AS cool_max,
-              SUM(cool_eng_sum) / NULLIF(SUM(cool_eng_n), 0) AS cool_avg, MIN(fuel_min) AS fuel_min, MAX(fuel_max) AS fuel_max,
+              SUM(cool_eng_sum) / NULLIF(SUM(cool_eng_n), 0) AS cool_avg, MIN(CASE WHEN fuel_min > 0 THEN fuel_min END) AS fuel_min,
+              MAX(fuel_max) AS fuel_max,
               MIN(volt_min) AS volt_min, MAX(volt_max) AS volt_max, MAX(thr_max) AS thr_max,
               MIN(iat_min) AS iat_min, MAX(iat_max) AS iat_max, SUM(gps_n) AS gps
        FROM minutes WHERE t BETWEEN ? AND ?`;
@@ -268,12 +279,14 @@ async function history(env: Env, from: number, to: number) {
     : `SELECT boot, ms, lat, lon, mph FROM track WHERE ts BETWEEN ? AND ? ORDER BY ts DESC LIMIT ${MAX_ROUTE_POINTS + 1}`;
   const lo = raw ? from : m0;
 
-  const [series, extremes, clipped, touching, geo] = await Promise.all([
+  const [series, extremes, clipped, touching, geo, first] = await Promise.all([
     env.DB.prepare(seriesSql).bind(lo, to).all<Record<string, number | null>>(),
     env.DB.prepare(extremesSql).bind(lo, to).first<Record<string, number | null>>(),
     tripAggsBetween(env, from, to),
     tripAggsTouching(env, from, to),
     env.DB.prepare(geoSql).bind(from, to).all<{ boot: number; ms: number; lat: number; lon: number; mph: number | null }>(),
+    // The oldest session of all, one row through the end_ts index, like get_history.
+    env.DB.prepare(`SELECT start_ts FROM trips WHERE end_ts IS NOT NULL ORDER BY end_ts LIMIT 1`).first<{ start_ts: number | null }>(),
   ]);
   // The newest points are kept, so a cut route is missing the oldest part of the window.
   const routeCut = !raw && geo.results.length > MAX_ROUTE_POINTS;
@@ -284,6 +297,7 @@ async function history(env: Env, from: number, to: number) {
   const parts = clipped.map(tripNumbers);
   const sum = (k: "miles" | "gallons" | "engine_s" | "moving_s") => parts.reduce((a, t) => a + t[k], 0);
   const miles = sum("miles"), gallons = sum("gallons");
+  const mpg = gallons > 0.05 ? Math.round((miles / gallons) * 10) / 10 : null;
 
   // Whole trips with their odometer figures. One extra indexed row gives the oldest its predecessor.
   const whole = await withGpsMiles(env, await tripNumbersWithGaps(env, touching));
@@ -303,14 +317,24 @@ async function history(env: Env, from: number, to: number) {
   });
 
   const e = extremes ?? {};
+  const unlogged = touching.some((t) => t.odo_start != null) ? unloggedTotal(startedInside) : null;
   return {
     from, to, bucket, source: raw ? "raw" : "minutes",
     epa: CAR.EPA,
+    // Start of the logger's first session, null before there is any data. A window that
+    // starts earlier is not covered before it, which is not the same as not driven.
+    data_starts: first?.start_ts ?? null,
     totals: {
       samples: e.n ?? 0,
       miles: Math.round(miles * 10) / 10,
+      // Rounded down, so a page that compares it with MPG30_MIN_MILES agrees with mpg_few_miles.
+      miles_down: milesDown(miles),
       gallons: Math.round(gallons * 100) / 100,
-      mpg: gallons > 0.05 ? Math.round((miles / gallons) * 10) / 10 : null,
+      mpg,
+      // The same rule as the 30-day MPG: under MPG30_MIN_MILES logged miles the figure is rough.
+      mpg_few_miles: mpg != null && !enoughMpgMiles(miles),
+      // How far the odometer moved over the trips wholly inside the window, logged or not.
+      odometer_mi: odometerSpanMiles(touching.filter((t) => t.start_ts >= from && t.end_ts <= to)),
       engine_s: Math.round(sum("engine_s")),
       moving_s: Math.round(sum("moving_s")),
       idle_s: Math.max(0, Math.round(sum("engine_s") - sum("moving_s"))),
@@ -326,7 +350,9 @@ async function history(env: Env, from: number, to: number) {
       // Odometer distance the logger did not record, before trips that started in this window.
       // Null when no trip here has odometer readings, or when the gap before one of them is
       // not known, so "none" and "unknown" stay apart.
-      unlogged_mi: touching.some((t) => t.odo_start != null) ? unloggedTotal(startedInside) : null,
+      unlogged_mi: unlogged,
+      // While unlogged_mi is null: the gaps that are known, added up. Null when there are none.
+      unlogged_mi_at_least: unlogged == null ? unloggedAtLeast(startedInside) : null,
     },
     series: {
       t: rows.map((r) => r.t),

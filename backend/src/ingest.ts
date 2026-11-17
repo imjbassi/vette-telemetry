@@ -159,9 +159,13 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
     stmts.push(ins.bind(s.boot, s.ms, ts, est ? 1 : 0, s.lat, s.lon, s.sats, s.rpm, s.speed_kph, s.coolant_c,
       s.intake_c, s.maf_gs, s.throttle_pct, s.fuel_pct, s.adapter_v, s.ecu_v, s.odo_km, s.csq, s.flags));
     const at = { ts, boot: s.boot, ms: s.ms, ...(est ? { est } : {}) };
+    // The stray-zero rule: one bad PID 2F reply reads as a 0 % tank, and the firmware carries
+    // that value into about ten records. A real 0 % is next to impossible while the car runs,
+    // so it does not replace the last real reading here. `samples` keep it as it came. The trip
+    // summary and History leave 0 % readings out by the same rule.
     for (const f of LATEST_FIELDS) {
       const v = s[f];
-      if (v !== null) put(f, { v, ...at });
+      if (v !== null && !(f === "fuel_pct" && v === 0)) put(f, { v, ...at });
     }
     if (s.lat !== null && s.lon !== null) {
       put("lat", { v: s.lat, ...at });

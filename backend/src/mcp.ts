@@ -5,15 +5,19 @@ import {
 } from "./queries";
 
 const SUPPORTED = ["2025-06-18", "2025-03-26", "2024-11-05"];
+// Some clients never show this text to the model, so the facts a tool needs are repeated in its
+// own description.
 const INSTRUCTIONS =
-  "Live and historical telemetry for the user's 2024 Corvette Stingray (C8, LT2, 8-speed DCT). " +
-  "A logger in the car reads OBD-II over Bluetooth and uploads over LTE about every 15 s while driving. " +
-  "The logger only has power while the car is on, so for a parked car every value is the last one reported before shutdown. " +
-  "A trip is one power-up of the logger with the engine running at some point. " +
+  "Live and historical telemetry for the owner's 2024 Corvette Stingray (C8, LT2, 8-speed DCT). " +
+  "A logger in the car reads OBD-II over Bluetooth and uploads over LTE about every 15 s while the engine runs. " +
+  "A parked car reports nothing, so its values are the last ones reported before shutdown. Say how old a value is. " +
+  "A trip is one power-up of the logger in which the engine ran, so an engine start without driving is a trip too. " +
   "Every trip has a trip_id number and a label such as 173-12, which is the name the dashboard shows. " +
   "Either one works as trip_id. " +
-  "Fuel used and MPG are estimates computed from engine airflow, not measured at the pump. " +
-  "Dates and times are in the owner's local time zone. Only get_location returns the car's position.";
+  "Fuel used and MPG are estimates from engine airflow, not measured at the pump. " +
+  "Range is an estimate built on them, or on the EPA rating when there is too little history. " +
+  "Dates and times are in the owner's local time zone. " +
+  "Give the car's position only when the user asks where the car is or where a trip went.";
 
 // Every tool only reads the owner's own database.
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
@@ -33,13 +37,19 @@ const TOOLS: Tool[] = [
     name: "get_latest_status",
     title: "Car status",
     description:
-      "Current or last known state of the car. Returns car_state (running, no_signal, parked or unknown, with one sentence " +
-      "that explains it and how old the last report is), fuel level in percent with estimated gallons left and estimated range " +
-      "in miles, battery voltage with a context word (charging, engine off, low), coolant and intake air temperature in °F, " +
-      "last speed in mph and RPM, odometer in miles (null if never read), cell signal, and the logger's firmware build, " +
-      "adapter link and last upload time. Each group has its own age because a parked car reports nothing. " +
-      "Range is an estimate from the 30-day airflow-based MPG, or the EPA rating when there is too little history. " +
-      "Does not return the position, use get_location for that.",
+      "Current or last known state of the owner's 2024 Corvette Stingray. Returns car_state (running, no_signal, parked or " +
+      "unknown, with one sentence that explains it and how old the last report is), fuel level in percent with estimated " +
+      "gallons left and estimated range in miles, battery voltage with a context word for the moment it was measured " +
+      "(charging, \"engine on, not charging\", engine off, low), coolant and intake air temperature in °F, last speed in mph " +
+      "and RPM, odometer in miles (null if never read), cell signal as cell_signal_csq and cell_signal_dbm (dBm), and the " +
+      "logger's firmware build, adapter link and last upload time. Each group has its own age because a parked car reports " +
+      "nothing. battery_note appears when the voltage is old: the voltage now is not known. engine_values_as_of dates the " +
+      "newest engine value. A value that stopped arriving is null, and engine_values_stale lists it with its own age. " +
+      "odometer_as_of appears when the odometer reading is older than the last report. firmware_build 0 is firmware from " +
+      "before build 2. " +
+      `Range is an estimate from the 30-day airflow-based MPG. With fewer than ${MPG30_MIN_MILES} logged miles in 30 days ` +
+      "it uses a rough MPG of those miles when that is lower than the EPA rating, and the EPA rating otherwise. range_basis " +
+      "says which. Returns no position.",
     inputSchema: { type: "object", properties: {} },
     run: (env) => latestStatus(env),
   },
@@ -47,11 +57,13 @@ const TOOLS: Tool[] = [
     name: "get_location",
     title: "Car location",
     description:
-      "Last GPS position of the car: latitude and longitude in decimal degrees, satellite count, a map link, the time and age " +
-      "of the fix, whether the car is parked (null when the engine state is not known), and the same car_state as " +
-      "get_latest_status. " +
-      "This is the only tool that returns coordinates unless asked. The fix can be older than the last report if the car " +
-      "had no sky view, so check its age.",
+      "Last GPS position of the car. Call it only when the user asks where the car is, not for a general status question. " +
+      "Returns latitude and longitude in decimal degrees, satellite count, a map link, the time and age of the fix, " +
+      "fix_before_last_report_min (how many minutes the fix is older than the last report, null for a minute or less), " +
+      "whether the car is parked there (null when that is not known: adapter link down, stored records still uploading, or " +
+      "the last report still had the engine on), and the same car_state as get_latest_status. " +
+      "No other tool returns coordinates, except get_trip_summary when include_locations is true. The fix can be older " +
+      "than the last report if the car had no view of the sky, so check its age.",
     inputSchema: { type: "object", properties: {} },
     run: (env) => location(env),
   },
@@ -59,20 +71,25 @@ const TOOLS: Tool[] = [
     name: "get_trip_summary",
     title: "Trip summary",
     description:
-      "Details of one trip, by default the most recent. Returns trip_id and label, start and end time, " +
-      "logger_on_min (how long the logger had power), engine_on_min and moving_min, distance_mi (integrated from speed), odometer_distance_mi (from the car's " +
-      "odometer), unlogged_before_mi (odometer miles driven between the previous trip and this one that the logger missed, " +
-      "null if none or unknown), fuel_used_gal_est and mpg_est (estimates from engine airflow, not from fill-ups), average " +
-      "moving speed and top speed in mph, max and average RPM, max coolant in °F, fuel gauge percent at start and end, " +
-      "odometer in miles at start and end, and in_progress (true while the trip is still going). " +
-      "Start and end coordinates are left out unless include_locations is true.",
+      "Details of one trip, by default the most recent trip in which the car moved, or the one in progress. Newer sessions " +
+      "in which the engine ran without driving are then listed in newer_sessions_without_driving. Returns trip_id and " +
+      "label, start and end time, logger_on_min (how long the logger had power), engine_on_min and moving_min, distance_mi " +
+      "(integrated from speed), gps_distance_mi (only when the speed readings failed, measured along the GPS route), " +
+      "odometer_distance_mi (from the car's odometer), unlogged_before_mi (odometer miles driven between the previous trip " +
+      "and this one that the logger missed, null if none or unknown), fuel_used_gal_est and mpg_est (estimates from engine " +
+      "airflow, not from fill-ups), average moving speed and top speed in mph, max and average RPM, max coolant in °F, fuel " +
+      "gauge percent near the start and end (whole percent, the gauge swings by several points while driving, so do not " +
+      "derive fuel used from it), odometer in miles at start and end, and in_progress (true while the trip is still going). " +
+      "end_not_received appears on the newest trip when the logger stopped sending while the engine was on, so its end, " +
+      "distance and fuel may be incomplete. times_estimated is true when the logger had no clock, so start and end are " +
+      "estimates. Start and end coordinates are left out unless include_locations is true.",
     inputSchema: {
       type: "object",
       properties: {
         trip_id: {
           type: ["integer", "string"],
           description: "Trip id from list_trips or get_history: the trip_id number, or the label the dashboard shows, " +
-            "for example \"173-12\". Omit for the latest trip.",
+            "for example \"173-12\". Omit for the latest drive.",
         },
         include_locations: {
           type: "boolean", default: false,
@@ -86,10 +103,15 @@ const TOOLS: Tool[] = [
     name: "list_trips",
     title: "List trips",
     description:
-      "Trips, newest first, optionally limited to a range of local dates. Each trip has its trip_id and label, " +
-      "start and end time, logger_on_min, engine_on_min, moving_min, distance_mi, odometer_distance_mi, unlogged_before_mi, fuel_used_gal_est " +
-      "and mpg_est (estimates from engine airflow), speeds in mph, RPM, max coolant in °F and in_progress. " +
-      "more_trips_exist is true when older trips were cut off by limit. No coordinates. " +
+      "Trips, newest first, optionally limited to a range of local dates. A trip is one power-up of the logger in which the " +
+      "engine ran, so an engine start without driving is listed too. Each trip has its trip_id and label, start and end " +
+      "time, logger_on_min, engine_on_min, moving_min, distance_mi, gps_distance_mi (only when the speed readings failed), " +
+      "odometer_distance_mi, unlogged_before_mi, fuel_used_gal_est and mpg_est (estimates from engine airflow), speeds in " +
+      "mph, RPM, max coolant in °F and in_progress. end_not_received appears on the newest trip when the logger stopped " +
+      "sending while the engine was on, so its end, distance and fuel may be incomplete. times_estimated is true when the " +
+      "logger had no clock, so start and end are estimates. " +
+      "more_trips_exist is true when older trips were cut off by limit. For older trips raise limit (up to 50), or call " +
+      "again with to set to the local date of the oldest trip listed. Trips of that day come back again. No coordinates. " +
       "For totals over a period use get_history instead of adding trips up.",
     inputSchema: {
       type: "object",
@@ -109,7 +131,8 @@ const TOOLS: Tool[] = [
       `combined_mpg_few_miles (true when that figure rests on fewer than ${MPG30_MIN_MILES} logged miles, so it is rough and not a solid average), ` +
       "the best and worst trip MPG among trips of 2 miles or more, the EPA ratings for comparison (16 city, 24 highway, " +
       "19 combined), and the 20 newest trips with distance and MPG. " +
-      "Gallons and MPG are estimates from engine airflow, not from fill-ups. Their accuracy has not been checked against a fill-up.",
+      "Gallons and MPG are estimates from engine airflow, not from fill-ups. Their accuracy has not been checked against a fill-up. " +
+      "For a calendar period such as this month use get_history.",
     inputSchema: {
       type: "object",
       properties: { days: { type: "integer", minimum: 1, maximum: 365, default: 30, description: "Length of the window in days, counted back from now." } },
@@ -123,14 +146,21 @@ const TOOLS: Tool[] = [
       "Driving totals for a period of whole local days. Use it for questions like how far the car went last week, " +
       "which days it was driven, or how this month compares with last month. " +
       "Give either period, or from and to dates (both included, to defaults to today). The window can be 366 days at most. " +
-      "Returns the resolved window, totals (distance_mi, fuel_used_gal_est, mpg_est, engine_on_min, moving_min, idle_min, " +
-      "max_speed_mph, max_rpm, days_with_driving, trip_count, unlogged_mi), the trips in the window (newest first, 50 at " +
-      "most), and with group_by \"day\" one row per day that had driving. " +
+      "Returns the resolved window, totals (distance_mi, odometer_distance_mi, fuel_used_gal_est, mpg_est, " +
+      "mpg_est_few_miles, engine_on_min, moving_min, idle_min, max_speed_mph, max_rpm, days_with_driving, trip_count, " +
+      "unlogged_mi, unlogged_mi_at_least), the trips in the window (newest first, 50 at most), and with group_by \"day\" " +
+      "one row per day that had driving. " +
       "Totals and day rows count only what happened inside the window, and days follow local midnight. " +
-      "Fuel and MPG are estimates from engine airflow. unlogged_mi is odometer distance the logger did not record, " +
-      "null when that is not known. " +
+      "distance_mi is the distance logged from speed readings. odometer_distance_mi is how far the odometer moved over " +
+      "the trips wholly inside the window, null without readings. For how far the car went give odometer_distance_mi when " +
+      "present and say how much of it was logged. unlogged_mi is odometer distance the logger did not record, null when " +
+      "that is not known. unlogged_mi_at_least then adds up the gaps that are known, when they come to more than 0. " +
+      "A trip row with gps_distance_mi had failed speed readings, so its distance_mi is near 0. " +
+      "Fuel and MPG are estimates from engine airflow. mpg_est_few_miles is true when mpg_est rests on fewer than " +
+      `${MPG30_MIN_MILES} logged miles, so it is rough and not a solid average. ` +
       "window.data_starts is only present when the logger's first data is later than the start of the window (null when " +
       "there is no data at all): the days before it are not covered, which is not the same as not driven. " +
+      "For the last N days with best and worst trips use get_fuel_economy. " +
       "No coordinates.",
     inputSchema: {
       type: "object",

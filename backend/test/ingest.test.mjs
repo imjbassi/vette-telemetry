@@ -700,6 +700,29 @@ test("in one body the later session wins latest, also over a session without a c
   assert.deepEqual(L.engine_on, { v: 1, ...at });
 });
 
+test("a 0 % fuel reading does not replace the last real one in latest", async () => {
+  const env = makeEnv();
+  const boot = sid(12, 173);
+  // 57.6 %, then one bad PID 2F reply carried into the last three records.
+  const fields = drive({ n: 10 }).map((r, i) => ({ ...r, fuel_raw: i < 7 ? 147 : 0 })); // ms 20000 to 29000
+  setNow(T0 + 30);
+  await post(env, fields);
+  let L = await getLatest(env);
+  assert.deepEqual(L.fuel_pct, { v: 57.6, ts: T0 + 26, boot, ms: 26000 });
+  assert.equal(L.rpm.ms, 29000, "the other fields still come from the newest record");
+  // The readings themselves are stored as they came.
+  assert.deepEqual(rows(env, "SELECT fuel_pct FROM samples WHERE ms >= 26000 ORDER BY ms").map((r) => r.fuel_pct), [57.6, 0, 0, 0]);
+
+  // An upload of nothing but 0 % readings leaves it too, and a real reading replaces it as usual.
+  setNow(T0 + 45);
+  await post(env, drive({ n: 5, ms0: 30000 }).map((r) => ({ ...r, fuel_raw: 0 })));
+  L = await getLatest(env);
+  assert.deepEqual([L.fuel_pct.v, L.fuel_pct.ms, L.rpm.ms], [57.6, 26000, 34000]);
+  setNow(T0 + 60);
+  await post(env, drive({ n: 1, ms0: 40000 }).map((r) => ({ ...r, fuel_raw: 145 })));
+  assert.deepEqual((await getLatest(env)).fuel_pct, { v: 56.9, ts: T0 + 40, boot, ms: 40000 });
+});
+
 test("engine_on bridges a missed RPM reply for 5 s, and nothing else", async () => {
   const boot = sid(12, 173);
   const on = drive({ n: 30 }); // ms 20000 to 49000, every record with an RPM above zero

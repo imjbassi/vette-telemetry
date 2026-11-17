@@ -6,10 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { handleMcp } from "../src/mcp.ts";
 import {
-  batteryContext, CAR, carState, clampInt, dateOfDay, dayExpr, dayStart, fmtTime, fuelEconomy, history, latestBattery,
-  latestStatus, listTrips, liveBoot, localDay, location, mpg30, MPG30_MIN_MILES, offsetSpans, parseDay, parseTripId,
-  resolveWindow, sameRecord, STATE_RULES, tripAgg, tripBefore, tripLabel, tripNumbers, tripNumbersList,
-  tripNumbersWithGaps, tripSummary, tzOffset, unloggedMiles, unloggedTotal, routeKm, withGpsMiles,
+  batteryContext, CAR, carState, clampInt, cutOffBoot, dateOfDay, dayExpr, dayStart, fmtTime, fuelEconomy, history,
+  latestBattery, latestStatus, listTrips, liveBoot, localDay, location, mpg30, MPG30_MIN_MILES, odometerSpanMiles, offsetSpans,
+  parseDay, parseTripId, powerUpBattery, resolveWindow, roughMpg, sameRecord, STATE_RULES, tripAgg, tripBefore, tripLabel,
+  tripMoved, tripNumbers, tripNumbersList, tripNumbersWithGaps, tripSummary, tzOffset, unloggedAtLeast, unloggedMiles,
+  unloggedTotal, routeKm, withGpsMiles,
 } from "../src/queries.ts";
 import { makeEnv } from "./helpers/d1.mjs";
 
@@ -78,6 +79,19 @@ test("liveBoot: only a running or no_signal session is in progress", () => {
   assert.equal(liveBoot({ engine_on: entry(0, 10, 12) }, NOW), null);
 });
 
+test("cutOffBoot: the engine was on in the newest record, and nothing came after it", () => {
+  const at = (on, age, uploadAge) => ({
+    engine_on: entry(on, age, 12),
+    ...(uploadAge == null ? {} : { last_upload: { v: NOW - uploadAge, ts: NOW - uploadAge, boot: 0, ms: 0 } }),
+  });
+  assert.equal(cutOffBoot(at(1, 601), NOW), 12);
+  assert.equal(cutOffBoot(at(1, 600), NOW), null); // no signal yet, not cut off
+  assert.equal(cutOffBoot(at(1, 601, 89), NOW), null); // stored records are still uploading
+  assert.equal(cutOffBoot(at(1, 601, 90), NOW), 12);
+  assert.equal(cutOffBoot(at(0, 601), NOW), null);
+  assert.equal(cutOffBoot({}, NOW), null);
+});
+
 test("batteryContext: the word depends on the engine, not on voltage alone", () => {
   assert.equal(batteryContext(14.2, true), "charging");
   assert.equal(batteryContext(13.0, true), "charging");
@@ -106,6 +120,19 @@ test("sameRecord and latestBattery: the engine state comes from the record the v
   assert.equal(latestBattery({ adapter_v: at(12.1, 12, 1000), engine_on: at(1, 12, 2000) }), "engine off");
   assert.equal(latestBattery({ adapter_v: at(14.2, 12, 1000) }), "charging");
   assert.equal(latestBattery({ adapter_v: at(11.7, 12, 1000), engine_on: at(1, 12, 1000) }), "low");
+});
+
+test("powerUpBattery: the voltage of a quiet first reading under 13.0 V, else null", () => {
+  // Flags: 1 engine on, 2 quiet, 4 no adapter link.
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: null, flags: 2 }), 12.3);
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: 0, flags: 0 }), 12.3);
+  assert.equal(powerUpBattery({ adapter_v: 14.1, rpm: null, flags: 2 }), null); // a charger, or the alternator
+  assert.equal(powerUpBattery({ adapter_v: 13.0, rpm: null, flags: 2 }), null);
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: 750, flags: 1 }), null); // the engine already runs
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: 750, flags: 0 }), null);
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: null, flags: 1 }), null);
+  assert.equal(powerUpBattery({ adapter_v: 12.3, rpm: null, flags: 4 }), null); // without the link nothing is known
+  assert.equal(powerUpBattery({ adapter_v: null, rpm: null, flags: 2 }), null);
 });
 
 // ------------------------------------------------------------ local days
@@ -405,6 +432,27 @@ test("tripNumbersList and unloggedTotal: a missing reading is unknown, not zero"
   assert.equal(unloggedTotal([]), 0);
   assert.equal(unloggedTotal([list[0], list[2]]), null);
   assert.equal(unloggedTotal([list[1], list[2], list[3]]), null);
+  // When the total is unknown, the known gaps still give a floor.
+  assert.equal(unloggedAtLeast([list[1], list[2], list[3]]), 20);
+  assert.equal(unloggedAtLeast([list[0], list[1], list[3]]), null); // nothing known is missing
+  assert.equal(unloggedAtLeast([list[2], list[3]]), null); // the total is known: 20
+  assert.equal(unloggedAtLeast([]), null);
+});
+
+test("odometerSpanMiles: first reading to last in time order, null when an end is missing or it went back", () => {
+  const t = (start_ts, odo_start, odo_end) => ({ start_ts, odo_start, odo_end });
+  // Newest first or oldest first, the span runs from the oldest reading to the newest.
+  const three = [t(3000, 1100, 1116.1), t(2000, null, null), t(1000, 1000, 1016.1)];
+  assert.equal(odometerSpanMiles(three), 72.1); // 116.1 km
+  assert.equal(odometerSpanMiles([...three].reverse()), 72.1);
+  // A trip at either end without a reading: the nearest reading inside counts.
+  assert.equal(odometerSpanMiles([t(1000, null, null), t(2000, 1000, 1016.1), t(3000, 1050, null)]), 10);
+  assert.equal(odometerSpanMiles([t(1000, 1000, 1000)]), 0);
+  assert.equal(odometerSpanMiles([t(1000, null, null)]), null);
+  assert.equal(odometerSpanMiles([t(1000, 1000, null)]), null);
+  assert.equal(odometerSpanMiles([]), null);
+  // Backwards is another odometer or a reset, not a distance.
+  assert.equal(odometerSpanMiles([t(1000, 1000, 1016.1), t(2000, 500, 510)]), null);
 });
 
 test("tripLabel and parseTripId: the full number and the dashboard label name the same trip", () => {
@@ -487,6 +535,29 @@ test("tools/list: descriptions promise no more than the code does", async () => 
   assert.deepEqual(tripId.type, ["integer", "string"]);
   assert.match(tripId.description, /173-12/);
   for (const name of ["get_trip_summary", "list_trips"]) assert.match(tool(name).description, /label/, name);
+  // A status question must not lead to a location call.
+  assert.match(tool("get_location").description, /only when the user asks/);
+  assert.match(tool("get_latest_status").description, /Returns no position\.$/);
+  assert.doesNotMatch(tool("get_latest_status").description, /get_location/);
+  // What a trip is reaches clients that never show the instructions.
+  assert.match(tool("list_trips").description, /an engine start without driving is listed too/);
+});
+
+test("tools/list: every field the answers carry is named in the description", async () => {
+  const { json } = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+  const description = (name) => json.result.tools.find((t) => t.name === name).description;
+  const fields = {
+    get_latest_status: ["battery_note", "engine_values_as_of", "engine_values_stale", "odometer_as_of", "cell_signal_dbm",
+      "firmware_build 0", "range_basis", "\"engine on, not charging\"", "engine off", "low"],
+    get_location: ["fix_before_last_report_min", "parked"],
+    get_trip_summary: ["newer_sessions_without_driving", "end_not_received", "times_estimated", "gps_distance_mi", "in_progress"],
+    list_trips: ["end_not_received", "times_estimated", "gps_distance_mi", "more_trips_exist"],
+    get_fuel_economy: ["combined_mpg_few_miles", "get_history"],
+    get_history: ["odometer_distance_mi", "unlogged_mi_at_least", "mpg_est_few_miles", "gps_distance_mi", "get_fuel_economy"],
+  };
+  for (const [name, words] of Object.entries(fields)) {
+    for (const w of words) assert.ok(description(name).includes(w), `${name} names ${w}`);
+  }
 });
 
 test("initialize: instructions give the real upload period", async () => {
@@ -494,6 +565,9 @@ test("initialize: instructions give the real upload period", async () => {
   assert.equal(json.result.protocolVersion, "2025-06-18");
   assert.match(json.result.instructions, /about every 15 s/);
   assert.doesNotMatch(json.result.instructions, /30 s/);
+  assert.match(json.result.instructions, /an engine start without driving is a trip too/);
+  assert.match(json.result.instructions, /position only when the user asks/);
+  assert.match(json.result.instructions, /Range is an estimate/);
 });
 
 test("messages that are not objects are rejected with -32600", async () => {
@@ -564,20 +638,23 @@ const MILE_KM = 1 / 0.621371;
 const mafOf = (gallons) => gallons * 14.1 * 2798.7;
 
 // One session at a steady mile per minute, written to `trips` and `minutes` the way ingest leaves them.
-function addSession(e, { boot, start, minutes, mpg = 20, engine = true, max_kph = 100, max_rpm = 3000, odo = [null, null], fw = 2, nolink_n = 0 }) {
-  const km = engine ? MILE_KM : 0, maf = engine ? mafOf(1 / mpg) : 0, eng = engine ? 60 : 0, mov = engine ? 50 : 0;
+// `idle`: the engine runs the whole time, but the car does not move.
+function addSession(e, { boot, start, minutes, mpg = 20, engine = true, idle = false, max_kph = 100, max_rpm = 3000, odo = [null, null], fw = 2, nolink_n = 0 }) {
+  const drives = engine && !idle;
+  const km = drives ? MILE_KM : 0, maf = drives ? mafOf(1 / mpg) : engine ? mafOf(0.005) : 0, eng = engine ? 60 : 0, mov = drives ? 50 : 0;
+  const kph = drives ? max_kph : engine ? 0 : null;
   const db = e.DB.sqlite;
   db.prepare(
     `INSERT INTO trips (boot, start_ts, end_ts, last_ms, n, engine_n, km, maf_g, engine_s, moving_s, max_kph, max_rpm,
        max_coolant, rpm_sum, rpm_n, est, odo_start, odo_end, fw, nolink_n) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(boot, start, start + minutes * 60 - 1, minutes * 60000, minutes * 60, eng * minutes, km * minutes, maf * minutes,
-    eng * minutes, mov * minutes, engine ? max_kph : null, engine ? max_rpm : null, engine ? 95 : null,
+    eng * minutes, mov * minutes, kph, engine ? max_rpm : null, engine ? 95 : null,
     engine ? 2000 * 60 * minutes : 0, engine ? 60 * minutes : 0, 0, odo[0], odo[1], fw, nolink_n);
   const ins = db.prepare(
     `INSERT INTO minutes (t, boot, n, engine_n, gps_n, km, maf_g, engine_s, moving_s, spd_max, rpm_max) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
   );
   for (let i = 0; i < minutes; i++) {
-    ins.run(start + i * 60, boot, 60, eng, 60, km, maf, eng, mov, engine ? max_kph : null, engine ? max_rpm : null);
+    ins.run(start + i * 60, boot, 60, eng, 60, km, maf, eng, mov, kph, engine ? max_rpm : null);
   }
 }
 
@@ -633,9 +710,13 @@ test("get_history: local days across the 25-hour day", async () => {
     { date: "2026-11-02", distance_mi: 15, fuel_used_gal_est: 0.75, mpg_est: 20, engine_on_min: 15, moving_min: 12.5, max_speed_mph: 62, trips: 1 },
   ]);
   assert.deepEqual(h.totals, {
-    distance_mi: 175, fuel_used_gal_est: 8.75, mpg_est: 20, engine_on_min: 175, moving_min: 145.8, idle_min: 29.2,
-    max_speed_mph: 100, max_rpm: 6400, days_with_driving: 3, trip_count: 4, unlogged_mi: 20,
+    distance_mi: 175, odometer_distance_mi: 195, fuel_used_gal_est: 8.75, mpg_est: 20, mpg_est_few_miles: false,
+    engine_on_min: 175, moving_min: 145.8, idle_min: 29.2, max_speed_mph: 100, max_rpm: 6400, days_with_driving: 3,
+    trip_count: 4, unlogged_mi: 20,
   });
+  // The odometer moved 20 mi more than was logged, and the note says so.
+  assert.match(h.note, /The odometer moved 195 mi between the first and last readings in this window\. 175 mi of that were logged from speed readings/);
+  assert.doesNotMatch(h.note, /gps_distance_mi/);
   assert.deepEqual(h.trips.map((t) => [t.trip_id, t.distance_mi, t.unlogged_before_mi]), [[12, 45, 20], [11, 60, null], [10, 30, null], [9, 40, null]]);
   assert.deepEqual(Object.keys(h.trips[0]),
     ["trip_id", "label", "start", "logger_on_min", "engine_on_min", "distance_mi", "fuel_used_gal_est", "mpg_est", "unlogged_before_mi"]);
@@ -666,6 +747,8 @@ test("get_history: periods, an edge trip, an empty window and a whole year", asy
   const today = await history(e, { period: "today" }, now);
   assert.equal(today.window.from, "2026-11-03");
   assert.deepEqual([today.totals.distance_mi, today.totals.fuel_used_gal_est, today.totals.mpg_est], [21, 0.82, 25.6]);
+  // 21 logged miles is under the 25 the dashboard asks for, so the figure is rough.
+  assert.equal(today.totals.mpg_est_few_miles, true);
   assert.equal(today.totals.days_with_driving, 1);
   assert.deepEqual(today.trips.map((t) => t.trip_id), [15, 13]); // session 14 never had the engine on
   assert.equal(today.totals.unlogged_mi, 0);
@@ -683,8 +766,9 @@ test("get_history: periods, an edge trip, an empty window and a whole year", asy
 
   const empty = await history(e, { from: "2026-01-01", to: "2026-01-31", group_by: "day" }, now);
   assert.deepEqual(empty.totals, {
-    distance_mi: 0, fuel_used_gal_est: 0, mpg_est: null, engine_on_min: 0, moving_min: 0, idle_min: 0,
-    max_speed_mph: null, max_rpm: null, days_with_driving: 0, trip_count: 0, unlogged_mi: null,
+    distance_mi: 0, odometer_distance_mi: null, fuel_used_gal_est: 0, mpg_est: null, mpg_est_few_miles: false,
+    engine_on_min: 0, moving_min: 0, idle_min: 0, max_speed_mph: null, max_rpm: null, days_with_driving: 0, trip_count: 0,
+    unlogged_mi: null,
   });
   assert.deepEqual(empty.days, []);
   assert.deepEqual(empty.trips, []);
@@ -749,6 +833,10 @@ test("get_history: unlogged_mi is null when a gap in the window is not known", a
   assert.deepEqual(h.trips.map((t) => [t.trip_id, t.unlogged_before_mi]), [[62, null], [61, null], [60, null]]);
   assert.equal(h.totals.unlogged_mi, null);
   assert.match(h.note, /unlogged_mi.*null when that is not known/);
+  // No gap here is known to be above 0, so there is no floor either.
+  assert.equal("unlogged_mi_at_least" in h.totals, false);
+  // The odometer still says how far the car went: 116 km from the first reading to the last.
+  assert.equal(h.totals.odometer_distance_mi, 72.1);
   // The day of trip 60 alone has nothing unknown in it: no trip at all came before it.
   assert.equal((await history(e, { from: "2026-11-10", to: "2026-11-10" }, now)).totals.unlogged_mi, 0);
   // The day of trip 62 alone is unknown too, because its predecessor has no reading.
@@ -841,6 +929,83 @@ test("list_trips and get_trip_summary mark the trip in progress", async () => {
   assert.deepEqual((await listTrips(e, {}, now + 7200)).trips.filter((t) => t.in_progress), []);
 });
 
+test("list_trips and get_trip_summary mark a trip whose end has not arrived", async () => {
+  const e = carEnv();
+  const now = utc(2026, 11, 3, 20, 10);
+  // The newest record of trip 13 had the engine on. Two hours later nothing more came.
+  setLatest(e, drivingLatest(now));
+  const later = now + 7200;
+  const list = await listTrips(e, {}, later);
+  assert.deepEqual(list.trips.filter((t) => t.end_not_received).map((t) => t.trip_id), [13]);
+  assert.equal(list.trips.find((t) => t.trip_id === 13).end_not_received, true);
+  assert.equal("end_not_received" in list.trips.find((t) => t.trip_id === 12), false);
+  const cut = await tripSummary(e, { trip_id: 13 }, later);
+  assert.deepEqual([cut.end_not_received, cut.in_progress], [true, false]);
+  assert.match(cut.note, /^The logger stopped sending while the engine was still on\. End time, distance and fuel cover only what arrived\. The rest may come in after the next start\. Fuel used and MPG/);
+  const other = await tripSummary(e, { trip_id: 12 }, later);
+  assert.equal("end_not_received" in other, false);
+  assert.match(other.note, /^Fuel used and MPG/);
+  for (const a of [list, cut]) assert.doesNotMatch(JSON.stringify(a), /location|"lat"|"lon"|maps\.google/);
+
+  // While the trip runs it is in progress, not cut off.
+  assert.equal("end_not_received" in (await tripSummary(e, { trip_id: 13 }, now)), false);
+  // While stored records still upload, the end may be on its way: no flag, and the usual note.
+  for (const age of [2, 89]) {
+    const backlog = drivingLatest(now);
+    backlog.last_upload = { v: later - age, ts: later - age, boot: 0, ms: 0 };
+    setLatest(e, backlog);
+    assert.deepEqual((await listTrips(e, {}, later)).trips.filter((t) => t.end_not_received), [], `upload ${age} s ago`);
+    const t = await tripSummary(e, { trip_id: 13 }, later);
+    assert.equal("end_not_received" in t, false, `upload ${age} s ago`);
+    assert.match(t.note, /^Fuel used and MPG/);
+  }
+  // get_history rows never read latest, so they carry no flag.
+  const h = await history(e, { from: "2026-11-03", to: "2026-11-03" }, later);
+  assert.equal(h.trips.some((t) => "end_not_received" in t), false);
+});
+
+test("tripMoved: logged distance from 0.1 mi, or a GPS distance", () => {
+  assert.equal(tripMoved({ miles: 0.1, gps_miles: null }), true);
+  assert.equal(tripMoved({ miles: 0.09, gps_miles: null }), false);
+  assert.equal(tripMoved({ miles: 0, gps_miles: null }), false);
+  assert.equal(tripMoved({ miles: 0, gps_miles: 7.5 }), true);
+});
+
+test("get_trip_summary: by default the newest trip that moved, or the one in progress", async () => {
+  const e = carEnv();
+  // Nov 3 16:00 PST, after trip 15: two minutes with the engine on and no driving.
+  addSession(e, { boot: 16, start: utc(2026, 11, 4, 0), minutes: 2, idle: true });
+  const now = utc(2026, 11, 4, 20);
+  const t = await tripSummary(e, {}, now);
+  assert.deepEqual([t.trip_id, t.distance_mi], [15, 1]);
+  assert.deepEqual(t.newer_sessions_without_driving.map((s) => ({ ...s, start: null })),
+    [{ trip_id: 16, label: "16", start: null, engine_on_min: 2 }]);
+  assert.match(t.newer_sessions_without_driving[0].start, /Tue, Nov 3, 2026.*4:00.PM PST/);
+  assert.doesNotMatch(JSON.stringify(t), /location|"lat"|"lon"|maps\.google/);
+  // The default answer is the same as asking for trip 15, plus the list.
+  const { newer_sessions_without_driving: _, ...rest } = t;
+  assert.deepEqual(rest, await tripSummary(e, { trip_id: 15 }, now));
+  // Asked for by id, the idle session is a trip like any other.
+  const idle = await tripSummary(e, { trip_id: 16 }, now);
+  assert.deepEqual([idle.trip_id, idle.distance_mi, idle.engine_on_min, "newer_sessions_without_driving" in idle], [16, 0, 2, false]);
+
+  // While it runs it is the default, moved or not.
+  const running = utc(2026, 11, 4, 0, 1, 50);
+  setLatest(e, drivingLatest(running, 16, { speed_kph: 0 }));
+  const live = await tripSummary(e, {}, running);
+  assert.deepEqual([live.trip_id, live.in_progress, "newer_sessions_without_driving" in live], [16, true, false]);
+  // Cut off while idling, it is skipped again and named as such.
+  const cut = await tripSummary(e, {}, running + 7200);
+  assert.equal(cut.trip_id, 15);
+  assert.deepEqual(cut.newer_sessions_without_driving.map((s) => [s.trip_id, s.end_not_received]), [[16, true]]);
+  assert.equal("end_not_received" in cut, false);
+
+  // When none of the five newest sessions moved, the newest one is the answer, with nothing skipped.
+  for (let i = 0; i < 4; i++) addSession(e, { boot: 17 + i, start: utc(2026, 11, 4, 1 + i), minutes: 2, idle: true });
+  const none = await tripSummary(e, {}, utc(2026, 11, 5, 20));
+  assert.deepEqual([none.trip_id, "newer_sessions_without_driving" in none], [20, false]);
+});
+
 test("tripNumbersWithGaps looks up the trip before the oldest one", async () => {
   const e = carEnv();
   const row = (boot) => e.DB.prepare(
@@ -885,10 +1050,13 @@ test("tripBefore: the previous trip counts even when its stored end is after thi
 test("get_trip_summary: field names, odometer, and locations only on request", async () => {
   const e = carEnv();
   const now = utc(2026, 11, 4, 20);
-  const ins = e.DB.sqlite.prepare("INSERT INTO samples (boot, ms, ts, ts_est, lat, lon, fuel_pct, flags) VALUES (?,?,?,0,?,?,?,1)");
-  ins.run(12, 1000, utc(2026, 11, 2, 7, 30), null, null, null);
-  ins.run(12, 2000, utc(2026, 11, 2, 7, 30) + 1, null, null, 60);
-  ins.run(12, 2699000, utc(2026, 11, 2, 8, 14, 59), null, null, 50);
+  // The tank gauge comes from the first and last minute rows with a reading. The very last
+  // minute holds ten 0 % readings from one bad reply, so it is skipped.
+  const gauge = e.DB.sqlite.prepare("UPDATE minutes SET fuel_sum = ?, fuel_n = 60, fuel_min = ?, fuel_max = ? WHERE boot = 12 AND t = ?");
+  const t12 = utc(2026, 11, 2, 7, 30);
+  gauge.run(60 * 60, 60, 60, t12);
+  gauge.run(50 * 60, 50, 50, t12 + 43 * 60);
+  gauge.run(50 * 50, 0, 50, t12 + 44 * 60);
   // The start and end positions come from the route points, never from a walk through `samples`.
   const pt = e.DB.sqlite.prepare("INSERT INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)");
   pt.run(12, 15000, utc(2026, 11, 2, 7, 30) + 15, 37.8199, -122.4783, 0);
@@ -899,17 +1067,20 @@ test("get_trip_summary: field names, odometer, and locations only on request", a
   assert.deepEqual(Object.keys(t), [
     "trip_id", "label", "start", "end", "logger_on_min", "engine_on_min", "moving_min", "distance_mi", "odometer_distance_mi",
     "unlogged_before_mi", "fuel_used_gal_est", "mpg_est", "avg_moving_speed_mph", "max_speed_mph", "max_rpm", "avg_rpm",
-    "max_coolant_f", "times_estimated", "in_progress", "fuel_level_pct", "fuel_used_by_tank_gauge_gal", "odometer_mi",
+    "max_coolant_f", "times_estimated", "in_progress", "fuel_level_pct", "odometer_mi",
     "records_without_adapter_link", "note",
   ]);
   assert.deepEqual({ ...t, start: null, end: null, note: null }, {
     trip_id: 12, label: "12", start: null, end: null, logger_on_min: 45, engine_on_min: 45, moving_min: 37.5, distance_mi: 45,
     odometer_distance_mi: 45, unlogged_before_mi: 20, fuel_used_gal_est: 2.25, mpg_est: 20, avg_moving_speed_mph: 72,
     max_speed_mph: 62, max_rpm: 3000, avg_rpm: 2000, max_coolant_f: 203, times_estimated: false, in_progress: false,
-    fuel_level_pct: { start: 60, end: 50 }, fuel_used_by_tank_gauge_gal: 1.85, odometer_mi: { start: 771, end: 816 },
+    fuel_level_pct: { start: 60, end: 50 }, odometer_mi: { start: 771, end: 816 },
     records_without_adapter_link: 4, note: null,
   });
   assert.match(t.note, /estimates from engine airflow/);
+  // The gauge is not a fuel figure, and the note says why.
+  assert.match(t.note, /fuel_level_pct is the tank gauge in whole percent.*not fuel used/);
+  assert.doesNotMatch(t.note, /cross-check/);
   assert.doesNotMatch(JSON.stringify(t), /location|"lat"|maps\.google/);
 
   const withPlaces = await tripSummary(e, { trip_id: 12, include_locations: true }, now);
@@ -920,6 +1091,7 @@ test("get_trip_summary: field names, odometer, and locations only on request", a
   const noFix = await tripSummary(e, { trip_id: 13, include_locations: true }, now);
   assert.deepEqual([noFix.start_location, noFix.end_location], [null, null]);
   assert.equal("records_without_adapter_link" in noFix, false);
+  assert.deepEqual(noFix.fuel_level_pct, { start: null, end: null }); // no minute of trip 13 has a reading
 
   // No id means the newest trip. An id sent as a string works too.
   assert.equal((await tripSummary(e, {}, now)).trip_id, 15);
@@ -928,6 +1100,10 @@ test("get_trip_summary: field names, odometer, and locations only on request", a
   assert.match((await tripSummary(e, { trip_id: 999 }, now)).error, /Trip 999 not found/);
   assert.match((await tripSummary(e, { trip_id: 14 }, now)).error, /not found/); // engine never ran
   assert.equal((await tripSummary(makeEnv(), {}, now)).error, "No trips recorded yet.");
+
+  // Nothing of it walks through the readings of the trip.
+  e.DB.sqlite.exec("DROP TABLE samples");
+  assert.deepEqual(await tripSummary(e, { trip_id: 12 }, now), t);
 });
 
 test("trip labels: every tool shows the label next to trip_id and takes either form", async () => {
@@ -1023,6 +1199,15 @@ test("mpg30: null until 25 logged miles", async () => {
   assert.deepEqual(await mpg30(carEnv(), now), { mpg: 20.5, miles: 196, gallons: 9.57 });
 });
 
+test("roughMpg: a figure from 5 to 25 logged miles, only while mpg30 has none", () => {
+  assert.equal(roughMpg({ mpg: null, miles: 20.1, gallons: 2.05 }), 9.8);
+  assert.equal(roughMpg({ mpg: null, miles: 5, gallons: 0.5 }), 10);
+  assert.equal(roughMpg({ mpg: null, miles: 4.9, gallons: 0.5 }), null);
+  assert.equal(roughMpg({ mpg: null, miles: 20, gallons: 0.05 }), null); // no fuel use readings
+  assert.equal(roughMpg({ mpg: 20.5, miles: 196, gallons: 9.57 }), null);
+  assert.equal(roughMpg({ mpg: null, miles: 0, gallons: 0 }), null);
+});
+
 test("mpg30: miles are rounded down, so a page comparing them with 25 agrees with the server", async () => {
   const now = utc(2026, 11, 4, 20);
   const e = makeEnv();
@@ -1056,7 +1241,7 @@ test("get_latest_status: running car, no coordinates", async () => {
   assert.deepEqual(Object.keys(s), [
     "car_state", "engine_running_at_last_report", "fuel", "battery_v", "battery_context", "battery_as_of", "ecu_v",
     "coolant_f", "intake_air_f", "last_speed_mph", "last_rpm", "engine_values_as_of", "odometer_mi", "cell_signal_csq",
-    "logger", "note",
+    "cell_signal_dbm", "logger", "note",
   ]);
   assert.equal(s.car_state.state, "running");
   assert.equal(s.car_state.summary, "The engine is running, last report 5s ago.");
@@ -1067,8 +1252,12 @@ test("get_latest_status: running car, no coordinates", async () => {
   });
   assert.deepEqual([s.battery_v, s.battery_context, s.ecu_v], [12.1, "engine on, not charging", 12]);
   assert.deepEqual([s.coolant_f, s.intake_air_f, s.last_speed_mph, s.last_rpm, s.odometer_mi, s.cell_signal_csq], [194.9, 87.8, 55, 1500, 7873, 21]);
+  assert.equal(s.cell_signal_dbm, -71);
+  assert.equal(s.engine_values_as_of.age, "5s ago");
   assert.deepEqual({ ...s.logger, last_upload: s.logger.last_upload.age }, { firmware_build: 2, adapter_link: "up", last_upload: "3s ago" });
   assert.doesNotMatch(JSON.stringify(s), /"lat"|"lon"|"location"|"map"|37\.8199|122\.4783|maps\.google/);
+  // Nothing in the answer points toward a location call.
+  assert.doesNotMatch(s.note, /get_location|position/);
 });
 
 test("get_latest_status: no signal, parked, link down, legacy firmware and the EPA fallback", async () => {
@@ -1079,17 +1268,24 @@ test("get_latest_status: no signal, parked, link down, legacy firmware and the E
   assert.equal(quiet.car_state.state, "no_signal");
   assert.match(quiet.car_state.summary, /No report since 5 min ago and the engine was on then/);
   assert.equal("ecu_v" in quiet, false);
+  assert.equal("battery_note" in quiet, false);
 
   const lost = await latestStatus(e, now + 7200);
   assert.equal(lost.car_state.state, "parked");
   assert.equal(lost.car_state.ended_mid_drive, true);
-  assert.match(lost.car_state.summary, /the end of that drive was not recorded/);
+  assert.equal(lost.car_state.summary, "Treated as parked. The last report (2 h ago) still had the engine on, and the end " +
+    "of that drive has not arrived. Records the logger still holds are sent after its next start.");
   assert.equal("ecu_v" in lost, false);
+  // An old reading keeps its word, and a note says that it is old.
+  assert.equal(lost.battery_context, "engine on, not charging");
+  assert.equal(lost.battery_note, "Measured 2 h ago with the engine running. The logger cannot measure a parked car, " +
+    "so the voltage now is not known.");
 
   setLatest(e, drivingLatest(now, 13, { engine_on: 0, rpm: 0, adapter_v: 12.4 }));
   const parked = await latestStatus(e, now + 7195);
   assert.equal(parked.car_state.summary, "Parked, the engine was off at the last report 2 h ago.");
   assert.deepEqual([parked.battery_context, parked.engine_running_at_last_report], ["engine off", false]);
+  assert.match(parked.battery_note, /^Measured 2 h ago with the engine off\. The logger cannot measure a parked car/);
 
   setLatest(e, drivingLatest(now, 13, { engine_on: 0, link: 0, adapter_v: 11.6 }));
   const noLink = await latestStatus(e, now);
@@ -1110,14 +1306,61 @@ test("get_latest_status: no signal, parked, link down, legacy firmware and the E
   setLatest(e, legacy);
   const old = await latestStatus(e, now);
   assert.deepEqual([old.logger.firmware_build, old.logger.adapter_link, old.odometer_mi, old.fuel], [null, null, null, null]);
+  assert.equal("odometer_as_of" in old, false);
 
-  // Under 25 logged miles the range uses the EPA figure.
+  // RPM keeps coming, but speed, coolant and the odometer were last read in another session two days ago.
+  const mixed = drivingLatest(now);
+  const twoDays = { ts: now - 2 * 86400, boot: 12, ms: 1000 };
+  Object.assign(mixed, { speed_kph: { v: 120, ...twoDays }, coolant_c: { v: 70, ...twoDays }, odo_km: { v: 12600, ...twoDays } });
+  setLatest(e, mixed);
+  const st = await latestStatus(e, now);
+  assert.deepEqual([st.last_rpm, st.last_speed_mph, st.coolant_f, st.intake_air_f], [1500, null, null, 87.8]);
+  assert.deepEqual(st.engine_values_stale, { last_speed_mph: "last read 2 days ago", coolant_f: "last read 2 days ago" });
+  assert.equal(st.engine_values_as_of.age, "5s ago");
+  // The odometer keeps its value and says how old it is.
+  assert.deepEqual([st.odometer_mi, st.odometer_as_of.age], [7829, "2 days ago"]);
+  // The other way round: the RPM replies stopped and speed still comes. The age follows the speed.
+  const noRpm = drivingLatest(now);
+  noRpm.rpm = { v: 900, ts: now - 400, boot: 13, ms: 205000 };
+  setLatest(e, noRpm);
+  const r = await latestStatus(e, now);
+  assert.deepEqual([r.last_rpm, r.last_speed_mph, r.engine_values_stale], [null, 55, { last_rpm: "last read 7 min ago" }]);
+  assert.equal(r.engine_values_as_of.age, "5s ago");
+  // Up to 120 s behind the newest value in the same session a value is current, so the
+  // once-a-minute retry of a skipped PID does not make it come and go.
+  const edge = drivingLatest(now);
+  edge.coolant_c = { v: 90.5, ts: now - 125, boot: 13, ms: 480000 };
+  edge.intake_c = { v: 31, ts: now - 126, boot: 13, ms: 479000 };
+  setLatest(e, edge);
+  const b = await latestStatus(e, now);
+  assert.deepEqual([b.coolant_f, b.intake_air_f, b.engine_values_stale], [194.9, null, { intake_air_f: "last read 2 min ago" }]);
+  assert.equal("odometer_as_of" in b, false);
+  // A cell signal the modem does not know.
+  setLatest(e, drivingLatest(now, 13, { csq: 99 }));
+  const noCsq = await latestStatus(e, now);
+  assert.deepEqual([noCsq.cell_signal_csq, noCsq.cell_signal_dbm], [99, null]);
+  // None of these answers carries a position.
+  for (const a of [st, r, b, noCsq]) assert.doesNotMatch(JSON.stringify(a), /"lat"|"lon"|37\.8199|122\.4783|maps\.google/);
+
+  // Under 25 logged miles the range uses the EPA figure when the car's own rough figure is higher.
   const few = makeEnv();
   addSession(few, { boot: 1, start: utc(2026, 11, 3, 19), minutes: 20, mpg: 30 });
   setLatest(few, drivingLatest(now, 1));
   const fresh = await latestStatus(few, now);
   assert.deepEqual([fresh.fuel.est_range_mi, fresh.fuel.range_basis_mpg], [176, 19]);
   assert.match(fresh.fuel.range_basis, /EPA combined rating \(fewer than 25 logged miles/);
+  // A lower one is used, and named as rough.
+  const thirsty = makeEnv();
+  addSession(thirsty, { boot: 1, start: utc(2026, 11, 3, 19), minutes: 20, mpg: 10 });
+  setLatest(thirsty, drivingLatest(now, 1));
+  const rough = await latestStatus(thirsty, now);
+  assert.deepEqual([rough.fuel.est_range_mi, rough.fuel.range_basis_mpg], [93, 10]);
+  assert.equal(rough.fuel.range_basis, "rough MPG of the 20 logged miles of the last 30 days, fewer than 25 and lower than the EPA rating");
+  // Under 5 logged miles there is no rough figure at all.
+  const short = makeEnv();
+  addSession(short, { boot: 1, start: utc(2026, 11, 3, 19), minutes: 4, mpg: 10 });
+  setLatest(short, drivingLatest(now, 1));
+  assert.equal((await latestStatus(short, now)).fuel.range_basis_mpg, 19);
 
   assert.deepEqual(await latestStatus(makeEnv(), now), { error: "No data received yet." });
 });
@@ -1144,8 +1387,9 @@ test("car_state while stored records upload: an old newest record is not a lost 
     const st = await latestStatus(e, now + later);
     assert.equal(st.car_state.ended_mid_drive, !drain, `upload ${later + 2} s ago`);
     assert.equal(/uploading stored records/.test(st.car_state.summary), drain, `upload ${later + 2} s ago`);
-    assert.equal(/the end of that drive was not recorded/.test(st.car_state.summary), !drain, `upload ${later + 2} s ago`);
-    assert.equal((await location(e, now + later)).parked, drain ? null : true);
+    assert.equal(/the end of that drive has not arrived/.test(st.car_state.summary), !drain, `upload ${later + 2} s ago`);
+    // Uploading or cut off, nobody knows whether the car stands where the last fix was.
+    assert.equal((await location(e, now + later)).parked, null, `upload ${later + 2} s ago`);
   }
   // A row from a Worker that never wrote last_upload keeps the old answer.
   delete latest.last_upload;
@@ -1196,17 +1440,43 @@ test("get_location: coordinates with the shared state", async () => {
   assert.deepEqual(await location(e, now), { error: "No GPS fix has been reported yet." });
   setLatest(e, drivingLatest(now));
   const here = await location(e, now);
-  assert.deepEqual(Object.keys(here), ["lat", "lon", "satellites", "map", "as_of", "age", "parked", "car_state"]);
-  assert.deepEqual([here.lat, here.lon, here.satellites, here.map, here.age, here.parked],
-    [37.8199, -122.4783, 11, "https://maps.google.com/?q=37.819900,-122.478300", "5s ago", false]);
+  assert.deepEqual(Object.keys(here), ["lat", "lon", "satellites", "map", "as_of", "age", "fix_before_last_report_min", "parked", "car_state"]);
+  assert.deepEqual([here.lat, here.lon, here.satellites, here.map, here.age, here.fix_before_last_report_min, here.parked],
+    [37.8199, -122.4783, 11, "https://maps.google.com/?q=37.819900,-122.478300", "5s ago", null, false]);
   assert.equal(here.car_state.state, "running");
-  // The same rule as get_latest_status at every age.
-  for (const [later, state, parked] of [[80, "running", false], [200, "no_signal", false], [1000, "parked", true]]) {
+  // The same rule as get_latest_status at every age. The newest record had the engine on, so
+  // once it is old the car is not called parked there.
+  for (const [later, state, parked] of [[80, "running", false], [200, "no_signal", false], [1000, "parked", null]]) {
     const l = await location(e, now + later);
     const s = await latestStatus(e, now + later);
     assert.deepEqual([l.car_state.state, l.parked], [state, parked]);
     assert.deepEqual(l.car_state, s.car_state);
   }
+  // Parked with the engine off, it is.
+  setLatest(e, drivingLatest(now, 13, { engine_on: 0, rpm: 0 }));
+  assert.equal((await location(e, now + 1000)).parked, true);
+});
+
+test("get_location: a fix older than the last report says by how much", async () => {
+  const e = carEnv();
+  const now = utc(2026, 11, 3, 20, 10);
+  // Same session: the fix was lost 10 minutes before the newest record.
+  const lost = drivingLatest(now);
+  for (const k of ["lat", "lon", "sats"]) lost[k] = { ...lost[k], ts: now - 605, ms: 0 };
+  setLatest(e, lost);
+  const l = await location(e, now);
+  assert.deepEqual([l.age, l.fix_before_last_report_min, l.parked], ["10 min ago", 10, false]);
+  // A minute or less is a normal gap between fixes.
+  const recent = drivingLatest(now);
+  for (const k of ["lat", "lon", "sats"]) recent[k] = { ...recent[k], ts: now - 65 };
+  setLatest(e, recent);
+  assert.equal((await location(e, now)).fix_before_last_report_min, null);
+  // An earlier session: this power-up never got a fix, the last one is two days old.
+  const earlier = drivingLatest(now);
+  for (const k of ["lat", "lon", "sats"]) earlier[k] = { ...earlier[k], ts: now - 5 - 2 * 86400, boot: 12, ms: 2000 };
+  setLatest(e, earlier);
+  const old = await location(e, now);
+  assert.deepEqual([old.age, old.fix_before_last_report_min], ["2 days ago", 2880]);
 });
 
 // ------------------------------------------------------------ distance from GPS
@@ -1243,10 +1513,10 @@ test("withGpsMiles: a drive without speed readings gets its GPS distance, a norm
   assert.equal(a.gps_miles, 7.5); // 12 km
   assert.equal(b.gps_miles, null, "a trip with speed readings keeps its logged distance");
 
-  // Only the trip that needs it reads route points.
-  const before = e.DB.statements.length;
+  // Only the trip that needs it reads route points. statements is a count of statements run.
+  const before = e.DB.statements;
   await withGpsMiles(e, tripNumbersList([aggs[1]]));
-  assert.equal(e.DB.statements.length, before, "no query when every trip has its distance");
+  assert.equal(e.DB.statements, before, "no query when every trip has its distance");
 
   // The tools carry the figure with a note.
   const list = await listTrips(e, { limit: 5 }, start + 7200);
@@ -1254,4 +1524,52 @@ test("withGpsMiles: a drive without speed readings gets its GPS distance, a norm
   assert.equal(t13.gps_distance_mi, 7.5);
   assert.match(t13.distance_note, /GPS route/);
   assert.equal(list.trips.find((t) => t.trip_id === 14).gps_distance_mi, undefined);
+});
+
+test("get_trip_summary: a drive whose speed readings failed moved by GPS, so the default does not skip it", async () => {
+  const e = makeEnv();
+  const start = utc(2026, 11, 12, 16);
+  addSession(e, { boot: 13, start, minutes: 16 });
+  e.DB.sqlite.prepare("UPDATE trips SET km = 0 WHERE boot = 13").run();
+  const ins = e.DB.sqlite.prepare("INSERT INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)");
+  for (const p of northRoute(41)) ins.run(13, p.ms, start + p.ms / 1000, p.lat, p.lon, null);
+  addSession(e, { boot: 14, start: start + 3600, minutes: 2, idle: true });
+  const t = await tripSummary(e, {}, start + 7200);
+  assert.deepEqual([t.trip_id, t.distance_mi, t.gps_distance_mi], [13, 0, 7.5]);
+  assert.deepEqual(t.newer_sessions_without_driving.map((s) => s.trip_id), [14]);
+});
+
+test("get_history: odometer distance, GPS distance on trip rows, and a floor for unlogged miles", async () => {
+  const e = makeEnv();
+  const start = utc(2026, 11, 12, 16); // 08:00 PST
+  // 10 logged miles each for trips 12, 14 and 15. Trip 13 lost its speed readings and never
+  // answered the odometer, so the gaps on both sides of it are not known. Before trip 15 the
+  // odometer is 33.9 km ahead of where trip 14 ended.
+  addSession(e, { boot: 12, start, minutes: 10, odo: [1000, 1016.1] });
+  addSession(e, { boot: 13, start: start + 3600, minutes: 16 });
+  addSession(e, { boot: 14, start: start + 7200, minutes: 10, odo: [1050, 1066.1] });
+  addSession(e, { boot: 15, start: start + 10800, minutes: 10, odo: [1100, 1116.1] });
+  e.DB.sqlite.prepare("UPDATE trips SET km = 0 WHERE boot = 13").run();
+  e.DB.sqlite.prepare("UPDATE minutes SET km = 0 WHERE boot = 13").run();
+  const ins = e.DB.sqlite.prepare("INSERT INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)");
+  for (const p of northRoute(41)) ins.run(13, p.ms, start + 3600 + p.ms / 1000, p.lat, p.lon, null);
+
+  const h = await history(e, { from: "2026-11-12", to: "2026-11-12" }, utc(2026, 11, 13, 20));
+  assert.deepEqual(h.trips.map((t) => [t.trip_id, t.distance_mi, t.gps_distance_mi, t.unlogged_before_mi]),
+    [[15, 10, undefined, 21.1], [14, 10, undefined, null], [13, 0, 7.5, null], [12, 10, undefined, null]]);
+  assert.deepEqual(Object.keys(h.trips[2]), ["trip_id", "label", "start", "logger_on_min", "engine_on_min", "distance_mi",
+    "gps_distance_mi", "fuel_used_gal_est", "mpg_est", "unlogged_before_mi"]);
+  // Two gaps are not known, so the total is unknown. The one that is known is a floor.
+  assert.deepEqual([h.totals.distance_mi, h.totals.odometer_distance_mi, h.totals.unlogged_mi, h.totals.unlogged_mi_at_least],
+    [30, 72.1, null, 21.1]);
+  assert.match(h.note, /The odometer moved 72\.1 mi between the first and last readings in this window\. 30 mi of that were logged from speed readings, the rest was missed by the logger or only measured by GPS\./);
+  assert.match(h.note, /A trip row with gps_distance_mi had failed speed readings, so its distance_mi is near 0\./);
+  assert.doesNotMatch(JSON.stringify(h), /"lat"|"lon"|maps\.google/);
+
+  // Trip 16 starts at 23:50 and ends after midnight. Only a window that holds it whole counts
+  // its odometer, so no day gets driving from outside it.
+  addSession(e, { boot: 16, start: utc(2026, 11, 13, 7, 50), minutes: 20, odo: [1116.1, 1148.3] });
+  const day = async (from, to) => (await history(e, { from, to }, utc(2026, 11, 14, 20))).totals.odometer_distance_mi;
+  assert.deepEqual([await day("2026-11-12", "2026-11-12"), await day("2026-11-13", "2026-11-13")], [72.1, null]);
+  assert.equal(await day("2026-11-12", "2026-11-13"), 92.1); // 148.3 km
 });
