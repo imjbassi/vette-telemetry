@@ -213,8 +213,9 @@ async function behavior() {
       } finally { net.busy--; }
     };
 
-    // calls: the name of every Leaflet method the page called, in order.
-    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [];
+    // calls: the name of every Leaflet method the page called, in order. fills: the fill color
+    // of every setStyle call, which is how a marker gets its color.
+    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [], fills = [];
     let reloads = 0;
     let every10s = null;
     const fire = (t) => { if (t.dead) return; t.dead = true; try { return t.fn(); } catch (e) { errors.push(e); } };
@@ -233,6 +234,7 @@ async function behavior() {
       get: (_, k) => (typeof k === "symbol" ? undefined : (...args) => {
         calls.push(k);
         if (k === "bindTooltip") tooltips.push(args[0]);
+        if (k === "setStyle") fills.push(args[0] && args[0].fillColor);
         return leaflet;
       }),
     });
@@ -280,7 +282,7 @@ async function behavior() {
       (fn) => { every10s = fn; return 1; }, matchMedia, (ev, fn) => { listeners[ev] = fn; }, 800, leaflet, PageDate);
 
     const page = {
-      $, net, errors, tooltips, calls, pushed, listeners, doc, groups, location: loc,
+      $, net, errors, tooltips, calls, pushed, fills, listeners, doc, groups, location: loc,
       // How often the page asked for a reload.
       reloads: () => reloads,
       // The window becomes `w` wide. Nothing is fired: a check fires listeners.resize() itself.
@@ -530,6 +532,81 @@ async function behavior() {
     assert.equal(p.header(), "Adapter link down · updated 29s ago");
     assert.equal(p.$("o-loc-sub").textContent, "Adapter link down · 30s ago");
     assert.deepEqual(p.tooltips, ["Latest position"]);
+    assert.deepEqual(p.fills, ["#ef4444"]);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("location: a cut-off drive is last known, and a fix behind the newest reading is a grey last fix", async () => {
+    // A drive whose end never arrived.
+    const cut = makeEnv();
+    await upload(cut, drive({ n: 60 }), T0 + 80);
+    setNow(T0 + 740);
+    const a = openPage(cut);
+    await a.settle();
+    assert.match(a.header(), /^Parked · logger went offline mid-drive/);
+    assert.equal(a.$("o-loc-sub").textContent, "Last known · 11 min ago");
+    assert.deepEqual(a.tooltips, ["Last position before the logger went offline"]);
+    assert.deepEqual(a.fills, ["#ef4444"]);
+
+    // The engine runs, but the last two minutes of readings came without a fix.
+    const lost = makeEnv();
+    await upload(lost, [...drive({ n: 60 }), ...drive({ n: 120, ms0: 80000, gps: false })], T0 + 200);
+    setNow(T0 + 205);
+    const b = openPage(lost);
+    await b.settle();
+    assert.equal(b.header(), "Engine running · updated just now");
+    assert.equal(b.$("o-loc-sub").textContent, "Last fix · 2 min ago");
+    assert.deepEqual(b.tooltips, ["Last GPS fix, 2 min before the last report"]);
+    assert.deepEqual(b.fills, ["#8b8f9a"]);
+    b.nav("live");
+    await b.settle();
+    assert.match(b.$("l-gauges").innerHTML, /<div class="delta">Last fix 2 min before the newest reading<\/div>/);
+    b.nav("logs");
+    await b.settle();
+    assert.match(b.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">Last fix 2 min before the newest reading</);
+
+    // Parked in a garage: the fix was lost three minutes before the engine stopped. That is
+    // still where the car stands.
+    const garage = makeEnv();
+    const off = drive({ n: 10, ms0: 260000, stepMs: 2000, flags: F.QUIET, gps: false }).map((r) => ({ ...r, rpm: null, speed_kph: null }));
+    await upload(garage, [...drive({ n: 60 }), ...drive({ n: 180, ms0: 80000, gps: false }), ...off], T0 + 300);
+    setNow(T0 + 400);
+    const c = openPage(garage);
+    await c.settle();
+    assert.match(c.header(), /^Parked · updated /);
+    assert.equal(c.$("o-loc-sub").textContent, "Parked · 5 min ago");
+    assert.deepEqual(c.tooltips, ["Parked here"]);
+    assert.deepEqual(c.fills, ["#ef4444"]);
+
+    // Two minutes after the last reading the logger powers up again and gets no fix. The fix is
+    // under 10 minutes old, but from the session before.
+    const later = makeEnv();
+    await parkedCar(later);
+    const wake = drive({ boot: 12, n: 10, base: T0 + 400, stepMs: 2000, flags: F.QUIET, gps: false }).map((r) => ({ ...r, rpm: null, speed_kph: null }));
+    await upload(later, wake, T0 + 440);
+    setNow(T0 + 500);
+    const d = openPage(later);
+    await d.settle();
+    assert.match(d.header(), /^Parked · updated /);
+    assert.equal(d.$("o-loc-sub").textContent, "Last fix · 3 min ago");
+    assert.deepEqual(d.tooltips, ["Last GPS fix, from an earlier power-up"]);
+    assert.deepEqual(d.fills, ["#8b8f9a"]);
+    d.nav("logs");
+    await d.settle();
+    assert.match(d.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix since the logger started</);
+    assert.deepEqual([...a.errors, ...b.errors, ...c.errors, ...d.errors], []);
+  });
+
+  check("logs: the GPS card gives the age of the fix, and no card or table prints coordinates", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env, { hash: "logs" });
+    await p.settle();
+    const health = p.$("g-health").innerHTML, raw = p.$("g-raw").innerHTML;
+    assert.match(health, /GPS<\/div><div class="val ">9<small>sats<\/small><\/div><div class="delta">Last fix 1\.0 h ago</);
+    assert.match(raw, /<th>GPS<\/th>/);
+    assert.match(raw, /<span class="tag ok">fix<\/span>/);
+    for (const text of [health, raw]) assert.doesNotMatch(text, /\d+\.\d{5}, -?\d+\.\d{5}/);
     assert.deepEqual(p.errors, []);
   });
 
@@ -542,6 +619,132 @@ async function behavior() {
     await p.settle();
     assert.match(p.header(), /^No signal since /);
     assert.match(p.$("l-banner-t").innerHTML, /Showing the last readings from 3 min ago\.$/);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("live: during an outage or a pause the banner says what the header says", async () => {
+    const env = makeEnv();
+    await upload(env, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    // The first look of the 10 s re-check, so the next one only redraws on a change.
+    p.interval();
+    const banner = () => p.$("l-banner-t").innerHTML;
+    assert.match(banner(), /Engine running\.<\/b> Updates arrive about every 15 s\.$/);
+    assert.equal(p.$("l-dot").className, "dot on");
+
+    // Every request fails. The banner changes with the header, before any re-check.
+    p.net.reject = () => true;
+    await p.poll();
+    assert.match(p.header(), /^No connection to the server · /);
+    assert.equal(p.$("l-dot").className, "dot bad");
+    assert.match(banner(), /^<b [^>]*>No connection to the server\.<\/b> Showing the last readings from just now\.$/);
+    // Two minutes on, the drive is no longer called running and the age has moved.
+    setNow(T0 + 265);
+    p.interval();
+    assert.doesNotMatch(banner(), /Engine running/);
+    assert.equal(p.$("l-dot").className, "dot bad");
+    assert.match(banner(), /No connection to the server\.<\/b> Showing the last readings from 2 min ago\.$/);
+
+    // A parked car, the Live view left alone for 16 minutes.
+    const env2 = makeEnv();
+    await parkedCar(env2);
+    const q = openPage(env2, { hash: "live" });
+    await q.settle();
+    assert.match(q.$("l-banner-t").innerHTML, /Engine off\.<\/b> Showing the last readings from 1\.0 h ago\.$/);
+    setNow(T0 + 4960);
+    await q.poll();
+    assert.equal(q.header(), "Paused · tap to resume");
+    assert.equal(q.$("l-dot").className, "dot");
+    assert.match(q.$("l-banner-t").innerHTML, /^<b [^>]*>Paused\.<\/b> Tap to resume\. Showing the last readings from 1\.3 h ago\.$/);
+    q.listeners.pointerdown();
+    await q.settle();
+    assert.match(q.$("l-banner-t").innerHTML, /Engine off\.<\/b> Showing the last readings from 1\.3 h ago\.$/);
+    assert.deepEqual([...p.errors, ...q.errors], []);
+  });
+
+  check("live: with the engine off the gauges are grey, name no state, and the charts say when they end", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    const g = p.$("l-gauges").innerHTML;
+    assert.equal((g.match(/class="card kpi gauge old"/g) ?? []).length, 10);
+    assert.doesNotMatch(g, /Charging|Idling|Normal|Warming up|satellites/);
+    assert.match(g, /class="bars old"/);
+    // No instant MPG from the last speed and airflow of a car that stands.
+    assert.match(g, /Instant MPG<\/div>\s*<div class="val">–<small>mpg/);
+    // The fill of a sparkline drops under its last reading (the 300th of 310), not at the edge.
+    assert.match(g, /L193\.5,34L0\.0,34Z/);
+    // The time axis has no date, so the subtitles give the end of the readings.
+    const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const end = new Date((T0 + 338) * 1000);
+    const wins = ["l-win", "l-win2", "l-win3", "l-win4"].map((id) => p.$(id).textContent);
+    assert.deepEqual(wins, Array(4).fill(`10 minutes up to ${day.format(end)}, ${time.format(end)}`));
+    assert.match(p.$("l-thr-r").innerHTML, /^avg <b>/);
+    assert.match(p.$("l-cool-r").innerHTML, /^avg <b>/);
+
+    // Overview: the voltage is an hour old, so it is grey and its word is in the past tense.
+    const o = openPage(env);
+    await o.settle();
+    assert.equal(o.$("k-batt-d").innerHTML, "Was charging · 1.0 h ago");
+    assert.equal(o.$("k-batt").className, "old");
+    // Logs: the signal bars of an hour ago are grey too.
+    const l = openPage(env, { hash: "logs" });
+    await l.settle();
+    assert.match(l.$("g-health").innerHTML, /class="bars old"/);
+    assert.deepEqual([...p.errors, ...o.errors, ...l.errors], []);
+  });
+
+  check("live: speed, RPM, throttle and airflow come only from the running session and its last 10 s", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // The next day a drive whose speed readings all fail. `latest` still holds yesterday's speed.
+    await upload(env, drive({ boot: 12, n: 60, base: T0 + 86400 }).map((r) => ({ ...r, speed_kph: null })), T0 + 86480);
+    setNow(T0 + 86485);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    assert.equal(p.header(), "Engine running · updated just now");
+    const g = p.$("l-gauges").innerHTML;
+    assert.match(g, /Speed<\/div>\s*<div class="val">–<small>mph/);
+    assert.match(g, /Instant MPG<\/div>\s*<div class="val">–<small>mpg/);
+    // Only the Speed card is grey, with the age of the speed it no longer shows.
+    assert.equal((g.match(/class="card kpi gauge old"/g) ?? []).length, 1);
+    assert.match(g, /<div class="card kpi gauge old">[^\n]*>Speed<\/div>\s*<div class="val">–<small>mph<\/small><\/div><div class="delta">Last read 24 h ago</);
+
+    // One session: the speed stopped coming 20 s before the newest reading.
+    const env2 = makeEnv();
+    await upload(env2, [...drive({ n: 60 }), ...drive({ n: 20, ms0: 80000 }).map((r) => ({ ...r, speed_kph: null }))], T0 + 100);
+    setNow(T0 + 105);
+    const q = openPage(env2, { hash: "live" });
+    await q.settle();
+    assert.equal(q.header(), "Engine running · updated just now");
+    const h = q.$("l-gauges").innerHTML;
+    assert.match(h, /Speed<\/div>\s*<div class="val">–<small>mph/);
+    // RPM came with the newest reading, so it stays.
+    assert.match(h, /Engine speed<\/div>\s*<div class="val">[^–<]+<small>rpm/);
+    assert.doesNotMatch(h, / old/);
+    assert.deepEqual([...p.errors, ...q.errors], []);
+  });
+
+  check("overview: during an outage the ages on the cards keep counting", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    p.interval();
+    assert.match(p.$("k-fuel-d").textContent, / · 1\.0 h ago$/);
+    p.net.reject = () => true;
+    await p.poll();
+    // The header changed, so this re-check redraws anyway. The next ones would not.
+    p.interval();
+    setNow(T0 + 6400);
+    p.interval();
+    assert.match(p.header(), /^No connection to the server · last data 1\.7 h ago$/);
+    assert.match(p.$("k-fuel-d").textContent, / · 1\.7 h ago$/);
+    assert.match(p.$("o-loc-sub").textContent, / · 1\.7 h ago$/);
     assert.deepEqual(p.errors, []);
   });
 
@@ -585,6 +788,13 @@ async function behavior() {
     const p = openPage(env, { hash: "live" });
     await p.settle();
     assert.equal(p.header(), "Engine running · updated just now");
+    // While the engine runs nothing is grey. The speed is the one of the newest reading, and the
+    // battery word is the server's.
+    const g = p.$("l-gauges").innerHTML;
+    assert.doesNotMatch(g, / old/);
+    assert.match(g, />50<small>mph/);
+    assert.match(g, /Battery<\/div>\s*<div class="val">14\.1<small>V<\/small><\/div><div class="delta"><span class="up">Charging<\/span>/);
+    assert.equal(p.$("l-win").textContent, "Last 10 minutes");
 
     // The drive goes on for 16 minutes and nobody touches the screen. That is past the idle
     // pause, which does not apply here.
@@ -594,6 +804,7 @@ async function behavior() {
       await p.poll();
       assert.equal(p.header(), "Engine running · updated just now");
       assert.equal(p.nextPoll(), 15000);
+      assert.doesNotMatch(p.$("l-gauges").innerHTML, / old/);
     }
 
     // 11 minutes without an upload. The state falls back to parked, the polling goes on.

@@ -140,6 +140,10 @@
   .gauges { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .gauge .val { font-size: 30px; }
   .spark { height: 34px; margin-top: 8px; }
+  /* A reading that is not current: the engine is off, or it is from an earlier session. */
+  .gauge.old .val, .val.old { color: var(--muted); }
+  .gauge.old .spark { opacity: .4; }
+  .bars.old i.on { background: var(--muted); }
   .banner { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--line2); background: var(--card); margin-bottom: 14px; color: #c4c7cf; font-size: 13px; }
 
   /* ---------- logs ---------- */
@@ -288,11 +292,11 @@
       <div class="grid gauges" id="l-gauges"></div>
       <div class="grid two mt">
         <div class="card"><div class="card-head"><div><h3>Speed</h3><div class="sub" id="l-win">Last 10 minutes</div></div><span class="readout" id="l-speed-r"></span></div><div class="chart" id="l-speed"></div></div>
-        <div class="card"><div class="card-head"><div><h3>Engine speed</h3><div class="sub">RPM, last 10 minutes</div></div><span class="readout" id="l-rpm-r"></span></div><div class="chart" id="l-rpm"></div></div>
+        <div class="card"><div class="card-head"><div><h3>Engine speed</h3><div class="sub" id="l-win2">Last 10 minutes</div></div><span class="readout" id="l-rpm-r"></span></div><div class="chart" id="l-rpm"></div></div>
       </div>
       <div class="grid two mt">
-        <div class="card"><div class="card-head"><div><h3>Throttle</h3><div class="sub">Throttle position, %</div></div></div><div class="chart" id="l-thr"></div></div>
-        <div class="card"><div class="card-head"><div><h3>Coolant temperature</h3><div class="sub">°F</div></div></div><div class="chart" id="l-cool"></div></div>
+        <div class="card"><div class="card-head"><div><h3>Throttle</h3><div class="sub" id="l-win3">Last 10 minutes</div></div><span class="readout" id="l-thr-r"></span></div><div class="chart" id="l-thr"></div></div>
+        <div class="card"><div class="card-head"><div><h3>Coolant temperature</h3><div class="sub" id="l-win4">Last 10 minutes</div></div><span class="readout" id="l-cool-r"></span></div><div class="chart" id="l-cool"></div></div>
       </div>
     </section>
 
@@ -493,9 +497,10 @@
     return mph / ((maf * 3600) / (c.afr * c.g_per_gal));
   }
   const dbm = (csq) => (csq == null || csq === 99 ? null : -113 + 2 * csq);
-  function bars(csq) {
+  // `old` greys the bars of a reading that is not current.
+  function bars(csq, old) {
     const n = csq == null || csq === 99 ? 0 : csq >= 20 ? 4 : csq >= 15 ? 3 : csq >= 10 ? 2 : csq >= 5 ? 1 : 0;
-    return `<span class="bars">${[5, 8, 11, 14].map((h, i) => `<i class="${i < n ? "on" : ""}" style="height:${h}px"></i>`).join("")}</span>`;
+    return `<span class="bars${old ? " old" : ""}">${[5, 8, 11, 14].map((h, i) => `<i class="${i < n ? "on" : ""}" style="height:${h}px"></i>`).join("")}</span>`;
   }
   // A request that never answers would stop the polling, because the next poll is only set
   // once this one is done. So each one is given up after 30 s, which still leaves a large
@@ -555,6 +560,35 @@
   const L_ = () => (S.status && S.status.latest) || {};
   const lv = (k) => (L_()[k] ? L_()[k].v : null);
   const lt = (k) => (L_()[k] ? L_()[k].ts : null);
+  // Read within the time in which a running car always sends a new reading.
+  const recent = (k) => lt(k) != null && now() - lt(k) < ((S.status && S.status.rules && S.status.rules.running_s) || 90);
+  // Readings only exist while the car is powered, so engine-off values include electrical load.
+  // The server says whether the engine ran when this voltage was read. Voltage alone cannot tell.
+  const BATT = {
+    "charging": '<span class="up">Charging</span>', "engine off": "Engine off, normal",
+    "engine on, not charging": "Engine on, not charging", "low": '<span class="down">Low, check battery</span>',
+  };
+  // An older voltage describes the moment it was read, not the battery now.
+  const BATT_OLD = {
+    "charging": "Was charging", "engine off": "Engine off, normal",
+    "engine on, not charging": "Engine was on, not charging", "low": '<span class="down">Low, check battery</span>',
+  };
+  const battWord = () => (recent("adapter_v") ? BATT : BATT_OLD)[S.status && S.status.battery] || "";
+  // A car parked in a garage loses the fix minutes before the last engine-off reading. That is
+  // still where it stands, so a parked car counts a fix as lagging only when it is from an
+  // earlier session or this much older than the newest reading.
+  const PARKED_FIX_LAG_S = 600;
+  // `latest` keeps the last fix for good, so readings without one (no view of the sky, or a
+  // power-up that never got a fix) leave it behind the newest reading. Null while it is current,
+  // else how far behind it is and whether it is from an earlier session.
+  function fixLag() {
+    const e = L_().engine_on, p = L_().lat;
+    if (!e || !p) return null;
+    const s = Math.max(0, e.ts - p.ts), earlier = p.boot !== e.boot, cs = carState();
+    const parked = cs.state === "parked" && !cs.ended_mid_drive && !cs.link_down;
+    return (parked ? earlier || s > PARKED_FIX_LAG_S : s > 60) ? { s, earlier } : null;
+  }
+  const lagText = (g) => (g.earlier ? "No fix since the logger started" : `Last fix ${dur(g.s)} before the newest reading`);
   // Takes the car state out of any answer that carries it (status, live, logs).
   function absorb(d) {
     S.status = S.status || {};
@@ -692,8 +726,11 @@
     if (hi === lo) { hi += 1; lo -= 1; }
     const X = (i) => (i / (ys.length - 1)) * W, Y = (y) => 3 + (1 - (y - lo) / (hi - lo)) * (H - 6);
     const d = pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join("");
+    // The fill drops straight down under the first and last points. Closed at the far corners it
+    // drew a slope out to an edge where there is no reading.
+    const xa = X(pts[0][0]).toFixed(1), xb = X(pts[pts.length - 1][0]).toFixed(1);
     const id = "s" + ++gid;
-    return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".35"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs><path d="${d}L${W},${H}L0,${H}Z" fill="url(#${id})" stroke="none"/><path d="${d}" fill="none" stroke="${color}" stroke-width="1.8" vector-effect="non-scaling-stroke"/></svg>`;
+    return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".35"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs><path d="${d}L${xb},${H}L${xa},${H}Z" fill="url(#${id})" stroke="none"/><path d="${d}" fill="none" stroke="${color}" stroke-width="1.8" vector-effect="non-scaling-stroke"/></svg>`;
   }
 
   function barChart(el, items, epa) {
@@ -757,10 +794,11 @@
     S.maps[key] = { map, marker: null, track: null, centered: false };
     return S.maps[key];
   }
-  function placeMarker(m, lat, lon, label, live) {
+  // `live` keeps the map on the marker as it moves. `color` fills it, green while live, else red.
+  function placeMarker(m, lat, lon, label, live, color = live ? "#2fbf71" : "#ef4444") {
     const ll = [lat, lon];
-    if (!m.marker) m.marker = L.circleMarker(ll, { radius: 8, color: "#fff", weight: 2.5, fillColor: live ? "#2fbf71" : "#ef4444", fillOpacity: 1 }).addTo(m.map);
-    m.marker.setLatLng(ll).setStyle({ fillColor: live ? "#2fbf71" : "#ef4444" }).bindTooltip(label);
+    if (!m.marker) m.marker = L.circleMarker(ll, { radius: 8, color: "#fff", weight: 2.5, fillColor: color, fillOpacity: 1 }).addTo(m.map);
+    m.marker.setLatLng(ll).setStyle({ fillColor: color }).bindTooltip(label);
     if (!m.centered) { m.map.setView(ll, 15); m.centered = true; }
     else if (live) m.map.panTo(ll);
   }
@@ -817,6 +855,7 @@
     S.shown = text;
     const odo = lv("odo_km");
     $("sideodo").textContent = odo == null ? "Corvette · LT2" : `${f0(odo * KM_TO_MI)} mi`;
+    if (S.view === "live") renderLiveBanner();
   }
 
   function renderOverview() {
@@ -838,13 +877,9 @@
 
     const b = lv("adapter_v");
     $("k-batt").innerHTML = b == null ? "–" : `${f1(b)}<small>V</small>`;
-    // Readings only exist while the car is powered, so engine-off values include electrical load.
-    // The server says whether the engine ran when this voltage was read. Voltage alone cannot tell.
-    const BATT = {
-      "charging": '<span class="up">Charging</span>', "engine off": "Engine off, normal",
-      "engine on, not charging": "Engine on, not charging", "low": '<span class="down">Low, check battery</span>',
-    };
-    $("k-batt-d").innerHTML = b == null ? "" : [BATT[s.battery], ago(lt("adapter_v"))].filter(Boolean).join(" · ");
+    // A bright 14.2 V from days ago would read as a healthy battery today.
+    $("k-batt").classList.toggle("old", b != null && !recent("adapter_v"));
+    $("k-batt-d").innerHTML = b == null ? "" : [battWord(), ago(lt("adapter_v"))].filter(Boolean).join(" · ");
 
     $("k-mpg").innerHTML = s.mpg30 == null ? "–" : `${f1(s.mpg30)}<small>mpg</small>`;
     // An empty card says why. The server gives no average under a minimum of logged miles.
@@ -858,15 +893,22 @@
       $("k-mpg-d").innerHTML = `<span class="${d >= 0 ? "up" : "down"}">${d >= 0 ? "+" : ""}${f0(d)}%</span> vs EPA ${s.car.epa.combined} combined`;
     }
 
-    const lat = lv("lat"), lon = lv("lon"), cs = carState(), st = cs.state, on = st === "running";
+    const lat = lv("lat"), lon = lv("lon"), cs = carState(), st = cs.state;
     const mp = getMap("o", "o-map");
     if (lat != null && lon != null) {
-      // Without a signal the car may have moved on, so this is not called parked. With the
-      // adapter link down the position is fresh but nothing is known about the engine.
-      const [word, mark] = cs.link_down ? ["Adapter link down", "Latest position"] : on ? ["Live", "Now"]
-        : st === "no_signal" ? ["Last known", "Last known position"] : ["Parked", "Parked here"];
+      // The first that applies. With the adapter link down the position is fresh but nothing is
+      // known about the engine. A fix behind the newest reading is where the car was then, so it
+      // is grey and the map does not follow it. Without a signal, or after a drive whose end never
+      // arrived, the car may have moved on, so neither is called parked.
+      const g = fixLag();
+      const [word, mark, color] = cs.link_down ? ["Adapter link down", "Latest position", "#ef4444"]
+        : g ? ["Last fix", g.earlier ? "Last GPS fix, from an earlier power-up" : `Last GPS fix, ${dur(g.s)} before the last report`, "#8b8f9a"]
+        : st === "running" ? ["Live", "Now", "#2fbf71"]
+        : st === "no_signal" ? ["Last known", "Last known position", "#ef4444"]
+        : cs.ended_mid_drive ? ["Last known", "Last position before the logger went offline", "#ef4444"]
+        : ["Parked", "Parked here", "#ef4444"];
       $("o-loc-sub").textContent = word + " · " + ago(lt("lat"));
-      if (mp) placeMarker(mp, lat, lon, mark, on);
+      if (mp) placeMarker(mp, lat, lon, mark, word === "Live", color);
       const a = $("o-maps"); a.hidden = false; a.href = `https://maps.google.com/?q=${lat.toFixed(6)},${lon.toFixed(6)}`;
     } else {
       $("o-loc-sub").textContent = "No GPS fix yet";
@@ -1039,51 +1081,92 @@
     ["fuel", "Fuel", "%", "#2fbf71", null, 0],
     ["signal", "Cell signal", "", "#2fbf71", null, 0],
   ];
-  function renderLive() {
-    const d = S.live; if (!d) return;
-    const cs = carState(), on = cs.state === "running" && !cs.link_down;
+  // The line above the gauges says what the header says, from the same moment. renderHeader
+  // runs it too while Live is open, so it also runs before the first live answer has arrived.
+  function renderLiveBanner() {
+    const d = S.live, cs = carState();
+    // The dot pulses only while answers arrive.
+    const on = cs.state === "running" && !cs.link_down && !S.err && !S.paused;
     const head = (t) => `<b style="color:var(--text)">${t}</b>`;
     // The age of the newest reading, as in the header. An upload can be newer than what it carried.
     const tail = cs.last_seen_ts == null ? "" : `Showing the last readings from ${esc(ago(cs.last_seen_ts))}.`;
-    $("l-dot").className = "dot" + (on ? " on" : cs.state === "no_signal" || cs.link_down ? " warn" : "");
-    $("l-banner-t").innerHTML = !d.boot ? "No data yet."
-      : cs.link_down ? `${head("Adapter link down.")} The logger is on but cannot reach the OBD adapter, so engine values are old.`
-      : on ? `${head("Engine running.")} Updates arrive about every 15 s.`
-      : cs.state === "no_signal" ? `${head("No signal since " + esc(timeFmt.format(new Date(cs.last_seen_ts * 1000))) + ".")} The car may be out of coverage or was just switched off. ${tail}`
-      : cs.ended_mid_drive ? `${head("Parked.")} The logger went offline mid-drive, so the end of that drive is missing. ${tail}`
-      : `${head("Engine off.")} ${tail}`;
+    const say = (...parts) => parts.filter(Boolean).join(" ");
+    // Paused first, then a failing connection, as in the header. The error can be the read
+    // limit or a server error, so it is printed as it is. The dot is picked with the words.
+    const [dot, text] = S.paused ? ["", say(head("Paused."), "Tap to resume.", tail)]
+      : S.err ? ["bad", say(head(esc(S.err.replace(/\.?$/, "."))), tail)]
+      : !d ? ["", "Checking…"]
+      : !d.boot ? ["", "No data yet."]
+      : cs.link_down ? ["warn", `${head("Adapter link down.")} The logger is on but cannot reach the OBD adapter, so engine values are old.`]
+      : on ? ["on", `${head("Engine running.")} Updates arrive about every 15 s.`]
+      : cs.state === "no_signal" ? ["warn", `${head("No signal since " + esc(timeFmt.format(new Date(cs.last_seen_ts * 1000))) + ".")} The car may be out of coverage or was just switched off. ${tail}`]
+      : cs.ended_mid_drive ? ["", `${head("Parked.")} The logger went offline mid-drive, so the end of that drive is missing. ${tail}`]
+      : ["", `${head("Engine off.")} ${tail}`];
+    $("l-dot").className = "dot" + (dot ? " " + dot : "");
+    $("l-banner-t").innerHTML = text;
+  }
+  // The `latest` entry behind each gauge. Instant MPG has none, it is worked out from two.
+  const KEY = { mph: "speed_kph", rpm: "rpm", throttle: "throttle_pct", coolant: "coolant_c", maf: "maf_gs", volts: "adapter_v", iat: "intake_c", fuel: "fuel_pct", signal: "csq" };
+  function renderLive() {
+    renderLiveBanner();
+    const d = S.live; if (!d) return;
+    const cs = carState(), on = cs.state === "running" && !cs.link_down;
     const s = d.series || { t: [] };
     const rows = s.t.map((t, i) => ({ t, mph: s.mph[i], rpm: s.rpm[i], throttle: s.throttle[i], coolant_f: s.coolant_f[i], maf: s.maf[i], volts: s.volts[i] }));
     rows.forEach((r) => { r.mpg = instMpg(r.mph, r.maf); if (r.mpg != null) r.mpg = Math.min(r.mpg, 99); });
     const last = (k) => { for (let i = rows.length - 1; i >= 0; i--) if (rows[i][k] != null) return rows[i][k]; return null; };
+    // `latest` keeps the last value of every field across sessions. Speed, RPM, throttle and
+    // airflow change by the second, so they come only from the newest session, and while the
+    // engine runs only from its last 10 s. A reading that stopped arriving shows as a dash, not
+    // as yesterday's value under "Engine running". Inside one session ms is the clock to compare.
+    const newest = L_().engine_on;
+    const sameRun = (k) => { const e = L_()[k]; return !!e && !!newest && e.boot === newest.boot; };
+    const fast = (k) => (sameRun(k) && (!on || newest.ms - L_()[k].ms <= 10000) ? lv(k) : null);
+    const old = (k) => (on ? null : last(k));
+    const kph = fast("speed_kph");
     const cur = {
-      mph: lv("speed_kph") == null ? last("mph") : Math.round(lv("speed_kph") * KM_TO_MI),
-      rpm: lv("rpm") ?? last("rpm"), throttle: lv("throttle_pct") ?? last("throttle"),
-      coolant: cToF(lv("coolant_c")) ?? last("coolant_f"), maf: lv("maf_gs") ?? last("maf"), volts: lv("adapter_v") ?? last("volts"),
+      mph: kph == null ? old("mph") : Math.round(kph * KM_TO_MI),
+      rpm: fast("rpm") ?? old("rpm"), throttle: fast("throttle_pct") ?? old("throttle"), maf: fast("maf_gs") ?? old("maf"),
+      coolant: cToF(lv("coolant_c")) ?? last("coolant_f"), volts: lv("adapter_v") ?? last("volts"),
       iat: cToF(lv("intake_c")), fuel: lv("fuel_pct"), csq: lv("csq"),
     };
-    cur.mpg = instMpg(cur.mph, cur.maf);
+    cur.mpg = on ? instMpg(cur.mph, cur.maf) : null;
+    // A card is grey when the engine is off, or when `latest` kept its value from an earlier session.
+    const earlier = (k) => !!KEY[k] && lv(KEY[k]) != null && !sameRun(KEY[k]);
+    const isOld = (k) => !on || earlier(k);
     const html = GAUGES.map(([k, label, unit, color, pick, dec]) => {
-      let v = cur[k], extra = "";
+      let v = k === "signal" ? cur.csq : cur[k], extra = "";
+      const stale = isOld(k), cls = "card kpi gauge" + (stale ? " old" : "");
+      // A grey card names no state. A value from an earlier session gives its own age. With the
+      // engine off the banner gives the age of the rest once.
+      const age = earlier(k) ? (v == null ? "Last read " : "") + ago(lt(KEY[k])) : "";
       if (k === "signal") {
         const dB = dbm(cur.csq);
-        return `<div class="card kpi gauge"><div class="lab"><span class="ico"><svg style="color:${color}"><use href="#i-signal"/></svg></span>${label}</div>
-          <div class="val">${bars(cur.csq)} <small>${dB == null ? "–" : dB + " dBm"}</small></div><div class="delta">${lv("sats") != null ? "GPS · " + lv("sats") + " satellites" : "No GPS fix"}</div></div>`;
+        const g = fixLag();
+        extra = stale ? age : lv("sats") == null ? "No GPS fix yet" : g ? lagText(g) : `GPS · ${f0(lv("sats"))} satellites`;
+        return `<div class="${cls}"><div class="lab"><span class="ico"><svg style="color:${color}"><use href="#i-signal"/></svg></span>${label}</div>
+          <div class="val">${bars(cur.csq, stale)} <small>${dB == null ? "–" : dB + " dBm"}</small></div><div class="delta">${extra || "&nbsp;"}</div></div>`;
       }
       if (k === "mpg" && v != null && v > 99) v = 99;
       const val = v == null ? "–" : (dec ? (Math.round(v * 10) / 10).toLocaleString() : Math.round(v).toLocaleString());
       const spark = pick ? sparkline(rows.map(pick), color) : "";
-      if (k === "mpg" && cur.mph === 0) extra = "Idling";
-      if (k === "coolant" && v != null) extra = v < 160 ? "Warming up" : v > 230 ? '<span class="down">Hot</span>' : "Normal";
-      if (k === "volts" && v != null) extra = v >= 13 ? "Charging" : "Not charging";
-      return `<div class="card kpi gauge"><div class="lab"><span class="ico" style="color:${color}"><svg><use href="#i-pulse"/></svg></span>${label}</div>
+      if (stale) extra = age;
+      else if (k === "mpg" && cur.mph === 0 && cur.rpm > 0) extra = "Idling";
+      else if (k === "coolant" && v != null) extra = v < 160 ? "Warming up" : v > 230 ? '<span class="down">Hot</span>' : "Normal";
+      // The server's word, as on Overview. It knows whether the engine ran, voltage alone cannot tell.
+      else if (k === "volts" && v != null) extra = battWord();
+      return `<div class="${cls}"><div class="lab"><span class="ico" style="color:${color}"><svg><use href="#i-pulse"/></svg></span>${label}</div>
         <div class="val">${val}<small>${unit}</small></div><div class="delta">${extra || "&nbsp;"}</div>${spark}</div>`;
     }).join("");
     $("l-gauges").innerHTML = html;
+    // The time axis has no date. Readings that are not live say when they end.
+    const tEnd = s.t.length ? s.t[s.t.length - 1] : null;
+    const win = on || tEnd == null ? "Last 10 minutes" : "10 minutes up to " + when(tEnd);
+    for (const id of ["l-win", "l-win2", "l-win3", "l-win4"]) $(id).textContent = win;
     chart($("l-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 180, readout: $("l-speed-r"), empty: "No recent speed data" });
     chart($("l-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 180, readout: $("l-rpm-r"), empty: "No recent RPM data" });
-    chart($("l-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, min: 0, empty: "No recent throttle data" });
-    chart($("l-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, ref: 220, refColor: "#ef4444", empty: "No recent coolant data" });
+    chart($("l-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, min: 0, readout: $("l-thr-r"), empty: "No recent throttle data" });
+    chart($("l-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, ref: 220, refColor: "#ef4444", readout: $("l-cool-r"), empty: "No recent coolant data" });
   }
   // Ask only for readings newer than the ones already on screen, then trim to the window.
   async function loadLive() {
@@ -1127,11 +1210,14 @@
     // Legacy firmware has no build number and only writes readings while the link is up.
     const link = L.link ? (L.link.v === 1 ? "Up" : "Down") : "–";
     const build = L.fw ? (L.fw.v ? `Build ${L.fw.v}` : "Legacy") : "–";
+    // The age of the fix and no coordinates: this view is the one that gets screenshotted.
+    const g = fixLag();
     const cards = [
       ["i-up", "var(--blue)", "Last upload", lastUp ? ago(lastUp) : "never", lastUp ? secFmt.format(new Date(lastUp * 1000)) : "", fresh ? "up" : ""],
       ["i-list", "var(--green)", "Uploads, last hour", f0(h.uploads), `${f0(h.records)} readings · ${f1((h.bytes || 0) / 1024)} KB`, ""],
-      ["i-signal", "var(--yellow)", "Cell signal", L.csq ? `${bars(L.csq.v)} ${dbm(L.csq.v) ?? "–"}<small>dBm</small>` : "–", L.csq ? ago(L.csq.ts) : "", ""],
-      ["i-sat", "var(--purple)", "GPS", L.sats ? `${L.sats.v}<small>sats</small>` : "No fix", L.lat ? `${L.lat.v.toFixed(5)}, ${L.lon.v.toFixed(5)}` : "Needs a view of the sky", ""],
+      ["i-signal", "var(--yellow)", "Cell signal", L.csq ? `${bars(L.csq.v, !recent("csq"))} ${dbm(L.csq.v) ?? "–"}<small>dBm</small>` : "–", L.csq ? ago(L.csq.ts) : "", ""],
+      ["i-sat", "var(--purple)", "GPS", g || !L.sats ? "No fix" : `${f0(L.sats.v)}<small>sats</small>`,
+        g ? lagText(g) : L.lat ? `Last fix ${ago(L.lat.ts)}` : "Needs a view of the sky", ""],
       ["i-pulse", "var(--cyan)", "Adapter link", link, L.link ? `Bluetooth to the OBD adapter · ${ago(L.link.ts)}` : "Not reported yet", L.link && L.link.v === 0 ? "down" : ""],
       ["i-car", "var(--orange)", "Firmware", build, L.fw ? (L.fw.v ? "Build number in the newest reading" : "From before build numbers") : "Not reported yet", ""],
     ];
@@ -1150,14 +1236,14 @@
     if (!d.ingests.length) $("g-uploads").innerHTML += '<tr><td colspan="5" class="empty">No uploads yet</td></tr>';
 
     $("g-raw-chip").textContent = `newest ${d.samples.length}`;
-    $("g-raw").innerHTML = `<tr><th>Time</th><th class="num">Session</th><th>State</th><th class="num">mph</th><th class="num">RPM</th><th class="num">Thr %</th><th class="num">MAF g/s</th><th class="num">Coolant °F</th><th class="num">Intake °F</th><th class="num">Fuel %</th><th class="num">Batt V</th><th class="num">ECU V</th><th>Position</th><th class="num">Sats</th><th>Signal</th></tr>` +
+    $("g-raw").innerHTML = `<tr><th>Time</th><th class="num">Session</th><th>State</th><th class="num">mph</th><th class="num">RPM</th><th class="num">Thr %</th><th class="num">MAF g/s</th><th class="num">Coolant °F</th><th class="num">Intake °F</th><th class="num">Fuel %</th><th class="num">Batt V</th><th class="num">ECU V</th><th>GPS</th><th class="num">Sats</th><th>Signal</th></tr>` +
       d.samples.map((r) => `<tr><td>${esc(secFmt.format(new Date((r.ts + (r.ms % 1000) / 1000) * 1000)))}${r.ts_est ? ' <span class="tag mid">est</span>' : ""}</td>
         <td class="num">${sid(r.boot)}</td><td>${flagsTag(r.flags)}</td>
         <td class="num">${r.speed_kph == null ? "–" : Math.round(r.speed_kph * KM_TO_MI)}</td><td class="num">${f0(r.rpm)}</td>
         <td class="num">${f0(r.throttle_pct)}</td><td class="num">${r.maf_gs == null ? "–" : r.maf_gs.toFixed(2)}</td>
         <td class="num">${f0(cToF(r.coolant_c))}</td><td class="num">${f0(cToF(r.intake_c))}</td><td class="num">${f1(r.fuel_pct)}</td>
         <td class="num">${r.adapter_v == null ? "–" : r.adapter_v.toFixed(2)}</td><td class="num">${r.ecu_v == null ? "–" : r.ecu_v.toFixed(2)}</td>
-        <td>${r.lat == null ? '<span style="color:var(--dim)">no fix</span>' : `${r.lat.toFixed(5)}, ${r.lon.toFixed(5)}`}</td>
+        <td>${r.lat == null ? '<span style="color:var(--dim)">no fix</span>' : '<span class="tag ok">fix</span>'}</td>
         <td class="num">${r.sats ?? "–"}</td><td>${bars(r.csq)}</td></tr>`).join("");
     if (!d.samples.length) $("g-raw").innerHTML += '<tr><td colspan="15" class="empty">No readings yet</td></tr>';
 
@@ -1469,6 +1555,9 @@
   let handled = null;
   setInterval(() => {
     renderHeader();
+    // During an outage or a pause no answer redraws Overview, so its ages are moved on here.
+    // Only then: every redraw binds the marker tooltip again.
+    if (S.view === "overview" && (S.err || S.paused)) renderOverview();
     if (S.shown === handled) return;
     const first = handled === null;
     handled = S.shown;
