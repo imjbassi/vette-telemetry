@@ -123,8 +123,9 @@ async function behavior() {
   const opened = [];
 
   // Element methods the page calls that need no real behavior here. Any other method is
-  // undefined, so calling it throws as it would in a browser.
-  const NOOP_METHODS = new Set(["addEventListener", "removeEventListener", "setAttribute", "getAttribute", "removeAttribute", "scrollIntoView"]);
+  // undefined, so calling it throws as it would in a browser. addEventListener keeps the
+  // handler under its event name in `handlers`, so a check can send a pointer event to a chart.
+  const NOOP_METHODS = new Set(["removeEventListener", "setAttribute", "getAttribute", "removeAttribute", "scrollIntoView"]);
 
   // The page in a stand-in browser. Timers do not run by themselves: a check fires the poll
   // timer when it wants the next poll, and moves the clock with setNow(). new Date() reads
@@ -162,6 +163,7 @@ async function behavior() {
           if (p === "appendChild") return (c) => { t.children.push(c); return c; };
           // Inserts a node after this one. Kept, so a check can see it.
           if (p === "after") return (c) => { t.next.push(c); };
+          if (p === "addEventListener") return (ev, fn) => { (t.handlers ??= {})[ev] = fn; };
           if (NOOP_METHODS.has(p)) return () => undefined;
           return undefined;
         },
@@ -214,8 +216,9 @@ async function behavior() {
     };
 
     // calls: the name of every Leaflet method the page called, in order. fills: the fill color
-    // of every setStyle call, which is how a marker gets its color.
-    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [], fills = [];
+    // of every setStyle call, which is how a marker gets its color. made: the options of every
+    // map the page made. dots: the options of every circle marker.
+    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [], fills = [], made = [], dots = [];
     let reloads = 0;
     let every10s = null;
     const fire = (t) => { if (t.dead) return; t.dead = true; try { return t.fn(); } catch (e) { errors.push(e); } };
@@ -235,6 +238,8 @@ async function behavior() {
         calls.push(k);
         if (k === "bindTooltip") tooltips.push(args[0]);
         if (k === "setStyle") fills.push(args[0] && args[0].fillColor);
+        if (k === "map") made.push(args[1] || {});
+        if (k === "circleMarker") dots.push(args[1] || {});
         return leaflet;
       }),
     });
@@ -282,7 +287,7 @@ async function behavior() {
       (fn) => { every10s = fn; return 1; }, matchMedia, (ev, fn) => { listeners[ev] = fn; }, 800, leaflet, PageDate);
 
     const page = {
-      $, net, errors, tooltips, calls, pushed, fills, listeners, doc, groups, location: loc,
+      $, net, errors, tooltips, calls, pushed, fills, made, dots, listeners, doc, groups, location: loc,
       // How often the page asked for a reload.
       reloads: () => reloads,
       // The window becomes `w` wide. Nothing is fired: a check fires listeners.resize() itself.
@@ -769,6 +774,58 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...o.errors, ...h.errors, ...q.errors], []);
   });
 
+  check("maps: a legend gives the speed colors, start and end are neutral dots, and a trip in progress ends at its latest position", async () => {
+    // The words of a legend in order, and the colors of its swatches.
+    const words = (q, id) => [...q.$(id).innerHTML.matchAll(/<span>(?:<i [^>]*><\/i>)?([^<]+)<\/span>/g)].map((m) => m[1]);
+    const swatches = (q, id) => [...q.$(id).innerHTML.matchAll(/background:(#[0-9a-f]+)/g)].map((m) => m[1]);
+    const bands = ["mph", "under 25", "25 to 44", "45 to 64", "65 to 79", "80 and up"];
+    const colors = ["#2fbf71", "#22b8cf", "#3d6ef5", "#e8b423", "#ef4444"];
+    const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const p = openPage(env, { hash: "trips" });
+    await p.settle();
+    // The legend explains the colors, so the subtitle names the trip.
+    const start = new Date((await api(env, "api/trips?limit=40")).trips[0].start_ts * 1000);
+    assert.equal(p.$("t-route-sub").textContent, `${day.format(start)}, ${time.format(start)}`);
+    assert.deepEqual(words(p, "t-legend"), [...bands, "Start", "End"]);
+    assert.deepEqual(swatches(p, "t-legend"), colors);
+    // Neutral markers: a dark dot with a white ring, then a white dot.
+    assert.deepEqual(p.tooltips, ["Start", "End"]);
+    assert.deepEqual(p.dots.map((o) => [o.color, o.fillColor]), [["#fff", "#0d0e11"], ["#0d0e11", "#fff"]]);
+    // History: the same key without start and end, and no markers on its routes.
+    const h = openPage(env, { hash: `history/${T0 - 600}-${T0 + 8000}` });
+    await h.settle();
+    assert.equal(h.$("h-map-sub").textContent, "3 drives with GPS");
+    assert.deepEqual(words(h, "h-legend"), bands);
+    assert.deepEqual([h.tooltips, h.dots], [[], []]);
+
+    // A drive in progress whose speed readings stop for ten seconds: its route has grey in it, and
+    // its newest point is no end yet.
+    const going = makeEnv();
+    await upload(going, drive({ n: 120 }).map((r, i) => (i >= 40 && i < 50 ? { ...r, speed_kph: null } : r)), T0 + 140);
+    setNow(T0 + 145);
+    const q = openPage(going, { hash: "trips" });
+    await q.settle();
+    assert.match(q.$("t-sub").textContent, / · in progress/);
+    assert.deepEqual(words(q, "t-legend"), [...bands, "no speed reading", "Start", "Latest position"]);
+    assert.deepEqual(swatches(q, "t-legend"), [...colors, "#8b8f9a"]);
+    assert.deepEqual(q.tooltips, ["Start", "Latest position"]);
+
+    // A period whose only GPS position is one point: a white dot and no key.
+    const one = makeEnv();
+    const fix = drive({ n: 60 })[30];
+    await upload(one, drive({ n: 60, gps: false }).map((r, i) => (i === 30 ? { ...r, lat: fix.lat, lon: fix.lon, sats: 9 } : r)), T0 + 100);
+    setNow(T0 + 4000);
+    const o = openPage(one, { hash: `history/${T0 - 600}-${T0 + 4000}` });
+    await o.settle();
+    assert.equal(o.$("h-mapbox").hidden, false);
+    assert.equal(o.$("h-legend").innerHTML, "");
+    assert.deepEqual(o.dots.map((d) => [d.color, d.fillColor]), [["#0d0e11", "#fff"]]);
+    assert.deepEqual([...p.errors, ...h.errors, ...q.errors, ...o.errors], []);
+  });
+
   check("trips: twelve tiles, the unlogged gap on a line of its own, and one note per line that applies", async () => {
     const env = makeEnv();
     await threeTrips(env, 126800);
@@ -912,6 +969,47 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("durations: a full hour is 1 h, an upload gap of days is in days, and an old upload or reading gives its date", async () => {
+    const env = makeEnv();
+    // Three uploads: one, an hour after it, and five days after that.
+    const day5 = 5 * 86400;
+    await upload(env, drive({ boot: 12, n: 60 }), T0 + 100);
+    await upload(env, drive({ boot: 13, n: 60, base: T0 + 3600 }), T0 + 3700);
+    await upload(env, drive({ boot: 14, n: 60, base: T0 + 3600 + day5 }), T0 + 3700 + day5);
+    const short = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+    const secs = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+    const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const last = new Date((T0 + 3700 + day5) * 1000);
+    const card = (q) => /Last upload<\/div><div class="val [^"]*">[^<]*<\/div><div class="delta">([^<]*)</.exec(q.$("g-health").innerHTML)?.[1];
+    setNow(T0 + 3760 + day5);
+    const p = openPage(env, { hash: "logs" });
+    await p.settle();
+    const gaps = [...p.$("g-uploads").innerHTML.matchAll(/<td class="num">([^<]*)<\/td><\/tr>/g)].map((m) => m[1]);
+    assert.deepEqual(gaps, ["5 d", "1 h", ""]);
+    // An upload from today gives the clock time alone.
+    assert.equal(card(p), secs.format(last));
+    // The readings span six days, from the first session to the newest.
+    assert.equal(p.$("g-raw-chip").textContent, `newest 180 · ${short.format(new Date((T0 + 20) * 1000))} to ${short.format(last)}`);
+    // The next day the upload is from yesterday, so it gives the day as well.
+    setNow(T0 + 3760 + day5 + 86400);
+    const q = openPage(env, { hash: "logs" });
+    await q.settle();
+    assert.equal(card(q), `${day.format(last)}, ${time.format(last)}`);
+
+    // Readings from one day name that day. History wraps the units of the engine time.
+    const one = makeEnv();
+    await parkedCar(one);
+    const r = openPage(one, { hash: "logs" });
+    await r.settle();
+    assert.equal(r.$("g-raw-chip").textContent, `newest 200 · ${short.format(new Date(T0 * 1000))}`);
+    const h = openPage(one, { hash: "history/24h" });
+    await h.settle();
+    assert.match(h.$("h-kpis").innerHTML, /Engine on<\/div><div class="val">\d+<small>min<\/small><\/div><div class="delta">\d+ min moving · \d+ (s|min) idle<\/div>/);
+    assert.match(h.$("h-daytable").innerHTML, /<td class="num">\d+ min<\/td>/);
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors, ...h.errors], []);
+  });
+
   check("live: the banner gives the age of the newest reading, not of the last upload", async () => {
     const env = makeEnv();
     // The newest reading is from T0 + 139. It was uploaded more than two minutes later.
@@ -1000,6 +1098,55 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...o.errors, ...l.errors], []);
   });
 
+  check("live: each gauge has its icon, and hot coolant is one number on the gauge and a labeled line on the charts", async () => {
+    const env = makeEnv();
+    // The coolant climbs from 90 to about 114 °C (237 °F).
+    await upload(env, drive({ n: 120 }).map((r, i) => ({ ...r, coolant_c: 90 + i * 0.2 })), T0 + 140);
+    setNow(T0 + 145);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    assert.equal(p.header(), "Engine running · updated just now");
+    const g = p.$("l-gauges").innerHTML;
+    const icons = [...g.matchAll(/<use href="#([^"]+)"\/><\/svg><\/span>([^<]+)<\/div>/g)].map((m) => `${m[2]} ${m[1]}`);
+    assert.deepEqual(icons, ["Speed i-gauge", "Engine speed i-pulse", "Throttle i-pulse", "Coolant i-temp", "Instant MPG i-drop",
+      "Airflow i-pulse", "Battery i-batt", "Intake air i-temp", "Fuel i-fuel", "Cell signal i-signal"]);
+    assert.match(g, /Coolant<\/div>\s*<div class="val">237<small>°F<\/small><\/div><div class="delta"><span class="down">Hot<\/span>/);
+    // The height of the line and of its label in a coolant chart.
+    const ref = (id, q) => {
+      const svg = q.$(id).innerHTML;
+      const line = /<line x1="[^"]+" x2="[^"]+" y1="([\d.]+)" y2="[\d.]+" stroke="#ef4444"/.exec(svg);
+      const text = /<text x="[\d.]+" y="([\d.]+)" text-anchor="end" style="fill:#ef4444">Hot 230 °F<\/text>/.exec(svg);
+      assert.ok(line && text, `${id}: no labeled line at 230 °F`);
+      return [+line[1], +text[1]];
+    };
+    // Well below the top of the chart, so the label sits above the line.
+    let [line, text] = ref("l-cool", p);
+    assert.ok(line > 14 && text < line, `${line} ${text}`);
+    p.nav("trips");
+    await p.settle();
+    [line, text] = ref("t-cool", p);
+    assert.ok(line > 14 && text < line, `${line} ${text}`);
+    // A drive that peaks just under 230 °F: the line runs close to the top, and the label goes below it.
+    const near = makeEnv();
+    await upload(near, drive({ n: 120 }).map((r, i) => ({ ...r, coolant_c: 90 + i * 0.16 })), T0 + 140);
+    const n = openPage(near, { hash: "trips" });
+    await n.settle();
+    [line, text] = ref("t-cool", n);
+    assert.ok(line < 14 && text > line, `${line} ${text}`);
+    // A drive that stays well below it draws neither the line nor the label.
+    const cool = makeEnv();
+    await threeTrips(cool, 126800);
+    const q = openPage(cool, { hash: "trips" });
+    await q.settle();
+    assert.doesNotMatch(q.$("t-cool").innerHTML, /Hot|#ef4444/);
+    // One color per quantity on the cards: the battery is pink and speed is blue, as in the charts.
+    assert.match(html, /<svg style="color:var\(--pink\)"><use href="#i-batt"\/><\/svg><\/span>Battery<\/div>/);
+    q.nav("history");
+    await q.settle();
+    assert.match(q.$("h-kpis").innerHTML, /<svg style="color:var\(--blue\)"><use href="#i-gauge"\/><\/svg><\/span>Top speed<\/div>/);
+    assert.deepEqual([...p.errors, ...n.errors, ...q.errors], []);
+  });
+
   check("live: speed, RPM, throttle and airflow come only from the running session and its last 10 s", async () => {
     const env = makeEnv();
     await parkedCar(env);
@@ -1083,6 +1230,35 @@ async function behavior() {
     // button until there is a position.
     assert.match(html, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
     assert.match(html, /<a class="btn" id="o-maps"[^>]* hidden>/);
+  });
+
+  check("shell: a strip under the status bar, side insets, 44 px controls on touch screens and a dark scheme", async () => {
+    const style = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
+    const root = style.slice(style.indexOf(":root {"), style.indexOf("\n  }", style.indexOf(":root {")));
+    assert.match(root, /color-scheme: dark;/);
+    assert.equal((style.match(/color-scheme/g) ?? []).length, 1, "color-scheme is set once, on :root");
+    assert.match(style, /body::before \{[^}]*position: fixed;[^}]*height: env\(safe-area-inset-top, 0px\);[^}]*background: var\(--bg\);/);
+    assert.match(style, /\.app \{[^}]*grid-template-columns: calc\(232px \+ env\(safe-area-inset-left, 0px\)\) 1fr;/);
+    assert.match(style, /:focus-visible \{ outline: 2px solid #8fb0ff;/);
+    // The touch block uses the same test as TOUCH in the script.
+    const query = /matchMedia\("([^"]+)"\)/.exec(html)[1];
+    const at = style.indexOf(`@media ${query} {`);
+    assert.ok(at > 0, `no CSS block for ${query}`);
+    const touch = style.slice(at, style.indexOf("\n  }", at));
+    assert.match(touch, /\.btn, \.seg button, \.custom input \{ min-height: 44px; \}/);
+    assert.match(touch, /\.leaflet-touch \.leaflet-bar a \{ width: 44px; height: 44px; line-height: 44px; \}/);
+    assert.match(touch, /\.custom input \{ font-size: 16px; \}/);
+  });
+
+  check("scroll boxes: Recent trips never scrolls inside its card, and Logs ends with the raw readings", async () => {
+    // The page text from `from` up to the first `to` after it.
+    const part = (from, to) => { const a = html.indexOf(from); return a < 0 ? "" : html.slice(a, html.indexOf(to, a)); };
+    // At every width, so outside any media query.
+    assert.match(part("/* ---------- trips ---------- */", "/* ---------- live ---------- */"), /\n  #o-trips \{ max-height: none; \}/);
+    assert.match(part("@media (max-width: 820px) {\n", "\n  }"), /\.tablewrap \{ max-height: min\(320px, 55vh\); \}/);
+    const logs = part('<section class="view" id="v-logs">', "</section>");
+    const order = ["g-health", "g-uploads", "g-boots", "g-raw"].map((id) => logs.indexOf(`id="${id}"`));
+    assert.ok(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), `Logs order ${order}`);
   });
 
   check("live: a watched drive is not paused by a long gap in the uploads", async () => {
@@ -1484,6 +1660,45 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("charts: a redraw cancels the touch hold of the chart before, and a scroll that starts on a chart clears its value at once", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const p = openPage(env, { hash: `history/${T0 - 600}-${T0 + 8000}`, width: 390, touch: true });
+    await p.settle();
+    // A pointer event from the browser to the chart that is drawn in `id` now.
+    const send = (id, ev, e = {}) => p.$(id).querySelector("svg").handlers[ev]({ clientX: 200, pointerType: "touch", ...e });
+    // The value stays up for 2.5 s after a finger lifts.
+    const holds = () => p.polls().filter((t) => t.ms === 2500);
+    const speed = p.$("h-readout").innerHTML;
+    assert.match(speed, / mph$/);
+    send("h-chart", "pointerdown");
+    assert.notEqual(p.$("h-readout").innerHTML, speed);
+    send("h-chart", "pointerleave");
+    assert.equal(holds().length, 1);
+    // Within those 2.5 s the RPM button draws a new chart. The hold of the Speed chart goes with
+    // it, so it cannot put the Speed summary into the RPM readout later.
+    p.groups["#h-metrics button"].find((b) => b.dataset.m === "rpm").onclick();
+    const rpm = p.$("h-readout").innerHTML;
+    assert.match(rpm, / rpm$/);
+    assert.deepEqual(holds(), []);
+    // A scroll that starts on the chart: the browser cancels the pointer, and the value goes at once.
+    send("h-chart", "pointerdown");
+    assert.notEqual(p.$("h-readout").innerHTML, rpm);
+    send("h-chart", "pointercancel");
+    assert.equal(p.$("h-readout").innerHTML, rpm);
+    send("h-chart", "pointerleave");
+    assert.deepEqual(holds(), []);
+    // The bars of By day: a lifted finger keeps the value up, a mouse that leaves clears it, and so does a scroll.
+    send("h-days", "pointerleave");
+    assert.equal(holds().length, 1);
+    send("h-days", "pointerleave", { pointerType: "mouse" });
+    assert.deepEqual(holds(), []);
+    send("h-days", "pointercancel");
+    send("h-days", "pointerleave");
+    assert.deepEqual(holds(), []);
+    assert.deepEqual(p.errors, []);
+  });
+
   check("charts: date labels under the bars are thinned on a narrow chart", async () => {
     const env = makeEnv();
     // Twelve short trips, one a day.
@@ -1633,6 +1848,11 @@ async function behavior() {
       }
       // On a touch screen each map says how to move it.
       assert.deepEqual(p.$("o-map").next.map((e) => e.textContent), touch ? ["Use two fingers to move the map."] : []);
+      // The wheel scrolls the page. With a mouse, a click on a map turns its wheel zoom on and
+      // leaving the map turns it off.
+      assert.equal(p.made.length, 3);
+      assert.ok(p.made.every((o) => o.scrollWheelZoom === false), JSON.stringify(p.made));
+      assert.equal(p.calls.filter((k) => k === "on").length, touch ? 0 : 6);
       assert.deepEqual(p.errors, []);
     }
   });
