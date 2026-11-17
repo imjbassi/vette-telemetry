@@ -479,6 +479,31 @@ async function behavior() {
     assert.deepEqual([typeof solid.totals.mpg, solid.totals.mpg_few_miles], ["number", false]);
   });
 
+  check("history: the odometer distance adds the gap before a trip across the end and what it logged inside the window", async () => {
+    const env = makeEnv();
+    // A short trip, then an hour later a 10-minute one with the odometer 15 km ahead.
+    const first = drive({ boot: 12, n: 60 });
+    const second = drive({ boot: 13, n: 600, base: T0 + 3600, odo0: Math.round(first.at(-1).odo_km * 10) + 150 });
+    await upload(env, first, T0 + 100);
+    await upload(env, second, T0 + 4300);
+    setNow(T0 + 4300);
+    // The window ends on a minute boundary five minutes into the second trip, so the minute rows
+    // split there: its readings up to `to` are inside.
+    const to = T0 + 3899;
+    const h = await api(env, `api/history?from=${T0 - 600}&to=${to}`);
+    const km = (rs) => rs.slice(1).reduce((a, r) => a + r.speed_kph / 3600, 0);
+    const inside = km(second.filter((r) => r.epoch <= to));
+    const r1 = (x) => Math.round(x * 10) / 10;
+    // From the first reading of the first trip to the first of the second, gap included, plus
+    // the miles the second logged before the end of the window.
+    assert.equal(h.totals.odometer_mi, r1((second[0].odo_km - first[0].odo_km + inside) * 0.621371));
+    // So it is about the 9.3 mi of the gap ahead of the logged miles.
+    assert.ok(h.totals.odometer_mi - h.totals.miles > 9, `${h.totals.odometer_mi} mi by odometer, ${h.totals.miles} logged`);
+    // A window that ends before the second trip holds the first one whole: its odometer alone.
+    const before = await api(env, `api/history?from=${T0 - 600}&to=${T0 + 3000}`);
+    assert.equal(before.totals.odometer_mi, r1((first.at(-1).odo_km - first[0].odo_km) * 0.621371));
+  });
+
   check("trip: unlogged_known says the same inside the trip and beside it", async () => {
     const env = makeEnv();
     await threeTrips(env, 126800);

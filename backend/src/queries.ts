@@ -365,6 +365,10 @@ const ENGINE_VALUES = [["rpm", "last_rpm"], ["speed_kph", "last_speed_mph"], ["c
 const ENGINE_VALUE_STALE_S = 120;
 // An odometer reading this much older than the newest record says how old it is.
 const ODOMETER_LAG_S = 600;
+// A car parked in a garage loses the fix minutes before the engine stops, so a fix up to this
+// much older than the newest record still shows where a parked car stands. The same rule as
+// PARKED_FIX_LAG_S in dash.html.
+const PARKED_FIX_LAG_S = 600;
 
 export async function latestStatus(env: Env, now = nowS()) {
   const L = await getLatest(env);
@@ -450,14 +454,19 @@ export async function location(env: Env, now = nowS()) {
   // `latest` keeps the last fix for good. Records after it that had no fix (no view of the sky,
   // or a power-up that never got one) make it older than the last report by this much.
   const lag = L.engine_on ? L.engine_on.ts - L.lat.ts : 0;
+  // A fix from an earlier power-up, or one far behind the newest record, may be from before the
+  // car last moved. The page shows it as Last fix, never as Parked here.
+  const fixBehind = !!L.engine_on && (L.lat.boot !== L.engine_on.boot || lag > PARKED_FIX_LAG_S);
+  const parked = cs.state === "parked";
   return {
     lat: L.lat.v, lon: L.lon.v, satellites: L.sats?.v ?? null,
     map: mapsLink(L.lat.v, L.lon.v),
     as_of: fmtTime(env, L.lat.ts), age: ago(L.lat.ts, now),
     fix_before_last_report_min: lag > 60 ? r1(lag / 60) : null,
     // Null when it is not known whether the car stands there: the adapter link is down, stored
-    // records are still uploading, or the newest record had the engine on and nothing came after.
-    parked: cs.link_down || cs.ended_mid_drive ? null : cs.state === "parked",
+    // records are still uploading, the newest record had the engine on and nothing came after,
+    // or the car is parked and the fix is behind (see fixBehind).
+    parked: cs.link_down || cs.ended_mid_drive || (parked && fixBehind) ? null : parked,
     car_state: describeState(env, cs, L, now),
   };
 }
@@ -528,9 +537,14 @@ export function tripNumbers(t: TripAgg): TripNums {
 
 // Below this logged distance a trip gets a GPS figure, if its route says it moved.
 export const GPS_FALLBACK_BELOW_MI = 0.1;
-// A trip moved when its speed readings logged that much, or when its route gave a GPS distance
-// because they failed. Anything else was an idle session: a start without driving.
-export const tripMoved = (n: Pick<TripNums, "miles" | "gps_miles">) => n.miles >= GPS_FALLBACK_BELOW_MI || n.gps_miles != null;
+// Odometer distance from which a trip moved when neither speed nor GPS gave a distance. That is
+// three of the odometer's 0.1 km steps, so a car moved a few metres still counts as idle.
+export const ODO_MOVED_MI = 0.2;
+// A trip moved when its speed readings logged GPS_FALLBACK_BELOW_MI, when its route gave a GPS
+// distance because they failed, or when its odometer moved ODO_MOVED_MI because both failed.
+// Anything else was an idle session: a start without driving.
+export const tripMoved = (n: Pick<TripNums, "miles" | "gps_miles" | "odo_miles">) =>
+  n.miles >= GPS_FALLBACK_BELOW_MI || n.gps_miles != null || (n.odo_miles ?? 0) >= ODO_MOVED_MI;
 // Steps between route points (15 s apart) that count as driving: slower is GPS drift while
 // standing, faster or longer apart is a jump or a gap that says nothing about the path.
 const GPS_MIN_MPS = 2, GPS_MAX_MPS = 70, GPS_MAX_GAP_MS = 60000;
@@ -620,11 +634,41 @@ export function unloggedAtLeast(trips: TripNums[]): number | null {
 // How far the odometer moved over a set of trips: from the first reading to the last, in time
 // order, so driving the logger missed between them counts too. Null when either end is missing,
 // or when it went backwards.
-export function odometerSpanMiles(aggs: Pick<TripAgg, "start_ts" | "odo_start" | "odo_end">[]): number | null {
+function odometerSpanKm(aggs: Pick<TripAgg, "start_ts" | "odo_start" | "odo_end">[]): number | null {
   const byTime = [...aggs].sort((a, b) => a.start_ts - b.start_ts);
   const first = byTime.find((t) => t.odo_start != null)?.odo_start;
   const last = byTime.reverse().find((t) => t.odo_end != null)?.odo_end;
-  return first == null || last == null || last < first ? null : r1((last - first) * KM_TO_MI);
+  return first == null || last == null || last < first ? null : last - first;
+}
+
+// The same in miles, one decimal.
+export function odometerSpanMiles(aggs: Pick<TripAgg, "start_ts" | "odo_start" | "odo_end">[]): number | null {
+  const km = odometerSpanKm(aggs);
+  return km == null ? null : r1(km * KM_TO_MI);
+}
+
+// How far the car went in a window, in miles, for get_history and the dashboard's History. The
+// odometer runs from the first reading of the trips that began in the window to the last reading
+// inside it. A trip that runs past the end of the window counts with its first reading only, so
+// the gap before it is in. To that come the miles logged inside the window outside that stretch:
+// `loggedKm`, all that was logged inside it, less what the trips inside the stretch logged. That
+// is what trips across the start or the end logged inside the window, and what trips without
+// odometer readings logged before the first reading or after the last. The gap before the first
+// trip that began in the window is left out, because it may have been driven before the window.
+// `last` is the last second of the window. Null when no trip that began in the window has an
+// odometer reading.
+export function windowOdometerMiles(
+  touching: Pick<TripAgg, "start_ts" | "end_ts" | "km" | "odo_start" | "odo_end">[], from: number, last: number, loggedKm: number,
+): number | null {
+  const began = touching.filter((t) => t.start_ts >= from && t.start_ts <= last)
+    .map((t) => (t.end_ts <= last ? t : { ...t, odo_end: t.odo_start }));
+  const span = odometerSpanKm(began);
+  if (span == null) return null;
+  const firstTs = Math.min(...began.filter((t) => t.odo_start != null).map((t) => t.start_ts));
+  const lastTs = Math.max(...began.filter((t) => t.odo_end != null).map((t) => t.start_ts));
+  const stretch = began.filter((t) => t.end_ts <= last && t.start_ts >= firstTs && t.start_ts <= lastTs);
+  const otherKm = Math.max(0, loggedKm - stretch.reduce((a, t) => a + (t.km ?? 0), 0));
+  return r1((span + otherKm) * KM_TO_MI);
 }
 
 // All trip reads go through the `trips` rollup (one row per session, maintained on upload),
@@ -730,7 +774,8 @@ function shapeTrip(env: Env, n: TripNums, live: number | null, cut: number | nul
     ...(n.gps_miles != null ? { gps_distance_mi: n.gps_miles, distance_note: "Speed readings failed on this trip, so distance_mi is near 0. gps_distance_mi is measured along the GPS route and reads a little short on curves." } : {}),
     odometer_distance_mi: n.odo_miles,
     unlogged_before_mi: n.unlogged_before_mi,
-    fuel_used_gal_est: n.gallons,
+    // Null when no airflow readings came through, so such a drive does not read as 0 gal.
+    fuel_used_gal_est: n.gallons > 0 ? n.gallons : null,
     mpg_est: n.mpg,
     avg_moving_speed_mph: n.avg_mph,
     max_speed_mph: n.max_mph,
@@ -836,6 +881,22 @@ export async function tripSummary(env: Env, a: { trip_id?: unknown; include_loca
   ]);
   const n: TripNums = { ...g, unlogged_before_mi: unloggedMiles(prev, agg) };
   const cut = cutOffBoot(L, now);
+  // Only the sentences that apply to this trip, like the trip notes on the dashboard.
+  const notes = [
+    n.id === cut
+      ? "The logger stopped sending while the engine was still on. End time, distance and fuel cover only what arrived. " +
+        "The rest may come in after the next start."
+      : null,
+    n.gallons > 0
+      ? "Fuel used and MPG are estimates from engine airflow (MAF), assuming E10 pump gasoline. They read low at full " +
+        "throttle and high while coasting."
+      : "There are no fuel or MPG figures, no airflow readings came through.",
+    f0 != null || f1 != null
+      ? "fuel_level_pct is the tank gauge in whole percent. It swings by several points while driving, so the difference " +
+        "between start and end is not fuel used."
+      : null,
+    n.gps_miles == null && n.miles > 0 ? "distance_mi is integrated from speed and usually reads about 1% under the odometer." : null,
+  ];
   return {
     ...shapeTrip(env, n, liveBoot(L, now), cut),
     fuel_level_pct: { start: f0, end: f1 },
@@ -853,14 +914,7 @@ export async function tripSummary(env: Env, a: { trip_id?: unknown; include_loca
         ...(s.id === cut ? { end_not_received: true } : {}),
       })),
     } : {}),
-    note: (n.id === cut
-      ? "The logger stopped sending while the engine was still on. End time, distance and fuel cover only what arrived. " +
-        "The rest may come in after the next start. "
-      : "") +
-      "Fuel used and MPG are estimates from engine airflow (MAF), assuming E10 pump gasoline. They read low at full " +
-      "throttle and high while coasting. fuel_level_pct is the tank gauge in whole percent. It swings by several points " +
-      "while driving, so the difference between start and end is not fuel used. distance_mi is integrated from " +
-      "speed and usually reads about 1% under the odometer.",
+    note: notes.filter((s) => s != null).join(" "),
   };
 }
 
@@ -875,6 +929,9 @@ export async function fuelEconomy(env: Env, days: number, now = nowS()) {
   // A short window is a fair question, so the figure stays. The flag keeps it from being
   // read as a solid average, which the dashboard only shows from the same minimum on.
   const fewMiles = combined != null && !enoughMpgMiles(miles);
+  // Only the listed trips are looked at for a GPS distance. The totals stay logged miles, the
+  // base of the MPG.
+  const listed = await withGpsMiles(env, list.slice(0, 20));
   return {
     window_days: days,
     trip_count: list.length,
@@ -886,11 +943,18 @@ export async function fuelEconomy(env: Env, days: number, now = nowS()) {
     best_trip_mpg_est: ranked.length ? Math.max(...ranked) : null,
     worst_trip_mpg_est: ranked.length ? Math.min(...ranked) : null,
     // Only the trips that are listed get their time formatted.
-    trips: list.slice(0, 20).map((t) => ({
-      trip_id: t.id, label: tripLabel(t.id), start: fmtTime(env, t.start_ts), distance_mi: t.miles, mpg_est: t.mpg,
+    trips: listed.map((t) => ({
+      trip_id: t.id, label: tripLabel(t.id), start: fmtTime(env, t.start_ts), distance_mi: t.miles,
+      ...(t.gps_miles != null ? { gps_distance_mi: t.gps_miles } : {}),
+      mpg_est: t.mpg,
     })),
-    note: `Gallons and MPG are estimates from engine airflow (MAF), not from fill-ups. Best and worst only count trips of ${RANKED_TRIP_MIN_MILES} miles or more. ` +
+    note: "total_miles is the miles logged from speed readings, the base of combined_mpg_est, not the distance driven. " +
+      "For that use get_history. " +
+      `Gallons and MPG are estimates from engine airflow (MAF), not from fill-ups. Best and worst only count trips of ${RANKED_TRIP_MIN_MILES} miles or more. ` +
       "The trips list holds the 20 newest." +
+      (listed.some((t) => t.gps_miles != null)
+        ? " A trip row with gps_distance_mi had failed speed readings, so its distance_mi is near 0."
+        : "") +
       (fewMiles
         ? ` combined_mpg_est rests on fewer than ${MPG30_MIN_MILES} logged miles, so it is rough and not a solid average. ` +
           `Below ${MPG30_MIN_MILES} miles the dashboard marks its figure as rough too.`
@@ -947,8 +1011,8 @@ export async function history(
   const startedInside = nums.filter((n) => n.start_ts >= w.start && n.start_ts < w.end);
   const distance = r1(miles) ?? 0;
   const mpg = gal > 0.05 ? r1(miles / gal) : null;
-  // Only trips wholly inside the window, so the span holds no driving from outside it.
-  const odometer = odometerSpanMiles(touching.filter((t) => t.start_ts >= w.start && t.end_ts < w.end));
+  // How far the car went inside the window, with no driving from outside it (see windowOdometerMiles).
+  const odometer = windowOdometerMiles(touching, w.start, w.end - 1, sum("km"));
   // Null when no trip in the window has odometer readings, or when the gap before one of them
   // is not known, so "none found" and "unknown" differ.
   const unlogged = touching.some((t) => t.odo_start != null) ? unloggedTotal(startedInside) : null;
@@ -1001,17 +1065,20 @@ export async function history(
       engine_on_min: r1(n.engine_s / 60),
       distance_mi: n.miles,
       ...(n.gps_miles != null ? { gps_distance_mi: n.gps_miles } : {}),
-      fuel_used_gal_est: n.gallons,
+      // The same rule as in list_trips: null when no airflow readings came through.
+      fuel_used_gal_est: n.gallons > 0 ? n.gallons : null,
       mpg_est: n.mpg,
       unlogged_before_mi: n.unlogged_before_mi,
     })),
     trips_not_listed: Math.max(0, nums.length - HISTORY_MAX_TRIPS),
-    note: "Totals and days count only what happened inside the window. Trips are listed whole, newest first, so a trip that " +
-      "crosses the edge of the window or midnight can show more miles than its day. Fuel and MPG are estimates from engine " +
-      "airflow. Days without driving are left out. unlogged_mi is odometer distance the logger did not record, " +
-      "null when that is not known." +
+    note: "Totals and days count only what happened inside the window, except unlogged_mi. Trips are listed whole, newest " +
+      "first, so a trip that crosses the edge of the window or midnight can show more miles than its day. Fuel and MPG are " +
+      "estimates from engine airflow. Days without driving are left out. unlogged_mi is odometer distance the logger did " +
+      "not record before the trips that began in the window, null when that is not known. It includes the gap before the " +
+      "first of them, which may have been driven before the window and is not part of odometer_distance_mi, so give it " +
+      "apart with the trip it came before." +
       (odometer != null && odometer - distance > Math.max(1, distance * 0.05)
-        ? ` The odometer moved ${odometer} mi between the first and last readings in this window. ${distance} mi of that ` +
+        ? ` By the odometer the car went ${odometer} mi in this window. ${distance} mi of that ` +
           "were logged from speed readings, the rest was missed by the logger or only measured by GPS."
         : "") +
       (listed.some((n) => n.gps_miles != null)

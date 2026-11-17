@@ -527,6 +527,9 @@ test("tools/list: descriptions promise no more than the code does", async () => 
   assert.doesNotMatch(tool("get_fuel_economy").description, /few percent/);
   assert.match(tool("get_fuel_economy").description, /not been checked against a fill-up/);
   assert.match(tool("get_fuel_economy").description, /combined_mpg_few_miles \(true when that figure rests on fewer than 25 logged miles/);
+  // Its miles are the base of the MPG, not the distance driven.
+  assert.match(tool("get_fuel_economy").description,
+    /total_miles \(miles logged from speed readings, the base of combined_mpg_est, not the distance driven, for that use get_history\)/);
   // yesterday and last_month end before today.
   assert.doesNotMatch(tool("get_history").inputSchema.properties.period.description, /ending today/);
   assert.match(tool("get_history").description, /data_starts/);
@@ -537,10 +540,21 @@ test("tools/list: descriptions promise no more than the code does", async () => 
   for (const name of ["get_trip_summary", "list_trips"]) assert.match(tool(name).description, /label/, name);
   // A status question must not lead to a location call.
   assert.match(tool("get_location").description, /only when the user asks/);
+  // parked is called not known in the same cases as the page's Last fix.
+  assert.match(tool("get_location").description, /a drive whose end has not arrived, or a fix from an earlier power-up or more than 10 minutes before the last report\)/);
   assert.match(tool("get_latest_status").description, /Returns no position\.$/);
   assert.doesNotMatch(tool("get_latest_status").description, /get_location/);
   // What a trip is reaches clients that never show the instructions.
   assert.match(tool("list_trips").description, /an engine start without driving is listed too/);
+  // A drive without airflow readings has no fuel figure, not 0 gal.
+  for (const name of ["get_trip_summary", "list_trips"]) {
+    assert.match(tool(name).description, /fuel_used_gal_est and mpg_est \(estimates from engine airflow, not from fill-ups, null when no airflow readings came through\)/, name);
+  }
+  assert.match(tool("get_history").description, /A trip row's fuel_used_gal_est is null when no airflow readings came through\./);
+  // get_history says what its odometer figures are, and that unlogged_mi can reach before the window.
+  assert.match(tool("get_history").description, /odometer_distance_mi is how far the car went in the window: the odometer from the first reading of the trips that began in the window to the last reading inside it, plus the miles logged inside the window outside that stretch, such as by trips across its start or end\. It is null when no trip that began in the window has odometer readings\./);
+  assert.match(tool("get_history").description, /count only what happened inside the window, except unlogged_mi,/);
+  assert.match(tool("get_history").description, /unlogged_mi is odometer distance the logger did not record before the trips that began in the window, null when that is not known\. It includes the gap before the first of them, which may have been driven before the window and is not part of odometer_distance_mi, so give it apart with the trip it came before\./);
 });
 
 test("tools/list: every field the answers carry is named in the description", async () => {
@@ -553,7 +567,7 @@ test("tools/list: every field the answers carry is named in the description", as
     get_location: ["fix_before_last_report_min", "parked"],
     get_trip_summary: ["newer_sessions_without_driving", "end_not_received", "times_estimated", "gps_distance_mi", "in_progress"],
     list_trips: ["end_not_received", "times_estimated", "gps_distance_mi", "more_trips_exist"],
-    get_fuel_economy: ["combined_mpg_few_miles", "get_history"],
+    get_fuel_economy: ["total_miles", "combined_mpg_few_miles", "gps_distance_mi", "get_history"],
     get_history: ["odometer_distance_mi", "unlogged_mi_at_least", "mpg_est_few_miles", "gps_distance_mi", "get_fuel_economy"],
   };
   for (const [name, words] of Object.entries(fields)) {
@@ -716,7 +730,7 @@ test("get_history: local days across the 25-hour day", async () => {
     trip_count: 4, unlogged_mi: 20,
   });
   // The odometer moved 20 mi more than was logged, and the note says so.
-  assert.match(h.note, /The odometer moved 195 mi between the first and last readings in this window\. 175 mi of that were logged from speed readings/);
+  assert.match(h.note, /By the odometer the car went 195 mi in this window\. 175 mi of that were logged from speed readings/);
   assert.doesNotMatch(h.note, /gps_distance_mi/);
   assert.deepEqual(h.trips.map((t) => [t.trip_id, t.distance_mi, t.unlogged_before_mi]), [[12, 45, 20], [11, 60, null], [10, 30, null], [9, 40, null]]);
   assert.deepEqual(Object.keys(h.trips[0]),
@@ -850,6 +864,13 @@ test("get_history: unlogged_mi is null when a gap in the window is not known", a
   addSession(full, { boot: 62, start: utc(2026, 11, 12, 20), minutes: 10, odo: [1100, 1116] });
   assert.equal((await history(full, win, now)).totals.unlogged_mi, 42.3); // 68 km
   assert.equal((await history(full, { from: "2026-11-10", to: "2026-11-11" }, now)).totals.unlogged_mi, 0);
+  // The day of trip 62 alone. The 42.3 mi before it are in unlogged_mi, but they may have been
+  // driven on an earlier day, so the odometer distance starts at trip 62. The note says so.
+  const day62 = await history(full, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([day62.totals.distance_mi, day62.totals.odometer_distance_mi, day62.totals.unlogged_mi], [10, 9.9, 42.3]);
+  assert.match(day62.note, /^Totals and days count only what happened inside the window, except unlogged_mi\. /);
+  assert.match(day62.note, /unlogged_mi is odometer distance the logger did not record before the trips that began in the window, null when that is not known\. It includes the gap before the first of them, which may have been driven before the window and is not part of odometer_distance_mi, so give it apart with the trip it came before\./);
+  assert.doesNotMatch(day62.note, /By the odometer/);
 });
 
 test("get_history through the MCP endpoint", async () => {
@@ -965,11 +986,32 @@ test("list_trips and get_trip_summary mark a trip whose end has not arrived", as
   assert.equal(h.trips.some((t) => "end_not_received" in t), false);
 });
 
-test("tripMoved: logged distance from 0.1 mi, or a GPS distance", () => {
-  assert.equal(tripMoved({ miles: 0.1, gps_miles: null }), true);
-  assert.equal(tripMoved({ miles: 0.09, gps_miles: null }), false);
-  assert.equal(tripMoved({ miles: 0, gps_miles: null }), false);
-  assert.equal(tripMoved({ miles: 0, gps_miles: 7.5 }), true);
+test("tripMoved: logged distance from 0.1 mi, a GPS distance, or 0.2 mi on the odometer", () => {
+  assert.equal(tripMoved({ miles: 0.1, gps_miles: null, odo_miles: null }), true);
+  assert.equal(tripMoved({ miles: 0.09, gps_miles: null, odo_miles: null }), false);
+  assert.equal(tripMoved({ miles: 0, gps_miles: null, odo_miles: null }), false);
+  assert.equal(tripMoved({ miles: 0, gps_miles: 7.5, odo_miles: null }), true);
+  // Speed and GPS both failed, but the odometer moved. Three of its 0.1 km steps read 0.2 mi,
+  // two read 0.1 mi: a car moved a few metres is still idle.
+  assert.equal(tripMoved({ miles: 0, gps_miles: null, odo_miles: 2.3 }), true);
+  assert.equal(tripMoved({ miles: 0, gps_miles: null, odo_miles: 0.2 }), true);
+  assert.equal(tripMoved({ miles: 0, gps_miles: null, odo_miles: 0.1 }), false);
+  assert.equal(tripMoved({ miles: 0, gps_miles: null, odo_miles: 0 }), false);
+});
+
+test("get_trip_summary: a drive whose speed and GPS both failed moved by the odometer, so the default does not skip it", async () => {
+  const e = makeEnv();
+  const start = utc(2026, 11, 12, 16);
+  // No speed readings and no route, but the odometer moved 3.7 km (2.3 mi).
+  addSession(e, { boot: 13, start, minutes: 12, odo: [1000, 1003.7] });
+  e.DB.sqlite.prepare("UPDATE trips SET km = 0 WHERE boot = 13").run();
+  // Then a start that moved the car two odometer steps: idle.
+  addSession(e, { boot: 14, start: start + 3600, minutes: 2, idle: true, odo: [1003.7, 1003.9] });
+  const t = await tripSummary(e, {}, start + 7200);
+  assert.deepEqual([t.trip_id, t.distance_mi, t.odometer_distance_mi, "gps_distance_mi" in t], [13, 0, 2.3, false]);
+  assert.deepEqual(t.newer_sessions_without_driving.map((s) => [s.trip_id, s.engine_on_min]), [[14, 2]]);
+  // Its note does not say distance_mi was integrated from speed. Nothing was.
+  assert.doesNotMatch(t.note, /distance_mi/);
 });
 
 test("get_trip_summary: by default the newest trip that moved, or the one in progress", async () => {
@@ -989,6 +1031,8 @@ test("get_trip_summary: by default the newest trip that moved, or the one in pro
   // Asked for by id, the idle session is a trip like any other.
   const idle = await tripSummary(e, { trip_id: 16 }, now);
   assert.deepEqual([idle.trip_id, idle.distance_mi, idle.engine_on_min, "newer_sessions_without_driving" in idle], [16, 0, 2, false]);
+  // Nothing was integrated from speed, so the note does not explain distance_mi.
+  assert.doesNotMatch(idle.note, /distance_mi/);
 
   // While it runs it is the default, moved or not.
   const running = utc(2026, 11, 4, 0, 1, 50);
@@ -1093,6 +1137,9 @@ test("get_trip_summary: field names, odometer, and locations only on request", a
   assert.deepEqual([noFix.start_location, noFix.end_location], [null, null]);
   assert.equal("records_without_adapter_link" in noFix, false);
   assert.deepEqual(noFix.fuel_level_pct, { start: null, end: null }); // no minute of trip 13 has a reading
+  // Without a gauge reading the note does not explain the gauge. The rest still applies.
+  assert.doesNotMatch(noFix.note, /fuel_level_pct/);
+  assert.match(noFix.note, /^Fuel used and MPG are estimates from engine airflow.* distance_mi is integrated from speed/);
 
   // No id means the newest trip. An id sent as a string works too.
   assert.equal((await tripSummary(e, {}, now)).trip_id, 15);
@@ -1477,7 +1524,29 @@ test("get_location: a fix older than the last report says by how much", async ()
   for (const k of ["lat", "lon", "sats"]) earlier[k] = { ...earlier[k], ts: now - 5 - 2 * 86400, boot: 12, ms: 2000 };
   setLatest(e, earlier);
   const old = await location(e, now);
-  assert.deepEqual([old.age, old.fix_before_last_report_min], ["2 days ago", 2880]);
+  // The engine runs, so the car is not parked, wherever it is.
+  assert.deepEqual([old.age, old.fix_before_last_report_min, old.parked], ["2 days ago", 2880, false]);
+  // Parked after that power-up, the car may stand somewhere else, so parked is not known. The
+  // page shows the same fix as Last fix, from an earlier power-up.
+  earlier.engine_on = { ...earlier.engine_on, v: 0 };
+  setLatest(e, earlier);
+  const away = await location(e, now);
+  assert.deepEqual([away.car_state.state, away.parked], ["parked", null]);
+  // The same after a quick restart without a fix: only 5 minutes behind, but from the power-up before.
+  const restart = drivingLatest(now, 13, { engine_on: 0, rpm: 0 });
+  for (const k of ["lat", "lon", "sats"]) restart[k] = { ...restart[k], ts: now - 305, boot: 12, ms: 900000 };
+  setLatest(e, restart);
+  const moved = await location(e, now);
+  assert.deepEqual([moved.fix_before_last_report_min, moved.parked], [5, null]);
+  // Parked in the same session, a fix up to 10 minutes behind the newest record still says where
+  // the car stands, because a garage blocks the fix before the engine stops. One second more does not.
+  for (const [behind, parked] of [[600, true], [601, null]]) {
+    const garage = drivingLatest(now, 13, { engine_on: 0, rpm: 0 });
+    for (const k of ["lat", "lon", "sats"]) garage[k] = { ...garage[k], ts: now - 5 - behind, ms: 0 };
+    setLatest(e, garage);
+    const l = await location(e, now);
+    assert.deepEqual([l.car_state.state, l.parked], ["parked", parked], `fix ${behind} s behind`);
+  }
 });
 
 // ------------------------------------------------------------ distance from GPS
@@ -1538,6 +1607,43 @@ test("get_trip_summary: a drive whose speed readings failed moved by GPS, so the
   const t = await tripSummary(e, {}, start + 7200);
   assert.deepEqual([t.trip_id, t.distance_mi, t.gps_distance_mi], [13, 0, 7.5]);
   assert.deepEqual(t.newer_sessions_without_driving.map((s) => s.trip_id), [14]);
+  // The note holds only the sentences that apply. distance_mi was not integrated from speed here,
+  // and there is no tank gauge reading to explain.
+  assert.equal(t.note, "Fuel used and MPG are estimates from engine airflow (MAF), assuming E10 pump gasoline. " +
+    "They read low at full throttle and high while coasting.");
+  assert.equal(t.fuel_used_gal_est, 0.8);
+
+  // The airflow readings failed as well: no fuel figure, not 0 gal, and the note says why.
+  e.DB.sqlite.prepare("UPDATE trips SET maf_g = 0 WHERE boot = 13").run();
+  e.DB.sqlite.prepare("UPDATE minutes SET maf_g = 0 WHERE boot = 13").run();
+  const dry = await tripSummary(e, {}, start + 7200);
+  assert.deepEqual([dry.trip_id, dry.fuel_used_gal_est, dry.mpg_est], [13, null, null]);
+  assert.equal(dry.note, "There are no fuel or MPG figures, no airflow readings came through.");
+  // The same in the trip rows of list_trips and get_history. The idle session burned a little fuel and keeps it.
+  const rows = (await listTrips(e, {}, start + 7200)).trips;
+  assert.deepEqual(rows.map((r) => [r.trip_id, r.fuel_used_gal_est, r.mpg_est]), [[14, 0.01, null], [13, null, null]]);
+  const day = await history(e, { from: "2026-11-12", to: "2026-11-12" }, start + 7200);
+  assert.deepEqual(day.trips.map((r) => [r.trip_id, r.fuel_used_gal_est, r.mpg_est]), [[14, 0.01, null], [13, null, null]]);
+});
+
+test("get_fuel_economy: total_miles is the logged miles, and a drive whose speed readings failed shows its GPS distance", async () => {
+  const e = makeEnv();
+  const start = utc(2026, 11, 12, 16);
+  addSession(e, { boot: 13, start, minutes: 16 });
+  addSession(e, { boot: 14, start: start + 3600, minutes: 10 });
+  e.DB.sqlite.prepare("UPDATE trips SET km = 0 WHERE boot = 13").run();
+  const ins = e.DB.sqlite.prepare("INSERT INTO track (boot, ms, ts, lat, lon, mph) VALUES (?,?,?,?,?,?)");
+  for (const p of northRoute(41)) ins.run(13, p.ms, start + p.ms / 1000, p.lat, p.lon, null);
+  const f = await fuelEconomy(e, 30, start + 7200);
+  // total_miles stays the logged miles, the base of the MPG. The note says it is not the distance driven.
+  assert.deepEqual([f.trip_count, f.total_miles], [2, 10]);
+  assert.match(f.note, /^total_miles is the miles logged from speed readings, the base of combined_mpg_est, not the distance driven\. For that use get_history\. /);
+  // The trip row of the drive without speed readings gets its distance along the route, with a note.
+  assert.deepEqual(f.trips.map((r) => [r.trip_id, r.distance_mi, r.gps_distance_mi]), [[14, 10, undefined], [13, 0, 7.5]]);
+  assert.deepEqual(Object.keys(f.trips[1]), ["trip_id", "label", "start", "distance_mi", "gps_distance_mi", "mpg_est"]);
+  assert.match(f.note, / A trip row with gps_distance_mi had failed speed readings, so its distance_mi is near 0\./);
+  // A window without such a trip has no such sentence.
+  assert.doesNotMatch((await fuelEconomy(e, 1, start + 3600 + 86400)).note, /gps_distance_mi/);
 });
 
 test("get_history: odometer distance, GPS distance on trip rows, and a floor for unlogged miles", async () => {
@@ -1563,14 +1669,62 @@ test("get_history: odometer distance, GPS distance on trip rows, and a floor for
   // Two gaps are not known, so the total is unknown. The one that is known is a floor.
   assert.deepEqual([h.totals.distance_mi, h.totals.odometer_distance_mi, h.totals.unlogged_mi, h.totals.unlogged_mi_at_least],
     [30, 72.1, null, 21.1]);
-  assert.match(h.note, /The odometer moved 72\.1 mi between the first and last readings in this window\. 30 mi of that were logged from speed readings, the rest was missed by the logger or only measured by GPS\./);
+  assert.match(h.note, /By the odometer the car went 72\.1 mi in this window\. 30 mi of that were logged from speed readings, the rest was missed by the logger or only measured by GPS\./);
   assert.match(h.note, /A trip row with gps_distance_mi had failed speed readings, so its distance_mi is near 0\./);
   assert.doesNotMatch(JSON.stringify(h), /"lat"|"lon"|maps\.google/);
 
-  // Trip 16 starts at 23:50 and ends after midnight. Only a window that holds it whole counts
-  // its odometer, so no day gets driving from outside it.
+  // Trip 16 starts at 23:50 and ends after midnight. Nov 12 counts the odometer up to its start
+  // and the 10 miles it logged before midnight, so no day gets driving from outside it. Nov 13
+  // has no trip that began on it, so no odometer figure.
   addSession(e, { boot: 16, start: utc(2026, 11, 13, 7, 50), minutes: 20, odo: [1116.1, 1148.3] });
   const day = async (from, to) => (await history(e, { from, to }, utc(2026, 11, 14, 20))).totals.odometer_distance_mi;
-  assert.deepEqual([await day("2026-11-12", "2026-11-12"), await day("2026-11-13", "2026-11-13")], [72.1, null]);
+  assert.deepEqual([await day("2026-11-12", "2026-11-12"), await day("2026-11-13", "2026-11-13")], [82.1, null]);
   assert.equal(await day("2026-11-12", "2026-11-13"), 92.1); // 148.3 km
+});
+
+test("get_history: a day's odometer distance takes in a drive across midnight, the gap before it and trips without odometer readings", async () => {
+  // Nov 12, local time: a 5 mi trip at 18:00, then a 40 mi trip from 23:40 to 00:20 that logs
+  // 20 mi before midnight. No gap on the odometer between them.
+  const e = makeEnv();
+  addSession(e, { boot: 30, start: utc(2026, 11, 13, 2), minutes: 5, odo: [1000, 1008] });
+  addSession(e, { boot: 31, start: utc(2026, 11, 13, 7, 40), minutes: 40, odo: [1008, 1072.4] });
+  const now = utc(2026, 11, 13, 20); // Nov 13 12:00
+  const nov12 = await history(e, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([nov12.totals.distance_mi, nov12.totals.odometer_distance_mi], [25, 25]);
+  assert.doesNotMatch(nov12.note, /By the odometer/);
+  const yesterday = await history(e, { period: "yesterday" }, now);
+  assert.deepEqual([yesterday.window.from, yesterday.totals.distance_mi, yesterday.totals.odometer_distance_mi], ["2026-11-12", 25, 25]);
+  // No trip began on Nov 13, so there is no odometer figure, only its 20 logged miles.
+  const nov13 = await history(e, { from: "2026-11-13", to: "2026-11-13" }, now);
+  assert.deepEqual([nov13.totals.distance_mi, nov13.totals.odometer_distance_mi], [20, null]);
+
+  // The odometer is 16.1 km (10 mi) ahead when the trip at midnight starts. That was driven
+  // between 18:05 and 23:40, inside the day, so it counts.
+  const gap = makeEnv();
+  addSession(gap, { boot: 30, start: utc(2026, 11, 13, 2), minutes: 5, odo: [1000, 1008] });
+  addSession(gap, { boot: 31, start: utc(2026, 11, 13, 7, 40), minutes: 40, odo: [1024.1, 1088.5] });
+  const g = await history(gap, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([g.totals.distance_mi, g.totals.odometer_distance_mi, g.totals.unlogged_mi], [25, 35, 10]);
+
+  // A 64 mi gap the logger missed before a 3 mi trip at 20:00. The car went about 92 mi that day.
+  const missed = makeEnv();
+  addSession(missed, { boot: 30, start: utc(2026, 11, 13, 2), minutes: 5, odo: [1000, 1008] });
+  addSession(missed, { boot: 31, start: utc(2026, 11, 13, 4), minutes: 3, odo: [1111, 1115.8] });
+  addSession(missed, { boot: 32, start: utc(2026, 11, 13, 7, 40), minutes: 40, odo: [1115.8, 1180.2] });
+  const m = await history(missed, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([m.totals.distance_mi, m.totals.odometer_distance_mi, m.totals.unlogged_mi], [28, 92, 64]);
+  assert.match(m.note, /By the odometer the car went 92 mi in this window\. 28 mi of that were logged from speed readings/);
+
+  // A trip that never answered the odometer, before the first reading or after the last, lies
+  // outside the odometer's stretch. Its logged miles are added, so the figure is never short of them.
+  const before = makeEnv();
+  addSession(before, { boot: 30, start: utc(2026, 11, 13, 2), minutes: 5 });
+  addSession(before, { boot: 31, start: utc(2026, 11, 13, 7, 40), minutes: 40, odo: [1008, 1072.4] });
+  const b = await history(before, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([b.totals.distance_mi, b.totals.odometer_distance_mi], [25, 25]);
+  const after = makeEnv();
+  addSession(after, { boot: 30, start: utc(2026, 11, 13, 2), minutes: 5, odo: [1000, 1008] });
+  addSession(after, { boot: 31, start: utc(2026, 11, 13, 4), minutes: 3 });
+  const a = await history(after, { from: "2026-11-12", to: "2026-11-12" }, now);
+  assert.deepEqual([a.totals.distance_mi, a.totals.odometer_distance_mi], [8, 8]);
 });

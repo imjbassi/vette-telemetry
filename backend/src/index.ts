@@ -1,4 +1,4 @@
-import { handleDash } from "./dash";
+import { dbErrorText, handleDash } from "./dash";
 import { Env, handleIngest } from "./ingest";
 import { handleMcp } from "./mcp";
 
@@ -50,11 +50,8 @@ export default {
       try {
         return await handleDash(req, env, rest, `/dash/${secret}`);
       } catch (e) {
-        // Surface database errors (for example the daily D1 read limit) to the page.
-        const msg = (e as Error).message || "error";
-        const limit = /limit|exceeded|too many/i.test(msg);
-        return Response.json({ error: limit ? "Database read limit reached for today. It resets at midnight UTC." : msg },
-          { status: 503, headers: { "Cache-Control": "no-store" } });
+        // Surface the error to the page, with the same texts as handleDash's own catch.
+        return Response.json({ error: dbErrorText(e) }, { status: 503, headers: { "Cache-Control": "no-store" } });
       }
     }
 

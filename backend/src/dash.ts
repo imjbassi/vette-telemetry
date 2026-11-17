@@ -2,9 +2,9 @@
 import page from "./dash.html";
 import { Env, getLatest, Latest } from "./ingest";
 import {
-  CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, odometerSpanMiles, powerUpBattery,
-  recentTripAggs, roughMpg, STATE_RULES, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching, tripLabel, tripNumbers,
-  tripNumbersList, tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, withGpsMiles,
+  CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, powerUpBattery, recentTripAggs, roughMpg,
+  STATE_RULES, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching, tripLabel, tripNumbers, tripNumbersList,
+  tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, windowOdometerMiles, withGpsMiles,
 } from "./queries";
 
 const json = (data: unknown, status = 200) =>
@@ -335,8 +335,11 @@ async function history(env: Env, from: number, to: number) {
       mpg,
       // The same rule as the 30-day MPG: under MPG30_MIN_MILES logged miles the figure is rough.
       mpg_few_miles: mpg != null && !enoughMpgMiles(miles),
-      // How far the odometer moved over the trips wholly inside the window, logged or not.
-      odometer_mi: odometerSpanMiles(touching.filter((t) => t.start_ts >= from && t.end_ts <= to)),
+      // How far the car went in the window, logged or not, the same figure as get_history's
+      // odometer_distance_mi: the odometer over the trips that began in it, plus what was logged
+      // inside it outside that stretch, such as by trips across its start or end (see
+      // windowOdometerMiles).
+      odometer_mi: windowOdometerMiles(touching, from, to, clipped.reduce((a, t) => a + (t.km ?? 0), 0)),
       engine_s: Math.round(sum("engine_s")),
       moving_s: Math.round(sum("moving_s")),
       idle_s: Math.max(0, Math.round(sum("engine_s") - sum("moving_s"))),
@@ -468,6 +471,17 @@ function pageId(text: string): string {
 const PAGE_ID = pageId(page);
 const PAGE = page.replace("__PAGE_ID__", PAGE_ID);
 
+// The text a failed request answers with, which the page shows. Only D1's two daily limits get a
+// sentence of their own, matched on their documented wording ("Your account has exceeded D1's
+// free tier daily row read limit." and the same with write). Anything else, an overload or a
+// timeout among them, goes out as it is, so a short outage never reads as a used-up day.
+export function dbErrorText(e: unknown): string {
+  const msg = (typeof e === "string" ? e : (e as Error | null)?.message) || "error";
+  if (/daily row read limit/i.test(msg)) return "Database read limit reached for today. It resets at midnight UTC.";
+  if (/daily row write limit/i.test(msg)) return "Database write limit reached for today. It resets at midnight UTC.";
+  return msg;
+}
+
 // `rest` is the path after /dash/<secret>, e.g. "", "/", "/api/status".
 export async function handleDash(req: Request, env: Env, rest: string, base: string): Promise<Response> {
   if (req.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
@@ -494,11 +508,9 @@ export async function handleDash(req: Request, env: Env, rest: string, base: str
     res = await api({ ...env, DB: countRows(env.DB, count) }, rest, new URL(req.url));
   } catch (e) {
     // Caught here and not in index.ts so the failed answer still carries the rows read so far.
-    // The page shows the text (for example when the daily D1 read limit is used up).
+    // The page shows the text (see dbErrorText).
     console.error("dashboard api failed", rest, e);
-    const msg = (e as Error).message || "error";
-    const limit = /limit|exceeded|too many/i.test(msg);
-    res = json({ error: limit ? "Database read limit reached for today. It resets at midnight UTC." : msg }, 503);
+    res = json({ error: dbErrorText(e) }, 503);
   }
   res.headers.set("X-Rows-Read", String(count.rows));
   res.headers.set("X-Page", PAGE_ID);

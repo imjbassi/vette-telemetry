@@ -107,6 +107,45 @@ test("a crash in the MCP route answers 500 with a JSON-RPC internal error", asyn
   assert.equal(logged.mock.callCount(), 1);
 });
 
+test("a failed dashboard request names a used-up daily limit only for D1's two limit errors, any other error as it is", async (t) => {
+  setNow(T0 + 100);
+  const logged = t.mock.method(console, "error", () => {});
+  const same = (text) => [text, text];
+  const cases = [
+    // The two documented texts, with and without D1's prefix.
+    ["D1_ERROR: Your account has exceeded D1's free tier daily row read limit.", "Database read limit reached for today. It resets at midnight UTC."],
+    ["Your account has exceeded D1's free tier daily row write limit.", "Database write limit reached for today. It resets at midnight UTC."],
+    // A short outage, a timeout and two mistakes in a query are not a used-up day.
+    same("D1 DB is overloaded. Too many requests queued."),
+    same("D1 DB storage operation exceeded timeout which caused object to be reset."),
+    same("D1_ERROR: too many SQL variables"),
+    same("D1_ERROR: no such column: odo_start: SQLITE_ERROR"),
+  ];
+  for (const [text, want] of cases) {
+    const env = makeEnv();
+    env.DB.prepare = () => { throw new Error(text); };
+    const res = await worker.fetch(new Request("https://logger.test/dash/test-dash-secret/api/status"), env);
+    assert.equal(res.status, 503, text);
+    assert.deepEqual(await res.json(), { error: want }, text);
+    // Caught inside handleDash, so the answer still says what it read and which page is deployed.
+    assert.equal(res.headers.get("X-Rows-Read"), "0", text);
+    assert.match(res.headers.get("X-Page") ?? "", /^[0-9a-f]{8}$/, text);
+  }
+  assert.equal(logged.mock.callCount(), cases.length);
+  // An error before handleDash's own catch reaches the one in index.ts, with the same texts.
+  for (const [text, want] of cases) {
+    const broken = {
+      url: "https://logger.test/dash/test-dash-secret/api/status",
+      headers: new Headers(),
+      get method() { throw new Error(text); },
+    };
+    const res = await worker.fetch(broken, makeEnv());
+    assert.equal(res.status, 503, text);
+    assert.equal(res.headers.get("Cache-Control"), "no-store", text);
+    assert.deepEqual(await res.json(), { error: want }, text);
+  }
+});
+
 test("the dashboard and the connector open only under their secret paths, and the page keeps its headers", async () => {
   setNow(T0 + 100);
   const env = makeEnv();
