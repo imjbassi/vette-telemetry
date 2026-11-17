@@ -187,7 +187,8 @@
   .six { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   tr.click { cursor: pointer; }
   @media (max-width: 1180px) { .six { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  @media (max-width: 820px) { .six { grid-template-columns: repeat(2, minmax(0, 1fr)); } .custom { margin-left: 0; } }
+  @media (max-width: 820px) { .six { grid-template-columns: repeat(2, minmax(0, 1fr)); } .custom { margin-left: 0; } .custom:not(.open) { display: none; } }
+  @media (min-width: 821px) { #h-custom { display: none; } }
 
   .view { display: none; } .view.show { display: block; }
   .tabs { display: none; }
@@ -297,7 +298,7 @@
           <div class="map" id="o-map"></div>
         </div>
         <div class="card">
-          <div class="card-head"><div><h3>Recent trips</h3><div class="sub">Engine time shown. Tap one for details</div></div><span class="chip" id="o-trips-chip">–</span></div>
+          <div class="card-head"><div><h3>Recent trips</h3><div class="sub">MPG is an estimate. Tap a trip for details.</div></div><span class="chip" id="o-trips-chip">–</span></div>
           <ul class="trips" id="o-trips"><li class="empty">Loading…</li></ul>
         </div>
       </div>
@@ -357,8 +358,10 @@
             <button data-p="30d">30 days</button>
             <button data-p="month">This month</button>
             <button data-p="year">12 months</button>
+            <!-- Phones only. It shows the date fields, which a phone keeps folded away. -->
+            <button id="h-custom" type="button">Custom</button>
           </div>
-          <div class="custom">
+          <div class="custom" id="h-dates">
             <input type="datetime-local" id="h-from" aria-label="From">
             <span>to</span>
             <input type="datetime-local" id="h-to" aria-label="To">
@@ -368,6 +371,10 @@
         <div class="sub" style="margin-top:10px" id="h-label">&nbsp;</div>
       </div>
 
+      <!-- A period without driving is this one card instead of a page of zeros. -->
+      <div class="card mt" id="h-none" hidden><div class="empty" id="h-none-t"></div><div style="display:flex;justify-content:center"><button class="btn" id="h-none-day" type="button">Show that day</button></div></div>
+
+      <div id="h-body">
       <div class="grid six mt" id="h-kpis"></div>
 
       <div class="card mt">
@@ -403,7 +410,7 @@
 
       <div class="card mt">
         <div class="card-head"><div><h3>Details</h3><div class="sub">Extremes and ranges in this period</div></div></div>
-        <div class="stats" id="h-extremes"></div>
+        <div class="stats six" id="h-extremes"></div>
       </div>
 
       <div class="grid two mt">
@@ -412,10 +419,11 @@
           <div class="tablewrap" style="max-height:360px"><table id="h-daytable"></table></div>
         </div>
         <div class="card">
-          <div class="card-head"><div><h3>Trips in this period</h3><div class="sub">Engine time shown. Tap one for its full details</div></div><span class="chip" id="h-trips-chip">–</span></div>
+          <div class="card-head"><div><h3>Trips in this period</h3><div class="sub">MPG is an estimate. Tap a trip for details.</div></div><span class="chip" id="h-trips-chip">–</span></div>
           <ul class="trips" id="h-trips" style="max-height:360px"></ul>
         </div>
       </div>
+      </div><!-- h-body -->
     </section>
 
     <!-- ====================================================== LOGS -->
@@ -832,7 +840,7 @@
     // at: where placeMarker last centered the map. A live position is followed. Any other moves
     // the view only when it is about 50 m or more from there, so GPS drift and a map moved by
     // hand stay put, and a drive the page did not see still brings the map to the car.
-    S.maps[key] = { map, marker: null, track: null, centered: false, at: null };
+    S.maps[key] = { map, marker: null, track: null, centered: false, at: null, drawn: null };
     return S.maps[key];
   }
   // `live` keeps the map on the marker as it moves. `color` fills it, green while live, else red.
@@ -845,8 +853,12 @@
     else if (live || far) { m.map.panTo(ll); m.at = ll; }
   }
   const speedColor = (mph) => (mph == null ? "#8b8f9a" : mph < 25 ? "#2fbf71" : mph < 45 ? "#22b8cf" : mph < 65 ? "#3d6ef5" : mph < 80 ? "#e8b423" : "#ef4444");
-  // The route of one trip. Whatever the trip before left on the map goes first.
+  // The route of one trip. Whatever the trip before left on the map goes first. The same answer
+  // is not drawn twice, so coming back to the Trips view keeps the owner's zoom. A tap on a trip
+  // row clears `drawn` and fits the route again. A trip in progress comes in a new answer.
   function drawTrack(m, track) {
+    if (m.drawn === track) return;
+    m.drawn = track;
     if (m.track) { m.map.removeLayer(m.track); m.track = null; }
     if (!track || !track.length) return;
     m.track = L.layerGroup().addTo(m.map);
@@ -1022,6 +1034,7 @@
   // A tap on a trip anywhere. `reveal` makes the details scroll into view once they are drawn.
   function openTrip(id) {
     S.selected = id; S.reveal = true;
+    if (S.maps.t) S.maps.t.drawn = null;
     if (S.view === "trips") showTrip(); else go("trips");
   }
   // Both trip lists from memory. Also run when the car state flips, for the "in progress" mark.
@@ -1057,6 +1070,7 @@
     const t0 = d.trips.find(moved) || d.trips[0];
     if (S.selected == null && t0) S.selected = t0.id;
     drawTripLists();
+    if (S.view === "history" && S.hist.none) renderNone();
     // Refetch the overview chart only when that drive actually changed.
     if (t0) {
       const key = `${t0.id}:${t0.end_ts}`;
@@ -1128,7 +1142,18 @@
     S.selected = id;
     markSelected();
     const req = ++S.tripReq;
-    let d; try { d = await get("api/trip/" + id); } catch { S.reveal = false; return; }
+    // The card still shows the trip before, so until the new one arrives it says so.
+    if (S.tripData && S.tripData.trip.id !== id) $("t-sub").textContent = "Loading this trip…";
+    let d;
+    try { d = await get("api/trip/" + id); }
+    catch {
+      if (req !== S.tripReq) return;  // a newer pick owns the card
+      S.reveal = false;
+      // The card keeps the trip it shows, and its line says so again. The footer or the header
+      // says what failed.
+      if (S.tripData) $("t-sub").textContent = tripSub(S.tripData.trip);
+      return;
+    }
     if (req !== S.tripReq) return;  // a newer trip was picked while this one loaded
     S.tripData = d;
     renderTrip();
@@ -1393,39 +1418,53 @@
   }
 
   // ---------------------------------------------------------------- history
+  // The chart title is the name of the button that picked it.
   const METRICS = {
     speed: ["Speed", "mph", "#3d6ef5", "speed", "speed_max", 0],
-    rpm: ["Engine speed", "rpm", "#f0732e", "rpm", "rpm_max", 0],
-    coolant: ["Coolant temperature", "°F", "#e8b423", "coolant", "coolant_max", 0],
+    rpm: ["RPM", "rpm", "#f0732e", "rpm", "rpm_max", 0],
+    coolant: ["Coolant", "°F", "#e8b423", "coolant", "coolant_max", 0],
     fuel: ["Fuel level", "%", "#2fbf71", "fuel", null, 0],
-    battery: ["Battery voltage", "V", "#e0457b", "battery", null, 2],
+    battery: ["Battery", "V", "#e0457b", "battery", null, 2],
     throttle: ["Throttle", "%", "#a855f7", "throttle", "throttle_max", 0],
-    intake: ["Intake air temperature", "°F", "#22b8cf", "intake", null, 0],
+    intake: ["Intake air", "°F", "#22b8cf", "intake", null, 0],
     airflow: ["Airflow", "g/s", "#22b8cf", "airflow", "airflow_max", 1],
   };
-  S.hist = { preset: "7d", from: null, to: null, metric: "speed", data: null };
+  // History opens on 30 days. The car is often parked for a week or more.
+  S.hist = { preset: "30d", from: null, to: null, metric: "speed", data: null };
 
   const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  // Server time, so a wrong phone clock cannot move the window. Days are counted on the calendar,
+  // so a day on which the clocks change is 23 or 25 hours long. 7 and 30 days are whole days
+  // including today, like get_history.
   function presetRange(p) {
-    const n = new Date();
+    const n = new Date(now() * 1000);
     const t = Math.floor(n.getTime() / 1000);
-    const sod = Math.floor(startOfDay(n).getTime() / 1000);
+    const daysBack = (k) => Math.floor(new Date(n.getFullYear(), n.getMonth(), n.getDate() - k).getTime() / 1000);
+    const sod = daysBack(0);
     switch (p) {
       case "today": return [sod, t];
-      case "yesterday": { const y = startOfDay(new Date(n.getTime() - 86400000)); return [Math.floor(y.getTime() / 1000), sod - 1]; }
+      case "yesterday": return [daysBack(1), sod - 1];
       case "24h": return [t - 86400, t];
-      case "7d": return [t - 7 * 86400, t];
-      case "30d": return [t - 30 * 86400, t];
+      case "7d": return [daysBack(6), t];
+      case "30d": return [daysBack(29), t];
       case "month": { const m = new Date(n.getFullYear(), n.getMonth(), 1); return [Math.floor(m.getTime() / 1000), t]; }
       case "year": return [t - 365 * 86400, t];
     }
-    return [t - 7 * 86400, t];
+    return [daysBack(29), t];  // the default, 30 days
   }
-  const toInput = (ts) => { const d = new Date(ts * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
-  const fromInput = (v) => (v ? Math.floor(new Date(v).getTime() / 1000) : null);
+  // The last second of the local day that starts at `a`.
+  const dayEnd = (a) => { const d = new Date(a * 1000); return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() / 1000 - 1; };
+  // Local wall time for a date field. The offset is the one of that moment, so a time just after
+  // a clock change is not an hour off.
+  const toInput = (ts) => new Date(ts * 1000 - new Date(ts * 1000).getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  // Null for an empty or half-filled field.
+  const fromInput = (v) => { const t = v ? Math.floor(new Date(v).getTime() / 1000) : NaN; return Number.isFinite(t) ? t : null; };
   // Whole minutes first, then split. Rounding the minutes after the split could print "1h 60m".
   const durShort = (s) => { const m = Math.round((s || 0) / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m} min`; };
   const bucketLabel = (b) => (b < 60 ? `${b} s` : b < 3600 ? `${b / 60} min` : b < 86400 ? `${b / 3600} h` : "day");
+  // Estimated gallons. One decimal is all the method supports, but under 1 gal it would round
+  // most short drives to the same figure.
+  const galText = (g) => (g >= 1 ? f1(g) : g.toFixed(2));
 
   function setRange(preset, from, to) {
     if (preset) [from, to] = presetRange(preset);
@@ -1435,39 +1474,84 @@
     loadHistory();
   }
   function parseHistoryHash(arg) {
-    if (!arg) return S.hist.from ? setRange(S.hist.preset, S.hist.from, S.hist.to) : setRange("7d");
+    if (!arg) return S.hist.from ? setRange(S.hist.preset, S.hist.from, S.hist.to) : setRange("30d");
     const m = arg.match(/^(\d+)-(\d+)$/);
     if (m) return setRange(null, +m[1], +m[2]);
     return setRange(arg);
   }
 
+  const rangeText = (a, b) => `${longDay.format(new Date(a * 1000))}, ${timeFmt.format(new Date(a * 1000))}  to  ${longDay.format(new Date(b * 1000))}, ${timeFmt.format(new Date(b * 1000))}`;
+
+  // The label under the range. It is written with the answer, so it never names a range other
+  // than the one the cards below show. S.hist.label keeps it for the messages of Apply.
+  function setLabel(text) { S.hist.label = text; $("h-label").textContent = text; }
+
   async function loadHistory() {
     const { from, to } = S.hist;
-    document.querySelectorAll("#h-presets button").forEach((b) => b.classList.toggle("active", b.dataset.p === S.hist.preset));
+    document.querySelectorAll("#h-presets button[data-p]").forEach((b) => b.classList.toggle("active", b.dataset.p === S.hist.preset));
     $("h-from").value = toInput(from); $("h-to").value = toInput(to);
-    $("h-label").textContent = `${longDay.format(new Date(from * 1000))}, ${timeFmt.format(new Date(from * 1000))}  to  ${longDay.format(new Date(to * 1000))}, ${timeFmt.format(new Date(to * 1000))}`;
     const req = (S.hist.req = (S.hist.req || 0) + 1);
     let d;
     // An older range that fails late, for example cut off by the time limit, says nothing about the one on screen.
-    try { d = await get(`api/history?from=${from}&to=${to}`); } catch { if (req === S.hist.req) $("h-label").textContent += " · could not load"; return; }
+    try { d = await get(`api/history?from=${from}&to=${to}`); } catch { if (req === S.hist.req) setLabel(rangeText(from, to) + " · could not load"); return; }
     if (req !== S.hist.req) return;  // a newer range was picked while this one loaded
     S.hist.data = d;
+    // The server answers at most 366 days, the newest ones. The label and the date fields then
+    // show what it answered.
+    let label = rangeText(d.from, d.to);
+    if (d.from !== from || d.to !== to) {
+      $("h-from").value = toInput(d.from); $("h-to").value = toInput(d.to);
+      if (d.to - d.from < Math.abs(to - from)) label += " · only the last 366 days of this range are shown";
+    }
+    // Before the logger's first session nothing was recorded, which is not the same as not driven.
+    if (d.data_starts === null) label += " · no logger data yet";
+    else if (d.data_starts > d.from) label += ` · logger data starts ${longDay.format(new Date(d.data_starts * 1000))}`;
+    setLabel(label);
     renderHistory();
+  }
+
+  // A period with no trip and no reading: one line with the newest trip and a button to its day,
+  // instead of a page of zeros and a map of the whole country. Run again from loadTrips, because
+  // the trip list can arrive after the History answer.
+  function renderNone() {
+    const t = S.trips[0];
+    $("h-none-t").textContent = "No driving in this period." + (t ? ` The last trip was ${when(t.start_ts)}.` : "");
+    const b = $("h-none-day");
+    b.hidden = !t;
+    if (t) b.onclick = () => { const a = Math.floor(startOfDay(new Date(t.start_ts * 1000)).getTime() / 1000); setRange(null, a, dayEnd(a)); };
   }
 
   function renderHistory() {
     const d = S.hist.data; if (!d) return;
     const T = d.totals, epa = d.epa.combined;
+    // Both boxes are set before the route map is made, so Leaflet measures one that is on screen.
+    S.hist.none = !d.trips.length && !T.samples;
+    $("h-none").hidden = !S.hist.none;
+    $("h-body").hidden = S.hist.none;
+    if (S.hist.none) { S.hist.days = []; renderNone(); return; }
+    // Logged miles leave out drives the logger missed. The odometer over the trips wholly inside
+    // the window shows how far the car went, given only when it is clearly more.
+    const odo = T.odometer_mi != null && T.odometer_mi > T.miles + 1 && T.odometer_mi > T.miles * 1.05;
+    // Fuel and MPG come from engine airflow, so both are estimates, and in plain text: no good or
+    // bad color. Under the minimum of logged miles the MPG is rough, as on Overview.
+    const need = d.mpg_min_miles ?? (S.status && S.status.mpg30_min_miles);
     const k = [
-      ["i-route", "var(--blue)", "Distance", `${f1(T.miles)}<small>mi</small>`, `${d.trips.length} trip${d.trips.length === 1 ? "" : "s"}`],
+      ["i-route", "var(--blue)", "Distance", `${f1(T.miles)}<small>mi</small>`, `${d.trips.length} trip${d.trips.length === 1 ? "" : "s"}` +
+        (odo ? ` · <span class="warn">${esc(f1(T.odometer_mi))} mi by odometer</span>` : "")],
       ["i-clock", "var(--cyan)", "Engine on", durShort(T.engine_s), `${durShort(T.moving_s)} moving · ${durShort(T.idle_s)} idle`],
-      ["i-fuel", "var(--green)", "Fuel used", `${T.gallons.toFixed(2)}<small>gal</small>`, T.fuel_min != null ? `tank ${f0(T.fuel_max)}% → ${f0(T.fuel_min)}%` : "&nbsp;"],
-      ["i-drop", "var(--purple)", "Fuel economy", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`, T.mpg == null ? "Needs some driving" : `<span class="${T.mpg >= epa ? "up" : "down"}">${T.mpg >= epa ? "+" : ""}${f0(((T.mpg - epa) / epa) * 100)}%</span> vs EPA ${epa}`],
+      // The lowest and highest tank reading. Which came first is not known from these two.
+      ["i-fuel", "var(--green)", "Fuel used (est.)", `${galText(T.gallons)}<small>gal</small>`, T.fuel_min != null ? `tank ${f0(T.fuel_min)} to ${f0(T.fuel_max)} %` : "&nbsp;"],
+      ["i-drop", "var(--purple)", "MPG (est.)", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`,
+        T.mpg == null ? "Needs some driving"
+        : T.mpg_few_miles ? `rough, only ${f1(T.miles_down)}${need ? ` of ${need}` : ""} mi logged`
+        : `${T.mpg >= epa ? "+" : ""}${f0(((T.mpg - epa) / epa) * 100)}% vs EPA ${epa}`, T.mpg_few_miles ? "rough" : ""],
       ["i-gauge", "var(--orange)", "Top speed", T.max_mph == null ? "–" : `${T.max_mph}<small>mph</small>`, T.max_rpm ? `max ${f0(T.max_rpm)} rpm` : "&nbsp;"],
-      ["i-temp", "var(--yellow)", "Coolant", T.avg_coolant_f == null ? "–" : `${f0(T.avg_coolant_f)}<small>°F avg</small>`, T.max_coolant_f == null ? "&nbsp;" : `max ${f0(T.max_coolant_f)} °F`],
+      // The average is over readings with the engine on. The highest reading is any.
+      ["i-temp", "var(--yellow)", "Coolant", T.avg_coolant_f == null ? "–" : `${f0(T.avg_coolant_f)}<small>°F avg</small>`,
+        T.max_coolant_f == null ? "&nbsp;" : `${T.avg_coolant_f == null ? "" : "engine on · "}max ${f0(T.max_coolant_f)} °F`],
     ];
-    $("h-kpis").innerHTML = k.map(([ic, col, lab, v, sub]) =>
-      `<div class="card kpi"><div class="lab"><span class="ico"><svg style="color:${col}"><use href="#${ic}"/></svg></span>${lab}</div><div class="val">${v}</div><div class="delta">${sub}</div></div>`).join("");
+    $("h-kpis").innerHTML = k.map(([ic, col, lab, v, sub, cls]) =>
+      `<div class="card kpi"><div class="lab"><span class="ico"><svg style="color:${col}"><use href="#${ic}"/></svg></span>${lab}</div><div class="val${cls ? " " + cls : ""}">${v}</div><div class="delta">${sub}</div></div>`).join("");
 
     drawHistoryChart();
 
@@ -1481,13 +1565,14 @@
       days.set(key, e);
     }
     const list = [...days.values()].sort((a, b) => a.day - b.day);
+    S.hist.days = list;  // for a redraw at a new width
     $("h-days-chip").textContent = `${list.length} day${list.length === 1 ? "" : "s"}`;
     dayBars($("h-days"), list);
-    $("h-daytable").innerHTML = `<tr><th>Day</th><th class="num">Trips</th><th class="num">Miles</th><th class="num">Engine on</th><th class="num">Fuel</th><th class="num">MPG</th><th class="num">Top mph</th></tr>` +
-      (list.length ? [...list].reverse().map((e) => `<tr class="click" data-day="${e.day}"><td>${esc(longDay.format(new Date(e.day * 1000)))}</td><td class="num">${e.trips}</td><td class="num">${f1(e.miles)}</td><td class="num">${durShort(e.engine_s)}</td><td class="num">${e.gallons.toFixed(2)} gal</td><td class="num">${e.gallons > 0.05 ? f1(e.miles / e.gallons) : "–"}</td><td class="num">${e.max_mph ?? "–"}</td></tr>`).join("")
+    $("h-daytable").innerHTML = `<tr><th>Day</th><th class="num">Trips</th><th class="num">Miles</th><th class="num">Engine on</th><th class="num">Gal (est.)</th><th class="num">MPG (est.)</th><th class="num">Top mph</th></tr>` +
+      (list.length ? [...list].reverse().map((e) => `<tr class="click" data-day="${e.day}"><td>${esc(longDay.format(new Date(e.day * 1000)))}</td><td class="num">${e.trips}</td><td class="num">${f1(e.miles)}</td><td class="num">${durShort(e.engine_s)}</td><td class="num">${galText(e.gallons)}</td><td class="num">${e.gallons > 0.05 ? f1(e.miles / e.gallons) : "–"}</td><td class="num">${e.max_mph ?? "–"}</td></tr>`).join("")
         : '<tr><td colspan="7" class="empty">No driving in this period</td></tr>');
     $("h-daytable").querySelectorAll("tr.click").forEach((tr) => (tr.onclick = () => {
-      const a = +tr.dataset.day; setRange(null, a, a + 86399);
+      const a = +tr.dataset.day; setRange(null, a, dayEnd(a));
     }));
 
     const ul = $("h-trips"); ul.innerHTML = "";
@@ -1495,15 +1580,14 @@
     if (!d.trips.length) ul.innerHTML = '<li class="empty">No trips in this period.</li>';
     d.trips.forEach((t) => ul.appendChild(tripItem(t)));
 
+    // Six tiles, none of them a figure the cards above already show. The gap comes first. When one
+    // gap is not known the server adds up the ones that are, as a floor.
     const X = [
-      ["Max RPM", f0(T.max_rpm)], ["Max coolant", T.max_coolant_f == null ? "–" : `${f0(T.max_coolant_f)} °F`],
-      ["Avg coolant (engine on)", T.avg_coolant_f == null ? "–" : `${f0(T.avg_coolant_f)} °F`],
-      ["Fuel level range", T.fuel_min == null ? "–" : `${f0(T.fuel_min)} to ${f0(T.fuel_max)} %`],
+      ["Driven but not logged", T.unlogged_mi != null ? `${f1(T.unlogged_mi)} mi` : T.unlogged_mi_at_least != null ? `at least ${f1(T.unlogged_mi_at_least)} mi` : "–"],
       ["Battery range", T.volt_min == null ? "–" : `${T.volt_min} to ${T.volt_max} V`],
       ["Max throttle", T.max_throttle == null ? "–" : `${T.max_throttle} %`],
       ["Intake air range", T.iat_min_f == null ? "–" : `${f0(T.iat_min_f)} to ${f0(T.iat_max_f)} °F`],
-      ["Idle time", durShort(T.idle_s)], ["Readings", f0(T.samples)], ["GPS points", f0(T.gps_points)],
-      ["Driven but not logged", T.unlogged_mi == null ? "–" : `${f1(T.unlogged_mi)} mi`],
+      ["Readings", f0(T.samples)], ["GPS points", f0(T.gps_points)],
     ];
     $("h-extremes").innerHTML = X.map(([kk, v]) => `<div class="stat"><div class="k">${esc(kk)}</div><div class="v">${esc(v)}</div></div>`).join("");
 
@@ -1572,14 +1656,20 @@
       const e = list[i];
       return [`${f1(e.miles)} mi`, `${longDay.format(new Date(e.day * 1000))} · ${e.trips} trip${e.trips === 1 ? "" : "s"} · tap to open`];
     });
-    el.querySelectorAll(".dbar").forEach((r) => (r.onclick = () => { const a = +r.dataset.day; setRange(null, a, a + 86399); }));
+    el.querySelectorAll(".dbar").forEach((r) => (r.onclick = () => { const a = +r.dataset.day; setRange(null, a, dayEnd(a)); }));
   }
 
-  document.querySelectorAll("#h-presets button").forEach((b) => (b.onclick = () => setRange(b.dataset.p)));
+  // Custom has no preset. It only opens and closes the date fields.
+  document.querySelectorAll("#h-presets button[data-p]").forEach((b) => (b.onclick = () => setRange(b.dataset.p)));
+  $("h-custom").onclick = () => $("h-custom").classList.toggle("active", $("h-dates").classList.toggle("open"));
   document.querySelectorAll("#h-metrics button").forEach((b) => (b.onclick = () => { S.hist.metric = b.dataset.m; drawHistoryChart(); }));
+  // The two dates in either order. What is missing is said next to the range on screen.
   $("h-apply").onclick = () => {
     const a = fromInput($("h-from").value), b = fromInput($("h-to").value);
-    if (a && b && b > a) setRange(null, a, b);
+    const say = (msg) => { $("h-label").textContent = [S.hist.label, msg].filter(Boolean).join(" · "); };
+    if (a == null || b == null) say("Pick a start and an end.");
+    else if (a === b) say("Start and end are the same.");
+    else setRange(null, Math.min(a, b), Math.max(a, b));
   };
 
   // ---------------------------------------------------------------- routing + polling
@@ -1706,8 +1796,22 @@
     // The first look is not a change, and the poll timer is already set for it.
     if (!first) schedule();
   }, 10000);
-  let rt;
-  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (S.view === "overview") drawOverviewCharts(); if (S.view === "trips") drawTripCharts(); if (S.view === "live") renderLive(); if (S.view === "history") renderHistory(); }, 150); });
+  // Charts are drawn for the width, so a new width draws the charts of the open view again.
+  // Nothing else: Safari fires a resize each time its toolbar slides in or out, and a full
+  // History redraw would snap a map the owner zoomed back to the whole route. Leaflet follows
+  // real resizes by itself.
+  let rt, drawnW = window.innerWidth;
+  addEventListener("resize", () => {
+    clearTimeout(rt);
+    rt = setTimeout(() => {
+      if (window.innerWidth === drawnW) return;
+      drawnW = window.innerWidth;
+      if (S.view === "overview") drawOverviewCharts();
+      if (S.view === "trips") drawTripCharts();
+      if (S.view === "live") renderLive();
+      if (S.view === "history" && S.hist.days) { drawHistoryChart(); dayBars($("h-days"), S.hist.days); }
+    }, 150);
+  });
 
   // boot
   (async () => {

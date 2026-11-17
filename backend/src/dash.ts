@@ -321,6 +321,8 @@ async function history(env: Env, from: number, to: number) {
   return {
     from, to, bucket, source: raw ? "raw" : "minutes",
     epa: CAR.EPA,
+    // The logged miles under which totals.mpg is rough, so the page can say how many are missing.
+    mpg_min_miles: MPG30_MIN_MILES,
     // Start of the logger's first session, null before there is any data. A window that
     // starts earlier is not covered before it, which is not the same as not driven.
     data_starts: first?.start_ts ?? null,
