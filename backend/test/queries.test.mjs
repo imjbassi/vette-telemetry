@@ -547,8 +547,9 @@ test("tools/list: every field the answers carry is named in the description", as
   const { json } = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   const description = (name) => json.result.tools.find((t) => t.name === name).description;
   const fields = {
+    // The battery words as one phrase: alone, "low" would also match the "lower" of the range text.
     get_latest_status: ["battery_note", "engine_values_as_of", "engine_values_stale", "odometer_as_of", "cell_signal_dbm",
-      "firmware_build 0", "range_basis", "\"engine on, not charging\"", "engine off", "low"],
+      "firmware_build 0", "range_basis", '(charging, "engine on, not charging", engine off, low)'],
     get_location: ["fix_before_last_report_min", "parked"],
     get_trip_summary: ["newer_sessions_without_driving", "end_not_received", "times_estimated", "gps_distance_mi", "in_progress"],
     list_trips: ["end_not_received", "times_estimated", "gps_distance_mi", "more_trips_exist"],

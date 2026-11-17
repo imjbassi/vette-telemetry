@@ -3,6 +3,7 @@
 // The scripts are loaded at run time from the backend folder: next to this file when it runs
 // as written, three levels up when scripts/run-tests.mjs runs its bundled copy.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -43,9 +44,9 @@ test("npm run deploy runs the local checks first, and --skip-checks never reache
   assert.deepEqual(dep.deployArgs(["--skip-checks"]), { skipChecks: true, wranglerArgs: [] });
   assert.deepEqual(dep.deployArgs(["--dry-run", "--skip-checks", "--outdir", "dist"]),
     { skipChecks: true, wranglerArgs: ["--dry-run", "--outdir", "dist"] });
-  // localChecks() is never called here: it runs the tests, this file among them. The source
-  // shows where it runs instead: in the main block before anything remote, and not inside
-  // deployWorker(), which setup uses.
+  // localChecks() never runs the real checks here: they run the tests, this file among them.
+  // The test below gives it stand-ins. The source shows where it runs: in the main block before
+  // anything remote, and not inside deployWorker(), which setup uses.
   assert.equal(typeof dep.localChecks, "function");
   const src = fs.readFileSync(path.join(backend, "scripts", "deploy.mjs"), "utf8");
   const main = src.slice(src.indexOf("if (path.basename(process.argv[1]"));
@@ -54,6 +55,55 @@ test("npm run deploy runs the local checks first, and --skip-checks never reache
   assert.ok(at("localChecks(") < at("syncLocalConfig(") && at("syncLocalConfig(") < at("deployWorker(wranglerArgs)"), "the checks come first");
   const deployFn = src.slice(src.indexOf("export function deployWorker("), src.indexOf("// ---- stored secrets"));
   assert.ok(deployFn.length > 0 && !deployFn.includes("localChecks"), "setup is not gated");
+});
+
+// A temp folder laid out like backend/ with stand-ins for the three local checks, which exit
+// with `codes` in order. Each writes its name and arguments to ran.txt. The import() runs
+// whether node reads the extensionless tsc as CommonJS or as a module.
+function stubChecks(codes) {
+  const dir = tmpDir();
+  const steps = [["node_modules/typescript/bin/tsc", "tsc"], ["scripts/run-tests.mjs", "run-tests"], ["scripts/check-dash.mjs", "check-dash"]];
+  steps.forEach(([file, name], i) => {
+    fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), `import("node:fs").then((fs) => {
+  fs.appendFileSync("ran.txt", [${JSON.stringify(name)}, ...process.argv.slice(2)].join(" ") + "\\n");
+  process.exit(${codes[i]});
+});
+`);
+  });
+  return dir;
+}
+const ran = (dir) => (fs.existsSync(path.join(dir, "ran.txt")) ? fs.readFileSync(path.join(dir, "ran.txt"), "utf8").trim().split("\n") : []);
+
+test("a failing local check stops npm run deploy before anything else runs", () => {
+  const dirs = [];
+  const stub = (codes) => { const d = stubChecks(codes); dirs.push(d); return d; };
+  // localChecks() names each step on the console. Not needed here.
+  const quiet = (fn) => { const log = console.log; console.log = () => {}; try { return fn(); } finally { console.log = log; } };
+  try {
+    // The tests fail: the error says so, and check:dash never starts.
+    const red = stub([0, 1, 0]);
+    assert.throws(() => quiet(() => dep.localChecks(red)), /^Error: npm test failed\. Nothing was deployed\.$/);
+    assert.deepEqual(ran(red), ["tsc --noEmit", "run-tests"]);
+    // All pass: every step ran, in order.
+    const green = stub([0, 0, 0]);
+    quiet(() => dep.localChecks(green));
+    assert.deepEqual(ran(green), ["tsc --noEmit", "run-tests", "check-dash"]);
+
+    // deploy.mjs run as npm run deploy runs it, from a copy beside the stand-ins. It stops with
+    // the error of the failed step and goes no further: no config rebuild, no wrangler.
+    const dir = stub([0, 1, 0]);
+    const copy = path.join(dir, "scripts", "deploy.mjs");
+    fs.copyFileSync(path.join(backend, "scripts", "deploy.mjs"), copy);
+    const r = spawnSync(process.execPath, [copy], { cwd: dir, encoding: "utf8" });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /DEPLOY FAILED: npm test failed\. Nothing was deployed\./);
+    assert.equal((r.stderr.match(/DEPLOY FAILED/g) ?? []).length, 1, r.stderr);
+    assert.doesNotMatch(r.stdout, /local checks passed|wrangler\.local\.toml|remote database/);
+    assert.deepEqual(ran(dir), ["tsc --noEmit", "run-tests"]);
+  } finally {
+    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  }
 });
 
 // ---- wrangler.local.toml -------------------------------------------------------------

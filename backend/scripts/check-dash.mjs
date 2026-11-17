@@ -2,8 +2,8 @@
 // src/dash.html is bundled as text, so neither tsc nor wrangler ever parses its script, and
 // the tests in test/ never run it. A mistake there only shows up in the browser. Two stages:
 //
-// 1. Syntax. Every inline <script> (one without src) is pulled out of the page, written to
-//    .wrangler/check-dash/ (git-ignored) and given to "node --check".
+// 1. Syntax. Every inline <script> (one without src) is pulled out of the page, written to a
+//    folder of this run under .wrangler/check-dash/ (git-ignored) and given to "node --check".
 // 2. Behavior. The page script runs in a small stand-in for the browser (elements, timers,
 //    fetch and Leaflet are fakes) against the real dashboard API of src/dash.ts, on the sqlite
 //    database double of the tests, filled through the real ingest handler. Those are
@@ -15,7 +15,7 @@
 // Nothing here talks to Cloudflare or to the network. Exits non-zero when a check fails.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,9 +23,26 @@ if (process.env.CHECK_DASH_STAGE === "behavior") process.exit(await behavior());
 
 const self = fileURLToPath(import.meta.url);
 const root = join(dirname(self), "..");
-const outDir = join(root, ".wrangler", "check-dash");
-// Start clean so a removed script cannot leave an old file behind.
-rmSync(outDir, { recursive: true, force: true });
+const buildRoot = join(root, ".wrangler", "check-dash");
+// Every run writes into a folder of its own, like run-tests.mjs. npm run deploy runs this as
+// well, and two runs in one checkout used to share one folder: the second deleted the files of
+// the first between write and use. A fresh folder also means a removed script cannot leave an
+// old file behind.
+const outDir = join(buildRoot, `run-${Date.now()}-${process.pid}`);
+
+// Cleaning up is best effort and never fails a run. On Windows a folder that is still in use
+// cannot be removed, and then it simply stays for a later run to remove.
+const remove = (path, olderThanMs = 0) => {
+  try {
+    if (olderThanMs && Date.now() - statSync(path).mtimeMs < olderThanMs) return;
+    rmSync(path, { recursive: true, force: true });
+  } catch { /* still in use, or already gone */ }
+};
+// Leftovers of runs that were killed. Only old ones: a young folder may belong to a run that
+// is still going.
+let leftovers = [];
+try { leftovers = readdirSync(buildRoot); } catch { /* no build folder yet */ }
+for (const name of leftovers) remove(join(buildRoot, name), 10 * 60 * 1000);
 mkdirSync(outDir, { recursive: true });
 
 let failed = syntax(join(root, "src", "dash.html"));
@@ -54,6 +71,7 @@ if (!failed) {
     failed = 1;
   }
 }
+remove(outDir);
 process.exit(failed ? 1 : 0);
 
 // ------------------------------------------------------------ stage 1: syntax
@@ -139,9 +157,15 @@ async function behavior() {
     const script = /<script>([\s\S]*?)<\/script>/.exec(text)[1];
     // Only ids that the page has. Ids built by the script appear in it as id="..." as well.
     const ids = new Set([...text.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    // Elements whose tag in the markup has the hidden attribute start hidden, as in a browser. So
+    // a check that reads hidden false shows that the page itself made the element visible.
+    const startHidden = new Set([...text.matchAll(/<[a-z][^>]*\bid="([^"]+)"[^>]*>/g)]
+      .filter((m) => /\shidden[\s>]/.test(m[0])).map((m) => m[1]));
     const els = new Map();
+    // A browser's dataset holds strings: li.dataset.id = 11 reads back as "11".
+    const stringMap = () => new Proxy({}, { set: (o, k, v) => { o[k] = String(v); return true; } });
     function makeEl() {
-      const store = { id: "", textContent: "", html: "", hidden: false, style: {}, dataset: {}, children: [], value: "", found: {}, classes: new Set(), next: [] };
+      const store = { id: "", textContent: "", html: "", hidden: false, style: {}, dataset: stringMap(), children: [], value: "", found: {}, classes: new Set(), next: [] };
       // className and classList are two views of the same classes, as in a browser.
       const classList = {
         add: (...cs) => { for (const c of cs) store.classes.add(c); },
@@ -178,7 +202,7 @@ async function behavior() {
     // Like document.getElementById: null for an id the page does not have.
     const $ = (id) => {
       if (!ids.has(id)) return null;
-      if (!els.has(id)) { const e = makeEl(); e.id = id; els.set(id, e); }
+      if (!els.has(id)) { const e = makeEl(); e.id = id; e.hidden = startHidden.has(id); els.set(id, e); }
       return els.get(id);
     };
     // The few groups the page looks up by selector, taken from the markup, so their click
@@ -215,10 +239,12 @@ async function behavior() {
       } finally { net.busy--; }
     };
 
-    // calls: the name of every Leaflet method the page called, in order. fills: the fill color
-    // of every setStyle call, which is how a marker gets its color. made: the options of every
-    // map the page made. dots: the options of every circle marker.
-    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [], fills = [], made = [], dots = [];
+    // calls: the name of every Leaflet method the page called, in order, and "wheel on" or
+    // "wheel off" when it turned the wheel zoom of a map on or off. fills: the fill color of every
+    // setStyle call, which is how a marker gets its color. made: the options of every map the
+    // page made. dots: the options of every circle marker. mapOn: the arguments of every on()
+    // call, an event name and its handler, so a check can run the handlers.
+    const timers = [], errors = [], listeners = {}, tooltips = [], calls = [], pushed = [], fills = [], made = [], dots = [], mapOn = [];
     let reloads = 0;
     let every10s = null;
     const fire = (t) => { if (t.dead) return; t.dead = true; try { return t.fn(); } catch (e) { errors.push(e); } };
@@ -232,10 +258,13 @@ async function behavior() {
     // The time limit of a request is the one timer whose callback aborts something.
     const isLimit = (t) => String(t.fn).includes("abort");
 
-    // Every Leaflet call answers with Leaflet itself, so any chain of calls works.
+    // Every Leaflet call answers with Leaflet itself, so any chain of calls works. The wheel zoom
+    // of a map is an object with enable and disable, as in Leaflet.
+    const wheel = { enable: () => { calls.push("wheel on"); }, disable: () => { calls.push("wheel off"); } };
     const leaflet = new Proxy(function () {}, {
-      get: (_, k) => (typeof k === "symbol" ? undefined : (...args) => {
+      get: (_, k) => (typeof k === "symbol" ? undefined : k === "scrollWheelZoom" ? wheel : (...args) => {
         calls.push(k);
+        if (k === "on") mapOn.push(args);
         if (k === "bindTooltip") tooltips.push(args[0]);
         if (k === "setStyle") fills.push(args[0] && args[0].fillColor);
         if (k === "map") made.push(args[1] || {});
@@ -287,7 +316,7 @@ async function behavior() {
       (fn) => { every10s = fn; return 1; }, matchMedia, (ev, fn) => { listeners[ev] = fn; }, 800, leaflet, PageDate);
 
     const page = {
-      $, net, errors, tooltips, calls, pushed, fills, made, dots, listeners, doc, groups, location: loc,
+      $, net, errors, tooltips, calls, pushed, fills, made, dots, mapOn, listeners, doc, groups, location: loc,
       // How often the page asked for a reload.
       reloads: () => reloads,
       // The window becomes `w` wide. Nothing is fired: a check fires listeners.resize() itself.
@@ -589,10 +618,10 @@ async function behavior() {
     assert.match(p.$("t-sub").textContent, /^Trip 11 · /);
     assert.match(p.$("t-list").children[0].querySelector(".m").textContent, /idle only/i);
     const marked = () => p.$("t-list").children.filter((li) => li.classList.contains("sel")).map((li) => li.dataset.id);
-    assert.deepEqual(marked(), [11]);
+    assert.deepEqual(marked(), ["11"]);
     // The first 10 s re-check draws the lists again. The selection stays marked.
     p.interval();
-    assert.deepEqual(marked(), [11]);
+    assert.deepEqual(marked(), ["11"]);
 
     // A drive whose speed readings all failed: its distance comes from the GPS route.
     const gps = makeEnv();
@@ -603,7 +632,11 @@ async function behavior() {
     assert.match(q.$("o-drive-sub").textContent, / · about [\d.]+ mi by GPS · 2 min engine$/);
     assert.equal(q.$("o-drive-chip").textContent, "no speed readings");
     assert.match(q.$("o-trips").children[0].querySelector(".r").innerHTML, /^[\d.]+<small>mi by GPS<\/small>$/);
-    assert.deepEqual([...p.errors, ...q.errors], []);
+    // No trip and no position yet: neither button shows.
+    const e = openPage(makeEnv());
+    await e.settle();
+    assert.deepEqual([e.$("o-drive-open").hidden, e.$("o-maps").hidden], [true, true]);
+    assert.deepEqual([...p.errors, ...q.errors, ...e.errors], []);
   });
 
   check("overview: with the adapter link down the location is not called parked", async () => {
@@ -618,6 +651,8 @@ async function behavior() {
     assert.equal(p.$("o-loc-sub").textContent, "Adapter link down · 30s ago");
     assert.deepEqual(p.tooltips, ["Latest position"]);
     assert.deepEqual(p.fills, ["#ef4444"]);
+    // With a position the Google Maps button shows. The markup starts it hidden.
+    assert.equal(p.$("o-maps").hidden, false);
     assert.deepEqual(p.errors, []);
   });
 
@@ -731,7 +766,6 @@ async function behavior() {
   });
 
   check("maps: no map without a position, and a trip with one position gets a dot that leaves with it", async () => {
-    // Stand-in elements start with hidden false, so each box is read after the page drew it.
     const none = makeEnv();
     await upload(none, drive({ n: 60, gps: false }), T0 + 100);
     setNow(T0 + 4000);
@@ -740,11 +774,12 @@ async function behavior() {
     assert.equal(p.$("t-detail").hidden, false);
     assert.equal(p.$("t-mapbox").hidden, true);
     assert.equal(p.$("t-route-sub").textContent, "No GPS positions were recorded on this trip");
-    // Overview and History make no map either.
+    // Overview and History make no map either, and Overview has no Google Maps button.
     const o = openPage(none);
     await o.settle();
     assert.equal(o.$("o-loc-sub").textContent, "No GPS fix yet");
     assert.equal(o.$("o-map").innerHTML, '<div class="empty">No GPS position yet.</div>');
+    assert.equal(o.$("o-maps").hidden, true);
     const h = openPage(none, { hash: `history/${T0 - 600}-${T0 + 4000}` });
     await h.settle();
     assert.equal(h.$("h-mapbox").hidden, true);
@@ -1178,6 +1213,37 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
+  check("live: throttle and airflow that stop coming show a dash, the next day with the age of the last reading", async () => {
+    // Every fixture record carries throttle and airflow, so the check above never takes them away.
+    const none = (r) => ({ ...r, throttle_pct: null, maf_gs: null });
+    // The next day a drive without throttle and airflow. `latest` still holds yesterday's. Its own
+    // database, so the check above keeps its single grey card.
+    const env = makeEnv();
+    await parkedCar(env);
+    await upload(env, drive({ boot: 12, n: 60, base: T0 + 86400 }).map(none), T0 + 86480);
+    setNow(T0 + 86485);
+    const p = openPage(env, { hash: "live" });
+    await p.settle();
+    assert.equal(p.header(), "Engine running · updated just now");
+    const g = p.$("l-gauges").innerHTML;
+    for (const label of ["Throttle", "Airflow"]) {
+      assert.match(g, new RegExp(`<div class="card kpi gauge old">[^\\n]*>${label}<\\/div>\\s*<div class="val">–<small>[^<]*<\\/small><\\/div><div class="delta">Last read 24 h ago<`), label);
+    }
+
+    // One session: throttle and airflow stopped 20 s before the newest reading.
+    const env2 = makeEnv();
+    await upload(env2, [...drive({ n: 60 }), ...drive({ n: 20, ms0: 80000 }).map(none)], T0 + 100);
+    setNow(T0 + 105);
+    const q = openPage(env2, { hash: "live" });
+    await q.settle();
+    assert.equal(q.header(), "Engine running · updated just now");
+    const h = q.$("l-gauges").innerHTML;
+    assert.match(h, /Throttle<\/div>\s*<div class="val">–<small>/);
+    assert.match(h, /Airflow<\/div>\s*<div class="val">–<small>/);
+    assert.doesNotMatch(h, / old/);
+    assert.deepEqual([...p.errors, ...q.errors], []);
+  });
+
   check("overview: during an outage the ages on the cards keep counting", async () => {
     const env = makeEnv();
     await parkedCar(env);
@@ -1508,6 +1574,54 @@ async function behavior() {
     assert.equal(p.$("o-trips-chip").textContent, "1 total");
     assert.match(p.$("o-econ-chip").textContent, /mi logged$/);
     assert.match(p.header(), /^Parked · updated/);
+    assert.deepEqual(p.errors, []);
+  });
+
+  // At page open the status is not known yet, so the check above cannot tell the two rules apart:
+  // a failure during an outage is not counted, and neither is one before the first answer.
+  check("a trip list and economy that failed once while the server answered keep their early retry through a later outage", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // The first trip list and economy requests fail after the status was answered, so each counts once.
+    const first = new Set();
+    const p = openPage(env, {
+      reject: (path) => {
+        const kind = ["api/trips", "api/economy"].find((k) => path.startsWith(k));
+        if (!kind || first.has(kind)) return false;
+        first.add(kind);
+        return "late";
+      },
+    });
+    await p.settle();
+    // Two polls during an outage. Their failures must not use up the retry.
+    p.net.reject = () => true;
+    let t = T0 + 4000;
+    for (let i = 0; i < 2; i++) { t += p.nextPoll() / 1000; setNow(t); await p.poll(); }
+    assert.deepEqual([p.$("o-trips-chip").textContent, p.$("o-econ-chip").textContent], ["", ""]);
+    p.net.reject = null;
+    t += p.nextPoll() / 1000; setNow(t);
+    await p.poll();
+    assert.equal(p.$("o-trips-chip").textContent, "1 total");
+    assert.match(p.$("o-econ-chip").textContent, /mi logged$/);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("failures before the first answer do not count, so one more failure after it still gets an early retry", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env, { reject: () => true });
+    await p.settle();
+    // The server answers, and the trip list and the economy fail once more after the status.
+    p.net.reject = (path) => (path.startsWith("api/trips") || path.startsWith("api/economy")) && "late";
+    let t = T0 + 4000;
+    t += p.nextPoll() / 1000; setNow(t);
+    await p.poll();
+    assert.deepEqual([p.$("o-trips-chip").textContent, p.$("o-econ-chip").textContent], ["", ""]);
+    p.net.reject = null;
+    t += p.nextPoll() / 1000; setNow(t);
+    await p.poll();
+    assert.equal(p.$("o-trips-chip").textContent, "1 total");
+    assert.match(p.$("o-econ-chip").textContent, /mi logged$/);
     assert.deepEqual(p.errors, []);
   });
 
@@ -1910,6 +2024,10 @@ async function behavior() {
       assert.equal(p.made.length, 3);
       assert.ok(p.made.every((o) => o.scrollWheelZoom === false), JSON.stringify(p.made));
       assert.equal(p.calls.filter((k) => k === "on").length, touch ? 0 : 6);
+      // Runs the handlers of an event on every map, as Leaflet would, and gives what they did.
+      const handle = (ev) => { const at = p.calls.length; for (const [e, fn] of p.mapOn) if (e === ev) fn(); return p.calls.slice(at); };
+      assert.deepEqual(handle("click"), Array(touch ? 0 : 3).fill("wheel on"));
+      assert.deepEqual(handle("mouseout"), Array(touch ? 0 : 3).fill("wheel off"));
       assert.deepEqual(p.errors, []);
     }
   });
@@ -2187,11 +2305,12 @@ async function behavior() {
     const p = openPage(env, { hash: "logs", page: html.replace(from, () => to) });
     await p.settle();
     await sleep(0);
-    assert.ok(p.errors.length + stray.splice(0).length > 0, "no error for the broken Logs view at open");
+    // The errors are taken out as they are counted, so the poll has to bring its own.
+    assert.ok(p.errors.splice(0).length + stray.splice(0).length > 0, "no error for the broken Logs view at open");
     await p.poll();
     await sleep(0);
     assert.equal(p.polls().length, 1, "the poll after the error is set");
-    assert.ok(p.errors.length + stray.splice(0).length > 0, "no error for the broken Logs view in the poll");
+    assert.ok(p.errors.splice(0).length + stray.splice(0).length > 0, "no error for the broken Logs view in the poll");
   });
 
   check("live: a series the page does not know yet starts with gaps, and the polling goes on", async () => {
@@ -2224,7 +2343,7 @@ async function behavior() {
       const p = openPage(env, { hash, page: html.replace(from, () => to) });
       await p.settle();
       await sleep(0);
-      assert.ok(p.errors.length + stray.splice(0).length > 0, `no error for: ${name}`);
+      assert.ok(p.errors.splice(0).length + stray.splice(0).length > 0, `no error for: ${name}`);
     }
   });
 
@@ -2238,10 +2357,13 @@ async function behavior() {
       await fn();
       await sleep(0);
       if (stray.length) throw stray.splice(0)[0];
-      // However a check ends, no page it opened is left with two polls on the way.
+      // However a check ends, no page it opened is left with two polls on the way, or with an
+      // error caught from one of its timers. A check that expects errors takes them out.
       for (const p of opened) {
         const ms = p.polls().map((t) => t.ms);
         assert.ok(ms.length <= 1, `a page of this check ended with ${ms.length} poll timers (${ms})`);
+        const errs = p.errors.map((e) => String((e && e.stack) || e));
+        assert.deepEqual(errs, [], `a page of this check ended with errors:\n${errs.join("\n")}`);
       }
       console.log(`check-dash: ok    ${name}`);
     } catch (e) {
