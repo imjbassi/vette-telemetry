@@ -248,6 +248,9 @@
     .tabs button.active { color: #fff; }
     .tabs button.active svg { color: var(--blue); }
     .gauges { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    /* A chart head with a readout. When the two do not fit side by side, the readout takes a line
+       of its own under the title, instead of both breaking into short lines. */
+    .card-head:has(> .readout) { flex-wrap: wrap; row-gap: 2px; }
     .kpi .val { font-size: 24px; }
     .map { height: 260px; }
     /* Only Raw data takes this height. The other tables set theirs on the box. */
@@ -722,8 +725,8 @@
   // o.note is a line under the chart that hovering never replaces.
   let gid = 0;
   // An axis in whole steps of 1, 2, 2.5 or 5 times a power of ten, about four steps over the
-  // range, with both ends rounded out to a step. The labels take the decimals of the step (at
-  // most 2), so they never repeat and never print a needless "250.0".
+  // range, with both ends rounded out to a step. `dec` is the decimals of the step (at most 2), so
+  // labels with that many never repeat.
   function niceScale(lo, hi) {
     if (!(hi > lo)) hi = lo + 1;
     const raw = (hi - lo) / 4, p = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -738,8 +741,9 @@
     for (let k = k0; k <= k1; k++) ticks.push(Math.round(k * step * 1e6) / 1e6 || 0);
     return { y0: ticks[0], y1: ticks[ticks.length - 1], ticks, dec };
   }
-  // Through toLocaleString, so 1,000 keeps its separator.
-  const tickLabel = (v, dec) => v.toLocaleString(undefined, { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  // Through toLocaleString, so 1,000 keeps its separator. Up to `dec` decimals and no trailing
+  // zeros: 0, 2.5, 5, 7.5 and 10, not 0.0, 2.5 and 5.0. A step of 0.25 still gives 14.25.
+  const tickLabel = (v, dec) => v.toLocaleString(undefined, { maximumFractionDigits: dec });
   // The smallest span of an axis, by unit. A steady reading then draws a flat line, not noise
   // stretched to the full height.
   const MIN_SPAN = { mph: 20, rpm: 1000, "°F": 20, "%": 20, V: 1, "g/s": 10 };
@@ -1503,9 +1507,11 @@
         <div class="val">${val}<small>${unit}</small></div><div class="delta">${extra || "&nbsp;"}</div>${spark}</div>`;
     }).join("");
     $("l-gauges").innerHTML = html;
-    // The time axis has no date. Readings that are not live say when they end.
+    // The time axis has no date. Readings that are not live say when they end, in the short form of
+    // since(), so the subtitle fits beside a readout on a phone. Not "10 minutes": the newest
+    // session can be shorter than that.
     const tEnd = s.t.length ? s.t[s.t.length - 1] : null;
-    const win = on || tEnd == null ? "Last 10 minutes" : "10 minutes up to " + when(tEnd);
+    const win = on || tEnd == null ? "Last 10 minutes" : "Up to " + since(tEnd);
     for (const id of ["l-win", "l-win2", "l-win3", "l-win4"]) $(id).textContent = win;
     chart($("l-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 180, readout: $("l-speed-r"), empty: "No recent speed data" });
     chart($("l-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 180, readout: $("l-rpm-r"), empty: "No recent RPM data" });
@@ -1561,8 +1567,10 @@
       ["i-up", "var(--blue)", "Last upload", lastUp ? ago(lastUp) : "never", !lastUp ? "" : sameDay(lastUp, now()) ? secFmt.format(new Date(lastUp * 1000)) : when(lastUp), fresh ? "up" : ""],
       ["i-list", "var(--green)", "Uploads, last hour", f0(h.uploads), `${f0(h.records)} readings · ${f1((h.bytes || 0) / 1024)} KB`, ""],
       ["i-signal", "var(--yellow)", "Cell signal", L.csq ? `${bars(L.csq.v, !recent("csq"))} ${dbm(L.csq.v) ?? "–"}<small>dBm</small>` : "–", L.csq ? ago(L.csq.ts) : "", ""],
+      // A fix from an earlier power-up gives its own age. The logger may have been off for days,
+      // so "since the logger started" would read as a GPS failing now.
       ["i-sat", "var(--purple)", "GPS", g || !L.sats ? "No fix" : `${f0(L.sats.v)}<small>sats</small>`,
-        g ? lagText(g) : L.lat ? `Last fix ${ago(L.lat.ts)}` : "Needs a view of the sky", ""],
+        g ? (g.earlier ? `No fix in the newest session · last fix ${ago(L.lat.ts)}` : lagText(g)) : L.lat ? `Last fix ${ago(L.lat.ts)}` : "Needs a view of the sky", ""],
       ["i-pulse", "var(--cyan)", "Adapter link", link, L.link ? `Bluetooth to the OBD adapter · ${ago(L.link.ts)}` : "Not reported yet", L.link && L.link.v === 0 ? "down" : ""],
       ["i-car", "var(--orange)", "Firmware", build, L.fw ? (L.fw.v ? "Build number in the newest reading" : "From before build numbers") : "Not reported yet", ""],
     ];
@@ -1665,23 +1673,42 @@
     if (m) return setRange(null, +m[1], +m[2]);
     return setRange(arg);
   }
+  // History left open on a preset keeps the window of the moment it was read. The polls, a
+  // return, the end of the pause and the end of a drive read the preset again through here, once
+  // its window ended more than `age` seconds ago. Not while the date fields hold dates that were
+  // typed and not applied: the answer would write over them.
+  function retakePreset(age) {
+    if (S.view !== "history" || !S.hist.preset || now() - S.hist.to <= age) return;
+    if ($("h-from").value !== toInput(S.hist.from) || $("h-to").value !== toInput(S.hist.to)) return;
+    setRange(S.hist.preset);
+  }
 
   const rangeText = (a, b) => `${longDay.format(new Date(a * 1000))}, ${timeFmt.format(new Date(a * 1000))}  to  ${longDay.format(new Date(b * 1000))}, ${timeFmt.format(new Date(b * 1000))}`;
 
-  // The label under the range. It is written with the answer, so it never names a range other
-  // than the one the cards below show. S.hist.label keeps it for the messages of Apply.
+  // The label under the range. It is written with the answer, so it names the range that the cards
+  // below show. A range that could not load is named with that, and loadHistory then hides the
+  // cards of any other range. S.hist.label keeps it for the messages of Apply.
   function setLabel(text) { S.hist.label = text; $("h-label").textContent = text; }
 
   async function loadHistory() {
-    const { from, to } = S.hist;
+    // `key` names the range: a preset, or its two times. S.hist.shown is the key of the cards.
+    const { from, to } = S.hist, key = S.hist.preset || from + "-" + to;
     document.querySelectorAll("#h-presets button[data-p]").forEach((b) => b.classList.toggle("active", b.dataset.p === S.hist.preset));
     $("h-from").value = toInput(from); $("h-to").value = toInput(to);
     const req = (S.hist.req = (S.hist.req || 0) + 1);
     let d;
-    // An older range that fails late, for example cut off by the time limit, says nothing about the one on screen.
-    try { d = await get(`api/history?from=${from}&to=${to}`); } catch { if (req === S.hist.req) setLabel(rangeText(from, to) + " · could not load"); return; }
+    try { d = await get(`api/history?from=${from}&to=${to}`); }
+    catch {
+      // An older range that fails late, for example cut off by the time limit, says nothing about the one on screen.
+      if (req !== S.hist.req) return;
+      setLabel(rangeText(from, to) + " · could not load");
+      // Under the name of another range the cards would read as its figures, so they go until an
+      // answer comes. A preset that fails to load again keeps its own.
+      if (key !== S.hist.shown) { $("h-body").hidden = true; $("h-none").hidden = true; }
+      return;
+    }
     if (req !== S.hist.req) return;  // a newer range was picked while this one loaded
-    S.hist.data = d;
+    S.hist.data = d; S.hist.shown = key;
     // The server answers at most 366 days, the newest ones. The label and the date fields then
     // show what it answered.
     let label = rangeText(d.from, d.to);
@@ -1696,12 +1723,14 @@
     renderHistory();
   }
 
-  // A period with no trip and no reading: one line with the newest trip and a button to its day,
-  // instead of a page of zeros and a map of the whole country. Run again from loadTrips, because
-  // the trip list can arrive after the History answer.
+  // A period with no trip and no reading: one line with the last drive and a button to its day,
+  // instead of a page of zeros and a map of the whole country. That is the newest trip in which
+  // the car moved, as on the Last drive card, not an idle session after it. Only when no listed
+  // trip moved is it the newest trip. Run again from loadTrips, because the trip list can arrive
+  // after the History answer.
   function renderNone() {
-    const t = S.trips[0];
-    $("h-none-t").textContent = "No driving in this period." + (t ? ` The last trip was ${when(t.start_ts)}.` : "");
+    const t = S.trips.find(moved) || S.trips[0];
+    $("h-none-t").textContent = "No driving in this period." + (t ? ` The last ${moved(t) ? "drive" : "trip"} was ${when(t.start_ts)}.` : "");
     const b = $("h-none-day");
     b.hidden = !t;
     if (t) b.onclick = () => { const a = Math.floor(startOfDay(new Date(t.start_ts * 1000)).getTime() / 1000); setRange(null, a, dayEnd(a)); };
@@ -1715,8 +1744,8 @@
     $("h-none").hidden = !S.hist.none;
     $("h-body").hidden = S.hist.none;
     if (S.hist.none) { S.hist.days = []; renderNone(); return; }
-    // Logged miles leave out drives the logger missed. The odometer over the trips wholly inside
-    // the window shows how far the car went, given only when it is clearly more.
+    // Logged miles leave out drives the logger missed. The odometer over the window
+    // (windowOdometerMiles in queries.ts) shows how far the car went, given only when it is clearly more.
     const odo = T.odometer_mi != null && T.odometer_mi > T.miles + 1 && T.odometer_mi > T.miles * 1.05;
     // Fuel and MPG come from engine airflow, so both are estimates, and in plain text: no good or
     // bad color. Under the minimum of logged miles the MPG is rough, as on Overview.
@@ -1725,8 +1754,10 @@
       ["i-route", "var(--blue)", "Distance", `${f1(T.miles)}<small>mi</small>`, `${d.trips.length} trip${d.trips.length === 1 ? "" : "s"}` +
         (odo ? ` · <span class="warn">${esc(f1(T.odometer_mi))} mi by odometer</span>` : "")],
       ["i-clock", "var(--cyan)", "Engine on", dur(T.engine_s).replace(/ (s|min|h|d)\b/g, "<small>$1</small>"), `${dur(T.moving_s)} moving · ${dur(T.idle_s)} idle`],
-      // The lowest and highest tank reading. Which came first is not known from these two.
-      ["i-fuel", "var(--green)", "Fuel used (est.)", `${galText(T.gallons)}<small>gal</small>`, T.fuel_min != null ? `tank ${f0(T.fuel_min)} to ${f0(T.fuel_max)} %` : "&nbsp;"],
+      // The lowest and highest tank reading. Which came first is not known from these two, so the
+      // line names them as a range. "57 to 98" next to the fuel used would read as a fill-up.
+      ["i-fuel", "var(--green)", "Fuel used (est.)", `${galText(T.gallons)}<small>gal</small>`, T.fuel_min == null ? "&nbsp;"
+        : f0(T.fuel_min) === f0(T.fuel_max) ? `tank at ${f0(T.fuel_min)} %` : `tank between ${f0(T.fuel_min)} and ${f0(T.fuel_max)} %`],
       ["i-drop", "var(--purple)", "MPG (est.)", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`,
         T.mpg == null ? "Needs some driving"
         : T.mpg_few_miles ? `rough, only ${f1(T.miles_down)}${need ? ` of ${need}` : ""} mi logged`
@@ -1935,8 +1966,10 @@
       if (S.view === "live") await loadLive();
       else if (S.view === "logs") await loadLogs();
       else await loadStatus();
-      // Short ranges that end now move with the clock. Long and past ranges only reload on demand.
-      if (S.view === "history" && (S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) setRange(S.hist.preset);
+      // Short ranges that end now move with the clock, every fifth poll. The other presets wait for
+      // a return, the end of the pause or the end of a drive. A window read in the last minute, as
+      // on a return, is not read again.
+      if ((S.hist.preset === "today" || S.hist.preset === "24h") && n % 5 === 0) retakePreset(60);
       // Every sixth poll. A first load that failed while the server answered is asked once more
       // on the next poll, not on every one: a request that keeps failing would otherwise keep
       // the header on the error and the polls at the fast rate.
@@ -1947,13 +1980,15 @@
     }
   }
   // Back after a pause or a long time in the background: the trip list and the economy figures
-  // are stale too, not only the view that polls.
+  // are stale too, not only the view that polls. So is a History preset whose window ended more
+  // than 5 minutes ago.
   function resume() {
     lastInput = Date.now();
     S.paused = false;
     renderHeader(); renderFoot();
     tick();
     loadTrips(); loadEcon();
+    retakePreset(300);
   }
   function wake() {
     lastInput = Date.now();
@@ -1978,12 +2013,12 @@
     // During an outage or a pause no answer redraws Overview, so its ages are moved on here.
     // Only then: every redraw binds the marker tooltip again.
     if (S.view === "overview" && (S.err || S.paused)) renderOverview();
-    // A drive that just ended changes the trip list and the fuel figures, so they are read once.
-    // A hidden or paused page makes no requests. During an outage the change waits for the first
-    // check after the server answers again.
+    // A drive that just ended changes the trip list, the fuel figures and an open History preset,
+    // so they are read once. A hidden or paused page makes no requests. During an outage the
+    // change waits for the first check after the server answers again.
     if (!S.paused && !document.hidden && !S.err) {
       const act = active();
-      if (S.wasActive && !act) { loadTrips(); loadEcon(); }
+      if (S.wasActive && !act) { loadTrips(); loadEcon(); retakePreset(0); }
       S.wasActive = act;
     }
     if (S.shown === handled) return;

@@ -807,8 +807,13 @@ async function behavior() {
     assert.deepEqual(d.fills, ["#8b8f9a"]);
     d.nav("logs");
     await d.settle();
-    assert.match(d.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix since the logger started</);
-    assert.deepEqual([...a.errors, ...b.errors, ...c.errors, ...d.errors], []);
+    // Logs gives the age of that fix, which stays true while the logger is off.
+    assert.match(d.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix in the newest session · last fix 3 min ago</);
+    setNow(T0 + 500 + 3 * 86400);
+    const e = openPage(later, { hash: "logs" });
+    await e.settle();
+    assert.match(e.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix in the newest session · last fix 3 d ago</);
+    assert.deepEqual([...a.errors, ...b.errors, ...c.errors, ...d.errors, ...e.errors], []);
   });
 
   check("a session cut off while the engine idled is not called a drive, and its trip says that its end did not arrive", async () => {
@@ -1188,9 +1193,10 @@ async function behavior() {
     const p = openPage(env, { hash: "history/24h" });
     await p.settle();
     const kpis = p.$("h-kpis").innerHTML;
-    // The lowest and highest tank reading, lowest first, with no arrow that reads as a start and an end.
+    // The lowest and highest tank reading, named as a range. "tank 62 to 63 %" next to the fuel
+    // used reads as a fill-up, and an arrow as a start and an end.
     assert.ok(kpis.includes(`Fuel used (est.)</div><div class="val">${h.totals.gallons.toFixed(2)}<small>gal</small></div>` +
-      `<div class="delta">tank ${Math.round(h.totals.fuel_min)} to ${Math.round(h.totals.fuel_max)} %</div>`), kpis);
+      `<div class="delta">tank between ${Math.round(h.totals.fuel_min)} and ${Math.round(h.totals.fuel_max)} %</div>`), kpis);
     // Under 25 logged miles: grey, called rough, and no verdict against EPA.
     assert.ok(kpis.includes(`MPG (est.)</div><div class="val rough">${f1(h.totals.mpg)}<small>mpg</small></div>` +
       `<div class="delta">rough, only ${f1(h.totals.miles_down)} of 25 mi logged</div>`), kpis);
@@ -1211,7 +1217,17 @@ async function behavior() {
     const pct = Math.round(((g.totals.mpg - 19) / 19) * 100);
     assert.ok(q.$("h-kpis").innerHTML.includes(`MPG (est.)</div><div class="val">${f1(g.totals.mpg)}<small>mpg</small></div><div class="delta">${pct}% vs EPA 19</div>`), q.$("h-kpis").innerHTML);
     assert.ok(q.$("h-kpis").innerHTML.includes(`Fuel used (est.)</div><div class="val">${f1(g.totals.gallons)}<small>gal</small></div>`));
-    assert.deepEqual([...p.errors, ...q.errors], []);
+
+    // The gauge read the same whole percent all period: one value, not a range from it to itself.
+    const flat = makeEnv();
+    await upload(flat, drive({ n: 60 }), T0 + 100);
+    setNow(T0 + 200);
+    const one = await api(flat, `api/history?from=${T0 + 200 - 86400}&to=${T0 + 200}`);
+    assert.equal(Math.round(one.totals.fuel_min), Math.round(one.totals.fuel_max));
+    const r = openPage(flat, { hash: "history/24h" });
+    await r.settle();
+    assert.match(r.$("h-kpis").innerHTML, new RegExp(`<div class="delta">tank at ${Math.round(one.totals.fuel_min)} %</div>`));
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors], []);
   });
 
   check("logs: the GPS card gives the age of the fix, and no card or table prints coordinates", async () => {
@@ -1335,14 +1351,37 @@ async function behavior() {
     assert.match(g, /Instant MPG<\/div>\s*<div class="val">–<small>mpg/);
     // The fill of a sparkline drops under its last reading (the 300th of 310), not at the edge.
     assert.match(g, /L193\.5,34L0\.0,34Z/);
-    // The time axis has no date, so the subtitles give the end of the readings.
-    const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+    // The time axis has no date, so the subtitles give the end of the readings, short enough to
+    // sit beside a readout on a phone: the time alone today, the weekday within 6 days, else the date.
     const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const wday = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+    const date = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
     const end = new Date((T0 + 338) * 1000);
-    const wins = ["l-win", "l-win2", "l-win3", "l-win4"].map((id) => p.$(id).textContent);
-    assert.deepEqual(wins, Array(4).fill(`10 minutes up to ${day.format(end)}, ${time.format(end)}`));
+    const wins = (q) => ["l-win", "l-win2", "l-win3", "l-win4"].map((id) => q.$(id).textContent);
+    assert.deepEqual(wins(p), Array(4).fill(`Up to ${time.format(end)}`));
     assert.match(p.$("l-thr-r").innerHTML, /^avg <b>/);
     assert.match(p.$("l-cool-r").innerHTML, /^avg <b>/);
+    setNow(T0 + 3 * 86400);
+    const later = openPage(env, { hash: "live" });
+    await later.settle();
+    assert.deepEqual(wins(later), Array(4).fill(`Up to ${wday.format(end)} ${time.format(end)}`));
+    setNow(T0 + 10 * 86400);
+    const old = openPage(env, { hash: "live" });
+    await old.settle();
+    assert.deepEqual(wins(old), Array(4).fill(`Up to ${date.format(end)}`));
+    assert.match(old.$("l-speed-r").innerHTML, /^avg <b>/);
+    // On a phone a chart head lets its readout take a line of its own when the two do not fit.
+    const style = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
+    const phone = style.slice(style.indexOf("@media (max-width: 820px) {\n"), style.indexOf("\n  }", style.indexOf("@media (max-width: 820px) {\n")));
+    assert.match(phone, /\n    \.card-head:has\(> \.readout\) \{ flex-wrap: wrap; row-gap: 2px; \}/);
+    // The rule reaches only a readout that is a child of the head: every div opened after the head
+    // is closed again before it.
+    for (const id of ["l-speed-r", "l-rpm-r", "l-thr-r", "l-cool-r", "t-speed-r", "t-rpm-r", "t-cool-r", "t-thr-r"]) {
+      const at = html.indexOf(`<span class="readout" id="${id}">`), head = html.lastIndexOf('<div class="card-head"', at);
+      const between = html.slice(html.indexOf(">", head) + 1, at);
+      assert.ok(at > 0 && head > 0 && (between.match(/<div\b/g) ?? []).length === (between.match(/<\/div>/g) ?? []).length, `${id} is not a readout of a card head`);
+    }
+    setNow(T0 + 4000);
 
     // Overview: the voltage is an hour old, so it is grey and its word is in the past tense.
     const o = openPage(env);
@@ -1557,6 +1596,31 @@ async function behavior() {
     assert.ok(air[0] < -22, `intake axis ${air}`);
     inside("History intake", q.$("h-chart").innerHTML, 230);
     assert.deepEqual([...p.errors, ...h.errors, ...q.errors], []);
+  });
+
+  check("charts: the y labels show only the decimals they need", async () => {
+    const env = makeEnv();
+    // About 9 logged miles in one drive, so the By day axis steps by 2.5.
+    await upload(env, drive({ n: 760 }), T0 + 800);
+    setNow(T0 + 900);
+    const h = await api(env, `api/history?from=${T0}&to=${T0 + 900}`);
+    assert.ok(h.totals.miles > 8 && h.totals.miles <= 10, `${h.totals.miles} mi`);
+    // The y labels from the bottom up, as the page wrote them.
+    const labels = (svg, x) => [...svg.matchAll(new RegExp(`<text x="${x}" y="[\\d.]+" text-anchor="end">([^<]*)</text>`, "g"))].map((m) => m[1]);
+    const p = openPage(env, { hash: `history/${T0}-${T0 + 900}` });
+    await p.settle();
+    // Through toLocaleString, so the same separators.
+    assert.deepEqual(labels(p.$("h-days").innerHTML, 26), [0, 2.5, 5, 7.5, 10].map((v) => v.toLocaleString()));
+    // The battery reads 14.10 to 14.16 V on an axis of 1 V or more in steps of 0.25: whole volts
+    // without decimals, quarter volts with both.
+    p.groups["#h-metrics button"].find((b) => b.dataset.m === "battery").onclick();
+    const volts = labels(p.$("h-chart").innerHTML, 32);
+    const group = (1000).toLocaleString().replace(/\d/g, ""), point = (1.5).toLocaleString().replace(/\d/g, "");
+    const num = (s) => +s.split(group).join("").replace(point, ".");
+    assert.ok(volts.length >= 3, `${volts}`);
+    for (const s of volts) assert.equal(s, num(s).toLocaleString(undefined, { maximumFractionDigits: 2 }), `${volts}`);
+    assert.ok(volts.includes((14).toLocaleString()) && volts.includes((14.25).toLocaleString()), `${volts}`);
+    assert.deepEqual(p.errors, []);
   });
 
   check("history: the hover value has a line of its own, outside the card head", async () => {
@@ -1931,11 +1995,12 @@ async function behavior() {
     await p.settle();
     assert.match(p.$("h-kpis").innerHTML, /Distance/);
     const label = p.$("h-label").textContent;
-    // 30 s after the first pick the page gives the long range up.
+    // 30 s after the first pick the page gives the long range up. The cards of the short one stay.
     assert.deepEqual(p.limits().map((t) => t.ms), [30000]);
     p.limits()[0].fn();
     await p.settle();
     assert.equal(p.$("h-label").textContent, label);
+    assert.deepEqual([p.$("h-body").hidden, p.$("h-none").hidden], [false, true]);
     assert.deepEqual(p.errors, []);
   });
 
@@ -1995,7 +2060,57 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
-  check("history: opens on 30 days, and an empty period is one line with the last trip and a button to its day", async () => {
+  check("history: the cards of one range never stand under another range that could not load", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const day = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const at = (ts) => `${day.format(new Date(ts * 1000))}, ${time.format(new Date(ts * 1000))}`;
+    const failing = (path) => path.startsWith("api/history?");
+    const preset = (q, name) => q.groups["#h-presets button[data-p]"].find((b) => b.dataset.p === name).onclick();
+    const boxes = (q) => [q.$("h-body").hidden, q.$("h-none").hidden];
+    // The first range fails: no empty cards under its name.
+    const p = openPage(env, { hash: "history/24h", reject: failing });
+    await p.settle();
+    assert.equal(p.$("h-label").textContent, `${at(T0 + 8000 - 86400)}  to  ${at(T0 + 8000)} · could not load`);
+    assert.deepEqual(boxes(p), [true, true]);
+    // It loads on a tap.
+    p.net.reject = null;
+    preset(p, "24h");
+    await p.settle();
+    assert.deepEqual(boxes(p), [false, true]);
+    assert.match(p.$("h-kpis").innerHTML, /<div class="delta">3 trips · /);
+    // A minute later the same preset fails to load again: its own cards stay, under its name.
+    const cards = p.$("h-kpis").innerHTML;
+    p.net.reject = failing;
+    setNow(T0 + 8060);
+    preset(p, "24h");
+    await p.settle();
+    assert.equal(p.$("h-label").textContent, `${at(T0 + 8060 - 86400)}  to  ${at(T0 + 8060)} · could not load`);
+    assert.deepEqual(boxes(p), [false, true]);
+    assert.equal(p.$("h-kpis").innerHTML, cards);
+    // Another range fails: the 24 hours cards go, and come back with the next answer.
+    p.location.hash = `history/${T0 + 3000}-${T0 + 8000}`;
+    await p.settle();
+    assert.equal(p.$("h-label").textContent, `${at(T0 + 3000)}  to  ${at(T0 + 8000)} · could not load`);
+    assert.deepEqual(boxes(p), [true, true]);
+    p.net.reject = null;
+    preset(p, "24h");
+    await p.settle();
+    assert.deepEqual(boxes(p), [false, true]);
+    // An empty period on screen, then a range that fails: its line goes too.
+    p.location.hash = `history/${T0 + 5000}-${T0 + 6000}`;
+    await p.settle();
+    assert.deepEqual(boxes(p), [true, false]);
+    p.net.reject = failing;
+    preset(p, "7d");
+    await p.settle();
+    assert.deepEqual(boxes(p), [true, true]);
+    assert.match(p.$("h-label").textContent, / · could not load$/);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("history: opens on 30 days, and an empty period is one line with the last drive and a button to its day", async () => {
     const env = makeEnv();
     await parkedCar(env);
     const p = openPage(env, { hash: "history" });
@@ -2015,8 +2130,8 @@ async function behavior() {
     p.location.hash = `history/${T0 + 1000}-${T0 + 3000}`;
     await p.settle();
     assert.deepEqual([p.$("h-none").hidden, p.$("h-body").hidden, p.$("h-none-day").hidden], [false, true, false]);
-    assert.equal(p.$("h-none-t").textContent, `No driving in this period. The last trip was ${when}.`);
-    // The button opens the local day of that trip, in place of the empty range.
+    assert.equal(p.$("h-none-t").textContent, `No driving in this period. The last drive was ${when}.`);
+    // The button opens the local day of that drive, in place of the empty range.
     p.$("h-none-day").onclick();
     await p.settle();
     const s = new Date(start * 1000);
@@ -2038,9 +2153,37 @@ async function behavior() {
     assert.equal(q.$("h-none-t").textContent, "No driving in this period.");
     assert.equal(q.$("h-none-day").hidden, true);
     await q.poll();
-    assert.equal(q.$("h-none-t").textContent, `No driving in this period. The last trip was ${when}.`);
+    assert.equal(q.$("h-none-t").textContent, `No driving in this period. The last drive was ${when}.`);
     assert.equal(q.$("h-none-day").hidden, false);
-    assert.deepEqual([...p.errors, ...q.errors], []);
+
+    // The next day the engine idles for two and a half minutes and the session ends normally. The
+    // car stands, without a fix, and the odometer stays put. That session is the newest trip, but
+    // the line still names the drive, and the button opens the drive's day, as on Last drive.
+    const idle = drive({ boot: 12, n: 150, gps: false, base: T0 + 86400 });
+    const off = drive({ boot: 12, n: 10, ms0: 170000, stepMs: 2000, flags: F.QUIET, gps: false, base: T0 + 86400 });
+    const flat = (r) => ({ ...r, speed_kph: 0, odo_km: idle[0].odo_km });
+    await upload(env, [...idle.map(flat), ...off.map((r) => ({ ...flat(r), rpm: null, speed_kph: null }))], T0 + 86400 + 200);
+    setNow(T0 + 86400 + 4000);
+    const list = (await api(env, "api/trips?limit=40")).trips;
+    assert.deepEqual(list.map((t) => t.id), [sid(12, INST), 11]);
+    const r = openPage(env, { hash: `history/${T0 + 86400 + 1000}-${T0 + 86400 + 3000}` });
+    await r.settle();
+    assert.match(r.header(), /^Parked · updated /);
+    assert.equal(r.$("h-none-t").textContent, `No driving in this period. The last drive was ${when}.`);
+    r.$("h-none-day").onclick();
+    await r.settle();
+    assert.equal(r.location.hash, `#history/${a}-${b - 1}`);
+    assert.match(r.$("h-kpis").innerHTML, /<div class="delta">1 trip<\/div>/);
+
+    // Only idle sessions: the line names the newest of them as a trip, not as a drive.
+    const still = makeEnv();
+    await upload(still, [...idle.map(flat), ...off.map((r) => ({ ...flat(r), rpm: null, speed_kph: null }))], T0 + 86400 + 200);
+    setNow(T0 + 86400 + 4000);
+    const at = new Date((T0 + 86420) * 1000);
+    const u = openPage(still, { hash: `history/${T0 + 86400 + 1000}-${T0 + 86400 + 3000}` });
+    await u.settle();
+    assert.equal(u.$("h-none-t").textContent, `No driving in this period. The last trip was ${day.format(at)}, ${time.format(at)}.`);
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors, ...u.errors], []);
   });
 
   check("history: Custom opens the date fields on a phone, a chart is titled like its button, and Apply orders the dates or says what is missing", async () => {
@@ -2507,6 +2650,118 @@ async function behavior() {
     await r.settle();
     assert.deepEqual([r.requests("api/trips"), r.requests("api/economy")], [then[0] + 1, then[1] + 1]);
     assert.deepEqual([...p.errors, ...q.errors, ...s.errors, ...r.errors], []);
+  });
+
+  check("history: an open preset is read again after a return, the pause and the end of a drive, but not over typed dates", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env, { hash: "history" });
+    await p.settle();
+    const asked = () => p.net.log.filter((path) => path.startsWith("api/history?"));
+    // 30 days: from local midnight 29 days back to now.
+    const month = (t) => { const n = new Date(t * 1000); return `api/history?from=${new Date(n.getFullYear(), n.getMonth(), n.getDate() - 29).getTime() / 1000}&to=${t}`; };
+    assert.deepEqual(asked(), [month(T0 + 4000)]);
+    assert.equal(p.$("h-trips-chip").textContent, "1 trip");
+
+    // Seven minutes in the background, while a drive is uploaded. The return reads the preset
+    // once, up to now, and the new trip is in it.
+    p.visible(false);
+    const next = drive({ boot: 12, n: 60, base: T0 + 4100 });
+    const stop = drive({ boot: 12, n: 10, ms0: 80000, stepMs: 2000, flags: F.QUIET, base: T0 + 4100 }).map((r) => ({ ...r, rpm: null, speed_kph: null }));
+    await upload(env, [...next, ...stop], T0 + 4220);
+    setNow(T0 + 4420);
+    p.visible(true);
+    await p.settle();
+    assert.deepEqual(asked().slice(1), [month(T0 + 4420)]);
+    assert.equal(p.$("h-trips-chip").textContent, "2 trips");
+    assert.ok(p.groups["#h-presets button[data-p]"].find((b) => b.dataset.p === "30d").classList.contains("active"), "30 days is not marked");
+    // Two minutes away is no return. Only the status is asked.
+    p.visible(false);
+    setNow(T0 + 4540);
+    p.visible(true);
+    await p.settle();
+    assert.equal(asked().length, 2);
+    // 16 minutes without a touch pause the page. The tap that ends the pause reads the preset.
+    setNow(T0 + 5500);
+    await p.poll();
+    assert.equal(p.header(), "Paused · tap to resume");
+    p.listeners.pointerdown();
+    await p.settle();
+    assert.deepEqual(asked().slice(2), [month(T0 + 5500)]);
+    // Only while History is open. On Overview a return leaves it, and History reads it when it opens.
+    p.nav("overview");
+    await p.settle();
+    p.visible(false);
+    setNow(T0 + 5920);
+    p.visible(true);
+    await p.settle();
+    assert.equal(asked().length, 3);
+    p.nav("history");
+    await p.settle();
+    assert.deepEqual(asked().slice(3), [month(T0 + 5920)]);
+    // Dates typed into the fields and not applied yet. A return leaves them as they are, and
+    // Apply then loads them.
+    const typed = wall(T0 - 5 * 86400);
+    p.$("h-from").value = typed;
+    p.visible(false);
+    setNow(T0 + 6340);
+    p.visible(true);
+    await p.settle();
+    assert.equal(asked().length, 4);
+    assert.equal(p.$("h-from").value, typed);
+    p.$("h-apply").onclick();
+    await p.settle();
+    assert.deepEqual(asked().slice(4), [`api/history?from=${T0 - 5 * 86400}&to=${T0 + 5880}`]);
+    // A range of dates does not move, so a return does not read it again.
+    p.visible(false);
+    setNow(T0 + 6760);
+    p.visible(true);
+    await p.settle();
+    assert.equal(asked().length, 5);
+    // A preset read a minute before the tap that ends the pause is not read again.
+    setNow(T0 + 7720);
+    p.groups["#h-presets button[data-p]"].find((b) => b.dataset.p === "7d").onclick();
+    await p.settle();
+    assert.equal(asked().length, 6);
+    await p.poll();
+    assert.equal(p.header(), "Paused · tap to resume");
+    setNow(T0 + 7780);
+    p.listeners.pointerdown();
+    await p.settle();
+    assert.equal(asked().length, 6);
+    assert.match(p.header(), /^Parked · /);
+
+    // A drive ends while History shows Today. The next 10 s check reads Today again, once.
+    const env2 = makeEnv();
+    await upload(env2, drive({ n: 120 }), T0 + 140);
+    setNow(T0 + 145);
+    const q = openPage(env2, { hash: "history/today" });
+    await q.settle();
+    q.interval();
+    const today = (t) => `api/history?from=${new Date(new Date(t * 1000).setHours(0, 0, 0, 0)).getTime() / 1000}&to=${t}`;
+    const askedQ = () => q.net.log.filter((path) => path.startsWith("api/history?"));
+    assert.deepEqual(askedQ(), [today(T0 + 145)]);
+    await upload(env2, drive({ n: 10, ms0: 142000, stepMs: 2000, flags: F.QUIET }).map((r) => ({ ...r, rpm: null, speed_kph: null })), T0 + 180);
+    setNow(T0 + 185);
+    await q.poll();
+    assert.match(q.header(), /^Parked · /);
+    assert.equal(askedQ().length, 1);
+    q.interval();
+    await q.settle();
+    assert.deepEqual(askedQ().slice(1), [today(T0 + 185)]);
+    setNow(T0 + 195);
+    q.interval();
+    await q.settle();
+    assert.equal(askedQ().length, 2);
+    // Five returns in a row each read Today once, the one on a fifth poll too.
+    for (let k = 1; k <= 5; k++) {
+      q.visible(false);
+      setNow(T0 + 195 + k * 420);
+      q.visible(true);
+      await q.settle();
+      assert.deepEqual(askedQ().slice(1 + k), [today(T0 + 195 + k * 420)], `return ${k}`);
+    }
+    assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
   check("history: every preset and metric button draws, and 7 days asks from local midnight 6 days back", async () => {
