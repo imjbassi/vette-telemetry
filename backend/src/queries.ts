@@ -282,6 +282,17 @@ export function cutOffBoot(latest: Latest, now: number): number | null {
   return cs.ended_mid_drive && !catchingUp(cs, latest, now) ? latest.engine_on.boot : null;
 }
 
+// Whether the session that cutOffBoot names moved, by tripMoved like the trip lists. Null when
+// none was cut off or it has no trip row. One trip row, plus its route points only when its
+// speed readings logged almost nothing.
+async function cutOffMoved(env: Env, latest: Latest, now: number): Promise<boolean | null> {
+  const boot = cutOffBoot(latest, now);
+  const agg = boot == null ? null : await tripAgg(env, boot);
+  if (!agg) return null;
+  const [n] = await withGpsMiles(env, [tripNumbers(agg)]);
+  return tripMoved(n);
+}
+
 // The same during a shorter gap. Only the sentence changes, the car still counts as driving.
 // The upload has to be well after the newest record, or it was just the last post before the
 // car went quiet.
@@ -289,8 +300,8 @@ const drainingGap = (cs: CarState, latest: Latest, now: number) =>
   cs.state === "no_signal" && cs.last_seen_ts != null && uploadingNow(latest, now) &&
   latest.last_upload.ts - cs.last_seen_ts > STATE_RULES.running_s;
 
-// The state word plus one plain sentence, for the Claude tools.
-function describeState(env: Env, cs: CarState, latest: Latest, now: number) {
+// The state word plus one plain sentence, for the Claude tools. `moved` is cutOffMoved().
+function describeState(env: Env, cs: CarState, latest: Latest, now: number, moved: boolean | null = null) {
   const seen = cs.last_seen_ts == null ? "" : ago(cs.last_seen_ts, now);
   const backlog = catchingUp(cs, latest, now) || drainingGap(cs, latest, now);
   let summary: string;
@@ -302,7 +313,10 @@ function describeState(env: Env, cs: CarState, latest: Latest, now: number) {
     summary = `The logger is uploading stored records right now (last upload ${ago(latest.last_upload.ts, now)}). The newest one so far is from ${seen} ` +
       "and had the engine on, so the current state is not known until it has caught up.";
   } else if (cs.ended_mid_drive) {
-    summary = `Treated as parked. The last report (${seen}) still had the engine on, and the end of that drive has not arrived. ` +
+    // Like the dashboard: a session in which the car never moved went offline while idling.
+    summary = (moved === false
+      ? `Treated as parked. The logger went offline while the engine idled (last report ${seen}), so the end of that session has not arrived. `
+      : `Treated as parked. The last report (${seen}) still had the engine on, and the end of that drive has not arrived. `) +
       "Records the logger still holds are sent after its next start.";
   } else if (cs.link_down) {
     summary = `The logger is reporting (last ${seen}) but has no Bluetooth link to the OBD adapter, so the engine state is not known.`;
@@ -379,7 +393,7 @@ export async function latestStatus(env: Env, now = nowS()) {
   const cs = carState(L, now);
   const fuelPct = val("fuel_pct");
   const gal = fuelPct == null ? null : (fuelPct / 100) * TANK_GAL;
-  const econ = fuelPct == null ? null : await mpg30(env, now);
+  const [econ, moved] = await Promise.all([fuelPct == null ? null : mpg30(env, now), cutOffMoved(env, L, now)]);
   // Under the minimum of logged miles the car's own rough figure is used when it is below the
   // EPA rating. A rough figure above it would stretch the range, so EPA stays then.
   const rough = econ ? roughMpg(econ) : null;
@@ -401,7 +415,7 @@ export async function latestStatus(env: Env, now = nowS()) {
   const odoLags = !!L.odo_km && !!L.engine_on && L.engine_on.ts - L.odo_km.ts > ODOMETER_LAG_S;
   const battery = L.adapter_v;
   return {
-    car_state: describeState(env, cs, L, now),
+    car_state: describeState(env, cs, L, now, moved),
     // Without the adapter link the logger cannot see the engine, so this is not known.
     engine_running_at_last_report: cs.link_down ? null : val("engine_on") === 1,
     fuel: fuelPct == null ? null : {
@@ -467,7 +481,7 @@ export async function location(env: Env, now = nowS()) {
     // records are still uploading, the newest record had the engine on and nothing came after,
     // or the car is parked and the fix is behind (see fixBehind).
     parked: cs.link_down || cs.ended_mid_drive || (parked && fixBehind) ? null : parked,
-    car_state: describeState(env, cs, L, now),
+    car_state: describeState(env, cs, L, now, await cutOffMoved(env, L, now)),
   };
 }
 

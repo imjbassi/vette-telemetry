@@ -1413,6 +1413,34 @@ test("get_latest_status: no signal, parked, link down, legacy firmware and the E
   assert.deepEqual(await latestStatus(makeEnv(), now), { error: "No data received yet." });
 });
 
+test("car_state: a session cut off while the engine idled is not called a drive", async () => {
+  const e = carEnv();
+  const now = utc(2026, 11, 4, 20);
+  const idle = "Treated as parked. The logger went offline while the engine idled (last report 2 h ago), " +
+    "so the end of that session has not arrived. Records the logger still holds are sent after its next start.";
+  const drive = "Treated as parked. The last report (2 h ago) still had the engine on, and the end of that drive has not " +
+    "arrived. Records the logger still holds are sent after its next start.";
+  // Nov 4 09:57 PST: the engine idled 3 minutes with the odometer standing still, then nothing came.
+  addSession(e, { boot: 16, start: now - 7400, minutes: 3, idle: true, odo: [1347.8, 1347.8] });
+  setLatest(e, drivingLatest(now - 7200, 16, { speed_kph: 0, rpm: 700 }));
+  const s = await latestStatus(e, now);
+  assert.deepEqual([s.car_state.state, s.car_state.ended_mid_drive], ["parked", true]);
+  assert.equal(s.car_state.summary, idle);
+  const l = await location(e, now);
+  assert.deepEqual(l.car_state, s.car_state);
+  assert.equal(l.parked, null);
+  // An idle row whose odometer moved 0.3 mi moved, like on the trip lists and the dashboard.
+  addSession(e, { boot: 17, start: now - 7400, minutes: 3, idle: true, odo: [1347.8, 1348.3] });
+  setLatest(e, drivingLatest(now - 7200, 17, { speed_kph: 0, rpm: 700 }));
+  assert.equal((await latestStatus(e, now)).car_state.summary, drive);
+  // Without a trip row the old sentence stays.
+  setLatest(e, drivingLatest(now - 7200, 99));
+  assert.equal((await latestStatus(e, now)).car_state.summary, drive);
+  // A car that is still running is not cut off, whatever it did.
+  setLatest(e, drivingLatest(now, 16, { speed_kph: 0, rpm: 700 }));
+  assert.match((await latestStatus(e, now)).car_state.summary, /^The engine is running/);
+});
+
 test("car_state while stored records upload: an old newest record is not a lost drive end", async () => {
   const e = carEnv();
   const now = utc(2026, 11, 3, 20, 30);
