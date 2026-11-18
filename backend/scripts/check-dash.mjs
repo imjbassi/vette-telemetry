@@ -161,6 +161,20 @@ async function behavior() {
     // a check that reads hidden false shows that the page itself made the element visible.
     const startHidden = new Set([...text.matchAll(/<[a-z][^>]*\bid="([^"]+)"[^>]*>/g)]
       .filter((m) => /\shidden[\s>]/.test(m[0])).map((m) => m[1]));
+    // The same for an inline style: element.style starts with what the markup sets, under the
+    // camelCase names a browser uses. So a check that reads style.visibility "" shows that the
+    // page itself made visible what the markup made invisible.
+    const startStyle = new Map();
+    for (const m of text.matchAll(/<[a-z][^>]*\bid="([^"]+)"[^>]*>/g)) {
+      const s = /\sstyle="([^"]*)"/.exec(m[0]);
+      if (!s) continue;
+      const style = {};
+      for (const decl of s[1].split(";")) {
+        const at = decl.indexOf(":");
+        if (at > 0) style[decl.slice(0, at).trim().replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = decl.slice(at + 1).trim();
+      }
+      startStyle.set(m[1], style);
+    }
     const els = new Map();
     // A browser's dataset holds strings: li.dataset.id = 11 reads back as "11".
     const stringMap = () => new Proxy({}, { set: (o, k, v) => { o[k] = String(v); return true; } });
@@ -202,7 +216,7 @@ async function behavior() {
     // Like document.getElementById: null for an id the page does not have.
     const $ = (id) => {
       if (!ids.has(id)) return null;
-      if (!els.has(id)) { const e = makeEl(); e.id = id; e.hidden = startHidden.has(id); els.set(id, e); }
+      if (!els.has(id)) { const e = makeEl(); e.id = id; e.hidden = startHidden.has(id); Object.assign(e.style, startStyle.get(id)); els.set(id, e); }
       return els.get(id);
     };
     // The few groups the page looks up by selector, taken from the markup, so their click
@@ -218,9 +232,11 @@ async function behavior() {
 
     // reject(path) and hold(path) decide per request. reject may answer "late": the request
     // then fails after the others of the same moment were answered. A held request never
-    // answers, so only the page's own time limit can end it. edit(path, answer) may change a
+    // answers, so only the page's own time limit can end it. answer(path, res) gives the page a
+    // Response of its own in place of the Worker's res, as Cloudflare in front of the Worker would,
+    // or another version of the Worker while a deploy rolls out. edit(path, answer) may change a
     // JSON answer in place before the page reads it, as a newer Worker would answer.
-    const net = { log: [], busy: 0, reject, hold, edit: null };
+    const net = { log: [], busy: 0, reject, hold, answer: null, edit: null };
     const fetch = async (path, init = {}) => {
       net.log.push(path);
       if (net.hold && net.hold(path)) {
@@ -231,7 +247,8 @@ async function behavior() {
         const verdict = net.reject && net.reject(path);
         if (verdict === "late") await sleep(20);
         if (verdict) throw new TypeError("Failed to fetch");
-        const res = await call(env, path);
+        let res = await call(env, path);
+        if (net.answer) res = await net.answer(path, res);
         if (!net.edit || !res.ok) return res;
         const answer = await res.json();
         net.edit(path, answer);
@@ -619,9 +636,17 @@ async function behavior() {
   check("overview: the Last drive card is the newest drive that moved, and a trip row leads with its distance", async () => {
     const env = makeEnv();
     await parkedCar(env);
-    // An hour later the engine idles for two minutes and the car does not move.
-    await upload(env, drive({ boot: 12, n: 120, gps: false, base: T0 + 3600 }).map((r) => ({ ...r, speed_kph: 0 })), T0 + 3760);
+    // An hour later the engine idles for two minutes and the car does not move. The odometer
+    // ticks once, by 0.1 km, as it can when it stands at a step: under 0.2 mi is no drive. Then
+    // the engine stops, before the logger does.
+    const idle = drive({ boot: 12, n: 120, gps: false, base: T0 + 3600 }), odo_km = idle[0].odo_km;
+    const off = drive({ boot: 12, n: 10, ms0: 142000, stepMs: 2000, flags: F.QUIET, gps: false, base: T0 + 3600 });
+    await upload(env, [
+      ...idle.map((r, i) => ({ ...r, speed_kph: 0, odo_km: odo_km + (i < 60 ? 0 : 0.1) })),
+      ...off.map((r) => ({ ...r, rpm: null, speed_kph: null, odo_km: odo_km + 0.1 })),
+    ], T0 + 3780);
     setNow(T0 + 4000);
+    assert.equal((await api(env, "api/trips?limit=40")).trips[0].odo_miles, 0.1);
     const p = openPage(env);
     await p.settle();
     assert.match(p.$("o-drive-chip").textContent, /^top \d+ mph$/);
@@ -633,10 +658,12 @@ async function behavior() {
     assert.equal(rows[0].querySelector(".r").innerHTML, "");
     assert.match(rows[1].querySelector(".r").innerHTML, /^[\d.]+<small>mi<\/small>$/);
     assert.match(rows[1].querySelector(".m").textContent, /^5 min engine · top \d+ mph · [\d.]+ mpg$/);
-    // Only the Trips list marks the selected trip.
+    // Only the Trips list marks the selected trip. No session was cut off, so no row says so.
     assert.ok(rows.every((li) => !li.classList.contains("sel")), "a Recent trips row is marked");
+    assert.ok(rows.every((li) => !li.innerHTML.includes("end not received")), "a row says its end did not arrive");
 
-    assert.equal(p.$("o-drive-open").hidden, false);
+    // The button keeps its room while it is invisible, and shows once there is a drive to open.
+    assert.equal(p.$("o-drive-open").style.visibility, "");
     p.$("o-drive-open").onclick();
     await p.settle();
     assert.deepEqual(p.shown(), ["v-trips"]);
@@ -660,7 +687,7 @@ async function behavior() {
     // No trip and no position yet: neither button shows.
     const e = openPage(makeEnv());
     await e.settle();
-    assert.deepEqual([e.$("o-drive-open").hidden, e.$("o-maps").hidden], [true, true]);
+    assert.deepEqual([e.$("o-drive-open").style.visibility, e.$("o-maps").hidden], ["hidden", true]);
     assert.deepEqual([...p.errors, ...q.errors, ...e.errors], []);
   });
 
@@ -681,6 +708,44 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("overview: a power-up without the engine is no stop, so a parked car stands since the last RPM reading of the drive before", async () => {
+    const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+    const wday = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+    // A drive whose last RPM reading is at T0 + 319, then quiet readings until T0 + 398, so the
+    // stop and the end of the session fall in different minutes.
+    const stop = new Date((T0 + 319) * 1000), driven = `Parked since ${wday.format(stop)} ${time.format(stop)}`;
+    // Two days later the logger powers up in the driveway, gets a fix, and the engine is never
+    // started. `flags` marks that power-up's readings: the adapter link up, or down.
+    const base = T0 + 2 * 86400, woke = `Parked since ${time.format(new Date((base + 38) * 1000))}`;
+    const woken = async (flags) => {
+      const env = makeEnv();
+      await upload(env, drive({ boot: 11, inst: 0, fw: 0, n: 300 }), T0 + 320);
+      await upload(env, drive({ boot: 11, inst: 0, fw: 0, n: 40, ms0: 320000, stepMs: 2000, flags: F.QUIET }).map((r) => ({ ...r, rpm: null, speed_kph: null })), T0 + 400);
+      await upload(env, drive({ boot: 12, n: 10, base, stepMs: 2000, flags }).map((r) => ({ ...r, rpm: null, speed_kph: null })), base + 60);
+      setNow(base + 3600);
+      return env;
+    };
+    const env = await woken(F.QUIET);
+    const p = openPage(env);
+    await p.settle();
+    assert.match(p.header(), /^Parked · updated /);
+    assert.equal(p.$("o-loc-sub").textContent, driven);
+    // The trip list fails at page open, after the status was answered, and comes with the next
+    // poll. Until then the line gives the end of the power-up. The list brings the stop.
+    let first = true;
+    const q = openPage(env, { reject: (path) => { if (!first || !path.startsWith("api/trips")) return false; first = false; return "late"; } });
+    await q.settle();
+    assert.equal(q.$("o-loc-sub").textContent, woke);
+    await q.poll();
+    assert.equal(q.$("o-loc-sub").textContent, driven);
+    // With the adapter link down the engine may have run unseen, so the line keeps the last report.
+    const r = openPage(await woken(F.NO_LINK));
+    await r.settle();
+    assert.match(r.header(), /^Parked · updated /);
+    assert.equal(r.$("o-loc-sub").textContent, woke);
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors], []);
+  });
+
   check("location: a cut-off drive is last known, and a fix behind the newest reading is a grey last fix", async () => {
     // A drive whose end never arrived.
     const cut = makeEnv();
@@ -689,6 +754,8 @@ async function behavior() {
     const a = openPage(cut);
     await a.settle();
     assert.match(a.header(), /^Parked · offline mid-drive, 11 min ago$/);
+    // Its row says so too.
+    assert.match(a.$("o-trips").children[0].innerHTML, /<div class="gap"><span class="tag mid">end not received<\/span><\/div>$/);
     assert.equal(a.$("o-loc-sub").textContent, "Last known · 11 min ago");
     assert.deepEqual(a.tooltips, ["Last position before the logger went offline"]);
     assert.deepEqual(a.fills, ["#ef4444"]);
@@ -742,6 +809,50 @@ async function behavior() {
     await d.settle();
     assert.match(d.$("g-health").innerHTML, /GPS<\/div><div class="val ">No fix<\/div><div class="delta">No fix since the logger started</);
     assert.deepEqual([...a.errors, ...b.errors, ...c.errors, ...d.errors], []);
+  });
+
+  check("a session cut off while the engine idled is not called a drive, and its trip says that its end did not arrive", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // An hour after the drive the engine idles for two and a half minutes, then the logger goes
+    // offline with the engine on. The car stands, so the odometer stays put.
+    const idle = drive({ boot: 12, n: 150, gps: false, base: T0 + 3600 });
+    await upload(env, idle.map((r) => ({ ...r, speed_kph: 0, odo_km: idle[0].odo_km })), T0 + 3780);
+    setNow(T0 + 4500);
+    const p = openPage(env);
+    await p.settle();
+    assert.equal(p.header(), "Parked · offline while idling, 12 min ago");
+    // The idle session is the newest row and carries the tag. The drive before it does not, and
+    // it is still the Last drive.
+    const rows = p.$("o-trips").children;
+    assert.deepEqual(rows.map((li) => li.dataset.id), [String(sid(12, INST)), "11"]);
+    assert.match(rows[0].querySelector(".m").textContent, /^Idle only · \d+ min engine$/);
+    assert.match(rows[0].innerHTML, /<div class="gap"><span class="tag mid">end not received<\/span><\/div>$/);
+    assert.doesNotMatch(rows[1].innerHTML, /end not received/);
+    assert.match(p.$("o-drive-chip").textContent, /^top \d+ mph$/);
+    assert.match(p.$("o-drive-sub").textContent, / · [\d.]+ mi · 5 min engine$/);
+    p.nav("live");
+    await p.settle();
+    assert.match(p.$("l-banner-t").innerHTML,
+      /^<b [^>]*>Parked\.<\/b> The logger went offline while the engine idled, so the end of that session is missing\. Showing the last readings from 12 min ago\.$/);
+    // Trips opens the drive. The line of the idle session says that its end did not arrive.
+    p.nav("trips");
+    await p.settle();
+    assert.match(p.$("t-sub").textContent, /^Trip 11 · /);
+    assert.doesNotMatch(p.$("t-sub").textContent, /end not received/);
+    p.$("t-list").children[0].onclick();
+    await p.settle();
+    assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-12 · .+ · end not received · firmware build 2$`));
+
+    // The trip list fails at page open, after the status was answered, and comes with the next
+    // poll. Until then the header cannot tell whether the session moved.
+    let first = true;
+    const q = openPage(env, { reject: (path) => { if (!first || !path.startsWith("api/trips")) return false; first = false; return "late"; } });
+    await q.settle();
+    assert.match(q.header(), /^No connection to the server/);
+    await q.poll();
+    assert.equal(q.header(), "Parked · offline while idling, 12 min ago");
+    assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
   check("overview: a parked car says since when, as a time today, a weekday this week, else a date", async () => {
@@ -834,7 +945,7 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...o.errors, ...h.errors, ...q.errors], []);
   });
 
-  check("maps: a legend gives the speed colors, start and end are neutral dots, and a trip in progress ends at its latest position", async () => {
+  check("maps: a legend gives the speed colors, start and end are neutral dots, and a trip in progress ends at the time of its newest position", async () => {
     // The words of a legend in order, and the colors of its swatches.
     const words = (q, id) => [...q.$(id).innerHTML.matchAll(/<span>(?:<i [^>]*><\/i>)?([^<]+)<\/span>/g)].map((m) => m[1]);
     const swatches = (q, id) => [...q.$(id).innerHTML.matchAll(/background:(#[0-9a-f]+)/g)].map((m) => m[1]);
@@ -862,16 +973,30 @@ async function behavior() {
     assert.deepEqual([h.tooltips, h.dots], [[], []]);
 
     // A drive in progress whose speed readings stop for ten seconds: its route has grey in it, and
-    // its newest point is no end yet.
+    // its newest point is no end yet. It is the position at the time of the newest reading with a
+    // fix, and the subtitle says the route goes up to then.
+    const at = (ts) => time.format(new Date(ts * 1000));
     const going = makeEnv();
     await upload(going, drive({ n: 120 }).map((r, i) => (i >= 40 && i < 50 ? { ...r, speed_kph: null } : r)), T0 + 140);
     setNow(T0 + 145);
     const q = openPage(going, { hash: "trips" });
     await q.settle();
     assert.match(q.$("t-sub").textContent, / · in progress/);
-    assert.deepEqual(words(q, "t-legend"), [...bands, "no speed reading", "Start", "Latest position"]);
+    assert.doesNotMatch(q.$("t-sub").textContent, /end not received/);
+    assert.deepEqual(words(q, "t-legend"), [...bands, "no speed reading", "Start", `Position at ${at(T0 + 139)}`]);
     assert.deepEqual(swatches(q, "t-legend"), [...colors, "#8b8f9a"]);
-    assert.deepEqual(q.tooltips, ["Start", "Latest position"]);
+    assert.deepEqual(q.tooltips, ["Start", `Position at ${at(T0 + 139)}`]);
+    assert.equal(q.$("t-route-sub").textContent, `${day.format(new Date((T0 + 20) * 1000))}, ${at(T0 + 20)} · up to ${at(T0 + 139)}`);
+    // The fix is lost a minute before the newest reading. The time is the one of the last fix.
+    const lost = makeEnv();
+    await upload(lost, [...drive({ n: 60 }), ...drive({ n: 60, ms0: 80000, gps: false })], T0 + 140);
+    setNow(T0 + 145);
+    const answer = await api(lost, `api/trip/${sid(12, INST)}`);
+    assert.deepEqual([answer.track_end_ts, answer.trip.end_ts], [T0 + 79, T0 + 139]);
+    const r = openPage(lost, { hash: "trips" });
+    await r.settle();
+    assert.deepEqual(r.tooltips, ["Start", `Position at ${at(T0 + 79)}`]);
+    assert.ok(r.$("t-route-sub").textContent.endsWith(` · up to ${at(T0 + 79)}`), r.$("t-route-sub").textContent);
 
     // A period whose only GPS position is one point: a white dot and no key.
     const one = makeEnv();
@@ -883,7 +1008,7 @@ async function behavior() {
     assert.equal(o.$("h-mapbox").hidden, false);
     assert.equal(o.$("h-legend").innerHTML, "");
     assert.deepEqual(o.dots.map((d) => [d.color, d.fillColor]), [["#0d0e11", "#fff"]]);
-    assert.deepEqual([...p.errors, ...h.errors, ...q.errors, ...o.errors], []);
+    assert.deepEqual([...p.errors, ...h.errors, ...q.errors, ...r.errors, ...o.errors], []);
   });
 
   check("trips: twelve tiles, the unlogged gap on a line of its own, and one note per line that applies", async () => {
@@ -894,8 +1019,10 @@ async function behavior() {
     assert.match(p.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
     assert.match(p.$("t-gap").innerHTML,
       /^<div class="notice"><i class="dot warn"><\/i><span>The odometer moved [\d.]+ mi before this trip without being logged\.<\/span><\/div>$/);
-    // The trip's row in the list shows the gap as a tag, and leads with the distance.
-    assert.match(p.$("t-list").children[0].innerHTML, /<div class="gap"><span class="tag mid">[\d.]+ mi unlogged before<\/span><\/div>$/);
+    // The trip's row in the list shows the gap as a tag, and leads with the distance. Its end never
+    // arrived (the logger went offline with the engine on), which is a second tag on the same line.
+    assert.match(p.$("t-list").children[0].innerHTML,
+      /<div class="gap"><span class="tag mid">[\d.]+ mi unlogged before<\/span> <span class="tag mid">end not received<\/span><\/div>$/);
     assert.match(p.$("o-trips").children[0].querySelector(".r").innerHTML, /^[\d.]+<small>mi<\/small>$/);
     const stats = p.$("t-stats").innerHTML;
     assert.equal((stats.match(/class="stat"/g) ?? []).length, 12);
@@ -916,7 +1043,8 @@ async function behavior() {
     assert.equal(q.$("t-gap").innerHTML, "");
     assert.match(q.$("t-note").innerHTML, /^<div>Not known if miles went unlogged before this trip\. An odometer reading is missing\.<\/div>/);
 
-    // A drive whose speed readings failed has no moving time, so no idle time and no average.
+    // A drive whose speed readings failed has no known moving time, so no idle time and no
+    // average. Its speed chart says that no readings came, not that they are still to come.
     const gps = makeEnv();
     await upload(gps, drive({ n: 120 }).map((r) => ({ ...r, speed_kph: null })), T0 + 200);
     setNow(T0 + 4000);
@@ -924,11 +1052,81 @@ async function behavior() {
     await g.settle();
     const gs = g.$("t-stats").innerHTML;
     assert.match(gs, /Distance<\/div><div class="v">[\d.]+ mi by GPS</);
+    assert.match(gs, /Moving<\/div><div class="v">–</);
     assert.match(gs, /Avg moving speed<\/div><div class="v">–</);
     assert.match(gs, /Idle<\/div><div class="v">–</);
+    assert.equal(g.$("t-speed").innerHTML, '<div class="empty">No speed readings on this trip</div>');
+    assert.match(g.$("t-rpm").innerHTML, /^<svg /);
     assert.equal(g.$("t-note").innerHTML, "<div>No speed readings on this trip. The distance is measured along the GPS route and reads a little short on curves. " +
       "There is no MPG figure.</div><div>Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.</div>");
     assert.deepEqual([...p.errors, ...q.errors, ...g.errors], []);
+  });
+
+  check("trips: a drive that moved only by the odometer gives that distance, and a session in progress is never called idle", async () => {
+    const f1 = (x) => (Math.round(x * 10) / 10).toLocaleString();
+    const env = makeEnv();
+    // The speed readings fail for the whole drive and there is no GPS fix, but the odometer goes
+    // up. Then the engine stops, before the logger does.
+    const fields = drive({ n: 180, gps: false }).map((r) => ({ ...r, speed_kph: null }));
+    const last = fields[fields.length - 1];
+    const off = drive({ n: 10, ms0: last.ms + 2000, stepMs: 2000, flags: F.QUIET, gps: false }).map((r) => ({ ...r, rpm: null, speed_kph: null, odo_km: last.odo_km }));
+    await upload(env, [...fields, ...off], T0 + 300);
+    setNow(T0 + 4000);
+    const t = (await api(env, "api/trips?limit=40")).trips[0];
+    assert.ok(t.miles < 0.1 && t.gps_miles == null && t.odo_miles > 1, JSON.stringify(t));
+    const p = openPage(env);
+    await p.settle();
+    const row = p.$("o-trips").children[0];
+    assert.equal(row.querySelector(".r").innerHTML, `${f1(t.odo_miles)}<small>mi by odometer</small>`);
+    assert.equal(row.querySelector(".m").textContent, "3 min engine");
+    assert.match(row.innerHTML, /<svg style="color:var\(--blue\)">/);
+    // It is the Last drive, not skipped as an idle session.
+    assert.ok(p.$("o-drive-sub").textContent.endsWith(` · ${f1(t.odo_miles)} mi by odometer · 3 min engine`), p.$("o-drive-sub").textContent);
+    assert.equal(p.$("o-drive-chip").textContent, "no speed readings");
+    p.nav("trips");
+    await p.settle();
+    const stats = p.$("t-stats").innerHTML;
+    assert.ok(stats.includes(`Distance</div><div class="v">${f1(t.odo_miles)} mi by odometer<`), stats);
+    assert.ok(stats.includes(`By odometer</div><div class="v">${f1(t.odo_miles)} mi<`), stats);
+    assert.match(stats, /Moving<\/div><div class="v">–</);
+    assert.match(stats, /Idle<\/div><div class="v">–</);
+    assert.equal(p.$("t-speed").innerHTML, '<div class="empty">No speed readings on this trip</div>');
+    assert.equal(p.$("t-note").innerHTML, "<div>No speed readings and no GPS route on this trip. The distance is from the odometer. There is no MPG figure.</div>" +
+      "<div>Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.</div>");
+
+    // Two minutes into a session the car has not moved yet. It may still drive off, so its row
+    // gives the engine time and is not called idle.
+    const going = makeEnv();
+    const still = drive({ n: 120, gps: false });
+    await upload(going, still.map((r) => ({ ...r, speed_kph: 0, odo_km: still[0].odo_km })), T0 + 140);
+    setNow(T0 + 145);
+    const q = openPage(going);
+    await q.settle();
+    const now = q.$("o-trips").children[0];
+    assert.match(now.querySelector(".w").textContent, / · in progress$/);
+    assert.equal(now.querySelector(".m").textContent, "2 min engine");
+    assert.deepEqual([...p.errors, ...q.errors], []);
+  });
+
+  check("trips: a chart without readings says so, and only a trip in progress says yet", async () => {
+    // Two minutes into a drive whose speed readings fail from the start.
+    const env = makeEnv();
+    await upload(env, drive({ n: 120 }).map((r) => ({ ...r, speed_kph: null })), T0 + 140);
+    setNow(T0 + 145);
+    const p = openPage(env, { hash: "trips" });
+    await p.settle();
+    assert.match(p.$("t-sub").textContent, / · in progress/);
+    assert.equal(p.$("t-speed").innerHTML, '<div class="empty">No speed readings yet</div>');
+    // A drive that ended without RPM, coolant or throttle readings.
+    const bare = makeEnv();
+    await upload(bare, drive({ n: 120 }).map((r) => ({ ...r, rpm: null, coolant_c: null, throttle_pct: null })), T0 + 200);
+    setNow(T0 + 4000);
+    const q = openPage(bare, { hash: "trips" });
+    await q.settle();
+    assert.match(q.$("t-speed").innerHTML, /^<svg /);
+    assert.deepEqual(["t-rpm", "t-cool", "t-thr"].map((id) => q.$(id).innerHTML),
+      ["RPM", "coolant", "throttle"].map((w) => `<div class="empty">No ${w} readings on this trip</div>`));
+    assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
   check("history: the odometer distance beside the logged one, six Details tiles from a floor for unlogged miles, and where the data starts", async () => {
@@ -1393,7 +1591,7 @@ async function behavior() {
     const at = style.indexOf(`@media ${query} {`);
     assert.ok(at > 0, `no CSS block for ${query}`);
     const touch = style.slice(at, style.indexOf("\n  }", at));
-    assert.match(touch, /\.btn, \.seg button, \.custom input \{ min-height: 44px; \}/);
+    assert.match(touch, /\.btn, \.seg button, \.custom input, \.status button \{ min-height: 44px; \}/);
     assert.match(touch, /\.leaflet-touch \.leaflet-bar a \{ width: 44px; height: 44px; line-height: 44px; \}/);
     assert.match(touch, /\.custom input \{ font-size: 16px; \}/);
   });
@@ -1494,9 +1692,12 @@ async function behavior() {
   });
 
   check("page open: the trips and the economy are asked for while the status is still on its way", async () => {
-    // Room is kept for the two Overview charts, so the cards below them do not jump.
+    // Room is kept for the two Overview charts, the readout line above the Last drive chart and the
+    // button below it, so the cards below them do not jump.
     assert.match(html, /#o-drive \{ min-height: 200px; \}/);
     assert.match(html, /#o-econ \{ min-height: 190px; \}/);
+    assert.match(html, /#o-drive-r \{ min-height: 1\.45em; \}/);
+    assert.match(html, /<button class="btn mt" id="o-drive-open" type="button" style="visibility:hidden">/);
     const env = makeEnv();
     await parkedCar(env);
     const p = openPage(env, { hold: (path) => path.startsWith("api/status") });
@@ -1676,6 +1877,49 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("an answer the Worker did not write is an outage in the header, a 429 of that kind names the request limit, and the Worker's own refusal is a note", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    const bad = () => p.$("state").parentNode.classList.contains("bad");
+    const page = (status, text) => new Response(text, { status, headers: { "Content-Type": "text/html" } });
+    // Cloudflare refuses the status request with a page of its own.
+    p.net.answer = (path, res) => (path.startsWith("api/status") ? page(429, "<html>Too many requests</html>") : res);
+    await p.poll();
+    const limit = "Request limit reached (429). It resets at midnight UTC.";
+    assert.equal(p.header(), `${limit} · last data 1.0 h ago`);
+    assert.ok(bad(), "the header is not marked as failing");
+    assert.equal(p.$("foot").textContent, limit);
+    assert.equal(p.nextPoll(), 5000);
+    // A gateway error page is an outage too.
+    p.net.answer = (path, res) => (path.startsWith("api/status") ? page(502, "Bad gateway") : res);
+    setNow(T0 + 4005);
+    await p.poll();
+    assert.equal(p.header(), "Server error 502 · last data 1.0 h ago");
+    // The Worker answers again.
+    p.net.answer = null;
+    setNow(T0 + 4010);
+    await p.poll();
+    assert.equal(p.header(), "Parked · updated 1.0 h ago");
+    assert.ok(!bad(), "the header still says it is failing");
+    // The Worker's own refusal, a trip that does not exist, is a note in the footer, and the header
+    // stays on the car.
+    const json = (status, d) => new Response(JSON.stringify(d), { status, headers: { "Content-Type": "application/json" } });
+    p.net.answer = (path, res) => (path.startsWith("api/trip/") ? json(404, { error: "not found" }) : res);
+    p.nav("trips");
+    await p.settle();
+    assert.equal(p.header(), "Parked · updated 1.0 h ago");
+    assert.equal(p.$("foot").textContent, "not found");
+    // The same status from in front of the Worker is an outage.
+    p.net.answer = (path, res) => (path.startsWith("api/trip/") ? page(404, "<html>Not found</html>") : res);
+    p.$("t-list").children[0].onclick();
+    await p.settle();
+    assert.equal(p.header(), "Server error 404 · last data 1.0 h ago");
+    assert.ok(bad(), "the header is not marked as failing");
+    assert.deepEqual(p.errors, []);
+  });
+
   check("history: an older range given up late does not mark the newer one 'could not load'", async () => {
     const env = makeEnv();
     await parkedCar(env);
@@ -1722,19 +1966,32 @@ async function behavior() {
     // Trips: the newest trip is on screen, then the oldest is tapped and its answer is held.
     const q = openPage(env, { hash: "trips" });
     await q.settle();
+    const marked = () => q.$("t-list").children.filter((li) => li.classList.contains("sel")).map((li) => li.dataset.id);
+    const [newest, oldest] = [sid(14, INST), sid(12, INST)].map(String);
     assert.match(q.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
-    q.net.hold = (path) => path === `api/trip/${sid(12, INST)}`;
+    q.net.hold = (path) => path === `api/trip/${oldest}`;
     q.$("t-list").children[2].onclick();
     await q.settle();
     assert.equal(q.$("t-sub").textContent, "Loading this trip…");
-    // Given up, the card names the trip it still shows. A second tap loads the new one.
+    assert.deepEqual(marked(), [oldest]);
+    // Given up, the card names the trip it still shows, and the list marks that trip again.
     q.net.hold = null;
     q.limits()[0].fn();
     await q.settle();
     assert.match(q.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
+    assert.deepEqual(marked(), [newest]);
+    // The same when the request fails at once.
+    q.net.reject = (path) => path === `api/trip/${oldest}`;
+    q.$("t-list").children[2].onclick();
+    await q.settle();
+    assert.match(q.$("t-sub").textContent, new RegExp(`^Trip ${INST}-14 · `));
+    assert.deepEqual(marked(), [newest]);
+    // A tap tries again, and loads it.
+    q.net.reject = null;
     q.$("t-list").children[2].onclick();
     await q.settle();
     assert.match(q.$("t-sub").textContent, new RegExp(`^Trip ${INST}-12 · `));
+    assert.deepEqual(marked(), [oldest]);
     assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
@@ -1939,6 +2196,37 @@ async function behavior() {
       assert.equal(p.$("o-econ-sub").textContent, "Newest 14 of 16 trips in the last 30 days");
       assert.deepEqual(p.errors, []);
     }
+  });
+
+  check("charts: MPG by trip is called an estimate, and on a phone each day keeps its date and the newest day always has one", async () => {
+    assert.match(html, /<h3>MPG by trip \(est\.\)<\/h3>/);
+    // The dates under the bars from left to right, and the date the page gives a moment.
+    const labels = (svg) => [...svg.matchAll(/<text x="([\d.]+)" y="185"[^>]*>([^<]*)<\/text>/g)].map((m) => [+m[1], m[2]]);
+    const day = (ts) => new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" }).format(new Date(ts * 1000)).replace(/^\w+,?\s*/, "");
+    // One trip on a day, then six on the next, ten minutes apart. Seven bars at 305 px.
+    const env = makeEnv();
+    const starts = [T0 - 86400, ...[0, 1, 2, 3, 4, 5].map((k) => T0 + k * 600)];
+    for (const [i, base] of starts.entries()) await upload(env, drive({ boot: 20 + i, n: 60, base, odo0: null }), base + 100);
+    setNow(T0 + 4000);
+    const p = openPage(env, { width: 305 });
+    await p.settle();
+    const svg = p.$("o-econ").innerHTML;
+    assert.equal((svg.match(/<rect class="bar"/g) ?? []).length, 7);
+    const dates = labels(svg);
+    assert.deepEqual(dates.map((d) => d[1]), [day(T0 - 86400), day(T0)]);
+    // Each date sits under the middle of its bars: the first bar, then the other six.
+    const slot = (305 - 34) / 7;
+    assert.deepEqual(dates.map((d) => Math.round(d[0] * 10) / 10), [Math.round((34 + 0.5 * slot) * 10) / 10, Math.round((34 + 4 * slot) * 10) / 10]);
+
+    // A trip a day for eight days. There is room for every second date, and the newest is one of them.
+    const week = makeEnv();
+    for (let k = 7; k >= 0; k--) await upload(week, drive({ boot: 30 + k, n: 60, base: T0 - k * 86400, odo0: null }), T0 - k * 86400 + 100);
+    setNow(T0 + 4000);
+    const q = openPage(week, { width: 305 });
+    await q.settle();
+    const eight = labels(q.$("o-econ").innerHTML).map((d) => d[1]);
+    assert.deepEqual(eight, [6, 4, 2, 0].map((k) => day(T0 - k * 86400)));
+    assert.deepEqual([...p.errors, ...q.errors], []);
   });
 
   check("overview: with enough miles but no fuel readings, the range card and the economy card agree", async () => {
@@ -2289,7 +2577,7 @@ async function behavior() {
     assert.deepEqual([...p.errors, ...q.errors, ...r.errors], []);
   });
 
-  check("a page older than the deployed one says so, and reloads when it comes back from the background", async () => {
+  check("a page older than the deployed one says so, and reloads when it comes back from the background and the server answers", async () => {
     const env = makeEnv();
     await parkedCar(env);
     // The Worker wrote the id into the page it serves, and names the same id in its answers.
@@ -2310,16 +2598,53 @@ async function behavior() {
     assert.equal(cur.reloads(), 0);
 
     // A page from before the last deploy.
-    const old = openPage(env, { page: html.replace(`const PAGE_ID = "${id}";`, () => 'const PAGE_ID = "old";') });
+    const stalePage = html.replace(`const PAGE_ID = "${id}";`, () => 'const PAGE_ID = "old";');
+    const old = openPage(env, { page: stalePage });
     await old.settle();
-    assert.equal(old.header(), "Parked · new version, tap to reload");
+    // The car state and its age stay. The notice comes after them, and the button is what reloads.
+    assert.equal(old.header(), "Parked · updated 1.0 h ago · new version");
     assert.equal(old.$("reload").hidden, false);
+    // Back from the background it reloads, but only once the server has answered.
     old.visible(false);
     old.visible(true);
+    assert.equal(old.reloads(), 0);
+    await old.settle();
+    assert.equal(old.reloads(), 1);
+    // Only on the return: the next poll does not reload again.
+    await old.poll();
     assert.equal(old.reloads(), 1);
     old.$("reload").onclick();
     assert.equal(old.reloads(), 2);
-    assert.deepEqual([...cur.errors, ...old.errors], []);
+
+    // Offline on the return: no reload, which would put the browser's error page in place of the
+    // last data. The page says what is wrong, and reloads with the first answer after that.
+    const away = openPage(env, { page: stalePage });
+    await away.settle();
+    away.visible(false);
+    away.net.reject = () => true;
+    away.visible(true);
+    await away.settle();
+    assert.equal(away.reloads(), 0);
+    assert.match(away.header(), /^No connection to the server/);
+    away.net.reject = null;
+    await away.poll();
+    assert.equal(away.reloads(), 1);
+
+    // A deploy rolling back or out: on the return the first answer comes from a Worker that still
+    // serves this page. That is no reason to reload, and the next chance is the next return.
+    const roll = openPage(env, { page: stalePage });
+    await roll.settle();
+    roll.visible(false);
+    roll.net.answer = (path, res) => { const h = new Headers(res.headers); h.set("X-Page", "old"); return new Response(res.body, { status: res.status, headers: h }); };
+    roll.visible(true);
+    await roll.settle();
+    assert.equal(roll.reloads(), 0);
+    assert.equal(roll.header(), "Parked · updated 1.0 h ago");
+    roll.net.answer = null;
+    await roll.poll();
+    assert.equal(roll.reloads(), 0);
+    assert.equal(roll.header(), "Parked · updated 1.0 h ago · new version");
+    assert.deepEqual([...cur.errors, ...old.errors, ...away.errors, ...roll.errors], []);
   });
 
   check("a draw that throws during a poll leaves the next poll set, and the error is still seen", async () => {

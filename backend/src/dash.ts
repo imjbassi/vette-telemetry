@@ -158,6 +158,9 @@ async function trip(env: Env, id: number, coarse = false) {
     step,
     series,
     track,
+    // When the last point of `track` was read. The end of a trip in progress is labeled with it.
+    // Null without a position.
+    track_end_ts: geo.length ? geo[geo.length - 1].ts : null,
   };
 }
 

@@ -120,9 +120,11 @@
   .tip.show { visibility: visible; }
   .tip.below { transform: translate(-50%, 14px); }
   .readout b { color: var(--text); font-weight: 600; }
-  /* The two Overview charts keep their height while they load, so the cards below do not jump. */
+  /* The two Overview charts keep their height while they load, so the cards below do not jump. So
+     do the readout line above the Last drive chart and its button, which arrive a request later. */
   #o-drive { min-height: 200px; }
   #o-econ { min-height: 190px; }
+  #o-drive-r { min-height: 1.45em; }
   .cnote { font-size: 12px; color: var(--muted); margin-top: 4px; }
   .cnote b { color: var(--text); font-weight: 600; }
 
@@ -254,7 +256,7 @@
   /* Touch screens, the same test as TOUCH in the script: every control at least 44 px tall. The
      zoom buttons stay at the top left, where Leaflet puts them. */
   @media (hover: none) and (pointer: coarse) {
-    .btn, .seg button, .custom input { min-height: 44px; }
+    .btn, .seg button, .custom input, .status button { min-height: 44px; }
     /* Under 16 px Safari zooms the page while a date field has focus. */
     .custom input { font-size: 16px; }
     /* Four buttons a row. A long name such as This month takes two lines inside its button. */
@@ -326,10 +328,11 @@
           <div class="card-head"><div><h3>Last drive</h3><div class="sub" id="o-drive-sub">Speed over the most recent drive</div></div><span class="chip" id="o-drive-chip">–</span></div>
           <div class="readout" id="o-drive-r" style="margin:-4px 0 6px"></div>
           <div class="chart" id="o-drive"></div>
-          <button class="btn mt" id="o-drive-open" type="button" hidden>Open this trip</button>
+          <!-- Invisible, not hidden, until there is a drive to open: it keeps its room, and takes no tap or focus meanwhile. -->
+          <button class="btn mt" id="o-drive-open" type="button" style="visibility:hidden">Open this trip</button>
         </div>
         <div class="card">
-          <div class="card-head"><div><h3>MPG by trip</h3><div class="sub" id="o-econ-sub">Last 30 days, against the EPA rating</div></div><span class="chip" id="o-econ-chip">–</span></div>
+          <div class="card-head"><div><h3>MPG by trip (est.)</h3><div class="sub" id="o-econ-sub">Last 30 days, against the EPA rating</div></div><span class="chip" id="o-econ-chip">–</span></div>
           <div class="chart" id="o-econ"></div>
         </div>
         <div class="card" id="o-loc-card">
@@ -519,12 +522,13 @@
   // early retries for an outage last began. note: a failure of one request only (footer).
   // rows: what the newest request cost. clock: server minus phone time. tripsFails, econFails:
   // failed loads of the trip list and the economy figures while the server answered. stale:
-  // the newest answer names another page, so a newer one is deployed. wasActive: the car was
+  // the newest answer names another page, so a newer one is deployed. reloadOnAnswer: a stale
+  // page came back from the background and reloads with the next answer. wasActive: the car was
   // running or out of contact mid-drive at the last 10 s check.
   const S = {
     view: null, status: null, trips: [], selected: null, tripData: null, live: null, maps: {},
     err: null, errAt: 0, note: null, rows: null, clock: 0, paused: false, shown: null, tripReq: 0, liveReq: 0, reveal: false,
-    tripsFails: 0, econFails: 0, stale: false, wasActive: false,
+    tripsFails: 0, econFails: 0, stale: false, reloadOnAnswer: false, wasActive: false,
   };
 
   // ---------------------------------------------------------------- utils
@@ -590,8 +594,9 @@
   // once this one is done. So each one is given up after 30 s, which still leaves a large
   // trip or History answer time to arrive on a slow link.
   const REQUEST_LIMIT_MS = 30000;
-  // Every failure is kept: a rejected fetch (no network) and a server error count as an outage
-  // and go to the header, anything else (a trip that does not exist) only to the footer.
+  // Every failure is kept. A rejected fetch (no network), a server error and an answer the Worker
+  // did not write count as an outage and go to the header. The Worker's own refusal (a trip that
+  // does not exist) goes only to the footer.
   async function get(path) {
     const ac = typeof AbortController === "function" ? new AbortController() : null;
     const limit = ac && setTimeout(() => ac.abort(), REQUEST_LIMIT_MS);
@@ -603,12 +608,19 @@
       // answer decides.
       const pid = r.headers.get("X-Page");
       if (pid) S.stale = pid !== PAGE_ID;
+      // Back from the background on a stale page. The Worker answered, so the new page can load
+      // now. An answer that names this page after all needs no reload.
+      if (pid && S.reloadOnAnswer) { S.reloadOnAnswer = false; if (S.stale) location.reload(); }
       const rr = r.headers.get("X-Rows-Read");
       if (rr != null && isFinite(+rr)) S.rows = { name: path.split("?")[0], n: +rr };
       if (!r.ok) {
-        let msg = `Server error ${r.status}`;
-        try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
-        throw fail(msg, r.status >= 500);
+        // The Worker answers its errors in JSON with an error text. Any other answer came from in
+        // front of it, such as a Cloudflare error page. A 429 there is most likely the free plan's
+        // daily request limit.
+        let msg = `Server error ${r.status}`, own = false;
+        try { const j = await r.json(); if (j && j.error) { msg = j.error; own = true; } } catch {}
+        if (!own && r.status === 429) msg = "Request limit reached (429). It resets at midnight UTC.";
+        throw fail(msg, r.status >= 500 || !own);
       }
       // The time limit also covers reading the answer. Cut off there, it was the connection.
       try { d = await r.json(); }
@@ -697,6 +709,11 @@
   // Running, or out of contact for a short while: the drive may still be going.
   const active = () => { const s = carState().state; return s === "running" || s === "no_signal"; };
   const liveBoot = () => (active() ? L_().engine_on.boot : null);
+  // The session whose end never arrived: its newest record had the engine on and is older than
+  // lost_s. cutIdle: that session is on the trip list and did not move, so the logger went
+  // offline while the engine idled, not mid-drive.
+  const cutBoot = () => (carState().ended_mid_drive ? L_().engine_on.boot : null);
+  const cutIdle = () => { const b = cutBoot(), t = b == null ? null : S.trips.find((x) => x.id === b); return !!t && !moved(t); };
 
   // ---------------------------------------------------------------- charts
   // Area chart with gradient fill (opts.area) or plain line. Hover shows the nearest point.
@@ -862,20 +879,27 @@
     const axis = niceScale(0, Math.max(epa + 4, ...items.map((t) => t.mpg))), max = axis.y1;
     const Y = (y) => pt + (1 - y / max) * (H - pt - pb);
     const slot = (W - pl) / items.length, bw = Math.min(46, slot * 0.68);
-    // A date label is about 35 px wide. On a narrow chart only every second or third bar gets one.
-    // A bar is labeled when its day differs from the bar before, so a day with several trips
-    // shows its date once, and when it is at least `every` bars after the last label.
-    const every = Math.ceil(40 / slot);
     let svg = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px">`;
     axis.ticks.forEach((v) => { svg += `<line class="gridl" x1="${pl}" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke-dasharray="2 4"/><text x="${pl - 8}" y="${Y(v) + 3.5}" text-anchor="end">${tickLabel(v, axis.dec)}</text>`; });
-    let prevDay = null, lastLab = -every;
+    // The bars of one day side by side: its date, its first bar and its last.
+    const runs = [];
     items.forEach((t, i) => {
       const x = pl + i * slot + (slot - bw) / 2, y = Y(t.mpg), c = PALETTE[i % PALETTE.length];
       svg += `<rect class="bar" data-i="${i}" x="${x}" y="${y}" width="${bw}" height="${H - pb - y}" rx="7" fill="${c}"/>`;
       const day = dayFmt.format(new Date(t.start_ts * 1000)).replace(/^\w+,?\s*/, "");
-      if (day !== prevDay && i - lastLab >= every) { svg += `<text x="${x + bw / 2}" y="${H - 5}" text-anchor="middle">${esc(day)}</text>`; lastLab = i; }
-      prevDay = day;
+      const r = runs[runs.length - 1];
+      if (r && r.day === day) r.end = i; else runs.push({ day, start: i, end: i });
     });
+    // One date per day, centered under that day's bars. A date label is about 35 px wide, so on a
+    // narrow chart a date is left out when it would come within 40 px of the one to its right.
+    // The newest day goes first, so it always has its date.
+    const dates = [];
+    let right = Infinity;
+    for (let k = runs.length - 1; k >= 0; k--) {
+      const r = runs[k], cx = pl + ((r.start + r.end + 1) / 2) * slot;
+      if (right - cx >= 40) { dates.unshift(`<text x="${cx}" y="${H - 5}" text-anchor="middle">${esc(r.day)}</text>`); right = cx; }
+    }
+    svg += dates.join("");
     svg += `<line x1="${pl}" x2="${W}" y1="${Y(epa)}" y2="${Y(epa)}" stroke="#eceef2" stroke-opacity=".5" stroke-dasharray="5 4"/><text x="${W - 2}" y="${Y(epa) - 5}" text-anchor="end" style="fill:#c4c7cf">EPA ${epa}</text></svg>`;
     el.innerHTML = svg;
     barHover(el, W, (i) => {
@@ -966,8 +990,9 @@
   }
   // The route of one trip. Whatever the trip before left on the map goes first. The same answer
   // is not drawn twice, so coming back to the Trips view keeps the owner's zoom. A tap on a trip
-  // row clears `drawn` and fits the route again. A trip in progress comes in a new answer. `end`
-  // names the end marker.
+  // row clears `drawn` and fits the route again. A trip in progress is read again each time the
+  // view opens, so it comes in a new answer. `end` names the end marker: End, or the time of the
+  // newest position of a trip in progress.
   function drawTrack(m, track, end) {
     if (m.drawn === track) return;
     m.drawn = track;
@@ -1004,7 +1029,8 @@
   }
 
   // The pill shows one thing, the first that applies: paused, a failing connection, then the car.
-  // When a newer page is deployed, the car state stays and the notice replaces the text after it.
+  // When a newer page is deployed, the car state and its age stay, and the notice comes after them.
+  // The Reload button beside it loads the new page.
   function renderHeader() {
     const cs = carState(), has = Object.keys(L_()).length > 0;
     const up = lt("last_upload"), bad = !S.paused && !!S.err;
@@ -1017,9 +1043,9 @@
     else if (cs.link_down) { dot = "warn"; text = "Adapter link down"; }
     else if (cs.state === "running") { dot = "on"; text = "Engine running"; }
     else if (cs.state === "no_signal") { dot = "warn"; text = "No signal since " + timeFmt.format(new Date(cs.last_seen_ts * 1000)); extra = ""; }
-    else if (cs.ended_mid_drive) extra = "· offline mid-drive, " + ago(cs.last_seen_ts);
+    else if (cs.ended_mid_drive) extra = (cutIdle() ? "· offline while idling, " : "· offline mid-drive, ") + ago(cs.last_seen_ts);
     const stale = S.stale && !S.paused && !S.err && !!S.status;
-    if (stale) extra = "· new version, tap to reload";
+    if (stale) extra = (extra ? extra + " " : "") + "· new version";
     $("dot").className = "dot" + (dot ? " " + dot : "");
     $("state").textContent = text;
     $("updated").textContent = extra;
@@ -1102,44 +1128,65 @@
         : st === "no_signal" ? ["Last known", "Last known position", "#ef4444"]
         : cs.ended_mid_drive ? ["Last known", "Last position before the logger went offline", "#ef4444"]
         : ["Parked", "Parked here", "#ef4444", true];
-      // A plain parked car says since when. Readings go on for a while after the engine stops,
-      // so the stop is the last RPM reading when it is from the newest session.
-      const rpm = L_().rpm, e = L_().engine_on;
-      const stop = rpm && e && rpm.boot === e.boot ? rpm.ts : cs.last_seen_ts;
-      $("o-loc-sub").textContent = plain ? `Parked since ${since(stop)}` : word + " · " + ago(lt("lat"));
+      // A plain parked car says since when (parkedSince). The trip list can change that line, so
+      // loadTrips writes it again while it shows.
+      S.parkedLine = !!plain;
+      $("o-loc-sub").textContent = plain ? parkedSince() : word + " · " + ago(lt("lat"));
       if (mp) placeMarker(mp, lat, lon, mark, word === "Live", color);
       const a = $("o-maps"); a.hidden = false; a.href = `https://maps.google.com/?q=${lat.toFixed(6)},${lon.toFixed(6)}`;
     } else {
+      S.parkedLine = false;
       $("o-loc-sub").textContent = "No GPS fix yet";
       // No map until there is a position to put on it.
       if (!S.maps.o) $("o-map").innerHTML = '<div class="empty">No GPS position yet.</div>';
     }
   }
+  // Since when a plain parked car stands. Readings go on for a while after the engine stops, so the
+  // stop is the last RPM reading when it is from the newest session. A newest session that is not
+  // the newest trip, with the adapter link up, was a power-up without the engine. The car then
+  // stands since the last RPM reading from the newest trip on, or else since that trip's end. With
+  // the link down the engine may have run unseen, so the newest report stays.
+  function parkedSince() {
+    const rpm = L_().rpm, e = L_().engine_on, lk = L_().link, t = S.tripsLoaded ? S.trips[0] : null;
+    const noRun = !!(t && e && t.id !== e.boot && lk && lk.v === 1);
+    const stop = rpm && e && rpm.boot === e.boot ? rpm.ts : noRun ? (rpm && rpm.ts >= t.start_ts ? rpm.ts : t.end_ts) : carState().last_seen_ts;
+    return `Parked since ${since(stop)}`;
+  }
 
   // ---------------------------------------------------------------- trips
-  // A trip whose speed readings failed shows its distance along the GPS route instead of 0.
-  const tripMiles = (t) => (t.gps_miles != null ? `about ${f1(t.gps_miles)} mi by GPS` : `${f1(t.miles)} mi`);
-  // The car moved: 0.1 mi logged, or a distance along the GPS route because the speed readings
-  // failed. The same line as GPS_FALLBACK_BELOW_MI and tripMoved() in queries.ts. Anything else
-  // was an idle session, a start without driving.
-  const moved = (t) => t.miles >= 0.1 || t.gps_miles != null;
+  // Odometer distance from which a trip moved when neither the speed readings nor the GPS route
+  // gave a distance: three of the odometer's 0.1 km steps. ODO_MOVED_MI in queries.ts.
+  const ODO_MOVED_MI = 0.2;
+  // The car moved: 0.1 mi logged, a distance along the GPS route because the speed readings
+  // failed, or the odometer because both failed. The same line as GPS_FALLBACK_BELOW_MI and
+  // tripMoved() in queries.ts. Anything else was an idle session, a start without driving.
+  const moved = (t) => t.miles >= 0.1 || t.gps_miles != null || (t.odo_miles ?? 0) >= ODO_MOVED_MI;
+  // Moved by the odometer alone.
+  const odoOnly = (t) => t.miles < 0.1 && t.gps_miles == null && (t.odo_miles ?? 0) >= ODO_MOVED_MI;
+  // A trip whose speed readings failed shows its distance along the GPS route, or by the
+  // odometer when there is no route either, instead of 0.
+  const tripMiles = (t) => (t.gps_miles != null ? `about ${f1(t.gps_miles)} mi by GPS` : odoOnly(t) ? `${f1(t.odo_miles)} mi by odometer` : `${f1(t.miles)} mi`);
 
   // The selection is marked by markSelected(), in the Trips list only.
   function tripItem(t) {
     const li = document.createElement("li");
     li.dataset.id = t.id;
-    const mv = moved(t), gps = t.gps_miles != null;
-    // A gap the odometer saw before this trip gets a line of its own.
-    const gap = t.unlogged_before_mi != null ? `<div class="gap"><span class="tag mid">${esc(f1(t.unlogged_before_mi))} mi unlogged before</span></div>` : "";
+    const mv = moved(t), gps = t.gps_miles != null, odo = odoOnly(t);
+    // A gap the odometer saw before this trip, and a session whose end never arrived, get a line
+    // of their own with a yellow tag each.
+    const tags = [t.unlogged_before_mi != null ? `${esc(f1(t.unlogged_before_mi))} mi unlogged before` : null, t.id === cutBoot() ? "end not received" : null]
+      .filter(Boolean).map((s) => `<span class="tag mid">${s}</span>`).join(" ");
+    const gap = tags ? `<div class="gap">${tags}</div>` : "";
     li.innerHTML = `<span class="tico"><svg style="color:${mv ? "var(--blue)" : "var(--muted)"}"><use href="#i-car"/></svg></span>
       <div class="w"></div><div class="m"></div><div class="r"></div>${gap}`;
     li.querySelector(".w").textContent = when(t.start_ts) + (t.id === liveBoot() ? " · in progress" : "");
     // Engine time, not logger-on time: the logger stays up for a few minutes after the engine stops.
-    // An idle session has no distance and no top speed to show.
+    // An idle session has no distance and no top speed to show. One still in progress may drive
+    // off yet, so it is not called idle.
     li.querySelector(".m").textContent = (mv
       ? [dur(t.engine_s) + " engine", t.max_mph ? "top " + t.max_mph + " mph" : null, t.mpg != null ? f1(t.mpg) + " mpg" : null]
-      : ["Idle only", dur(t.engine_s) + " engine"]).filter(Boolean).join(" · ");
-    li.querySelector(".r").innerHTML = mv ? `${f1(gps ? t.gps_miles : t.miles)}<small>${gps ? "mi by GPS" : "mi"}</small>` : "";
+      : [t.id === liveBoot() ? null : "Idle only", dur(t.engine_s) + " engine"]).filter(Boolean).join(" · ");
+    li.querySelector(".r").innerHTML = mv ? `${f1(gps ? t.gps_miles : odo ? t.odo_miles : t.miles)}<small>${gps ? "mi by GPS" : odo ? "mi by odometer" : "mi"}</small>` : "";
     li.onclick = () => openTrip(t.id);
     return li;
   }
@@ -1194,6 +1241,12 @@
     const have = S.tripData && S.tripData.trip.id === S.selected ? S.tripData.trip : null;
     const behind = have && sel && sel.end_ts !== have.end_ts && sel.id !== liveBoot();
     if (S.view === "trips" && S.selected != null && (!have || behind)) loadTrip(S.selected);
+    // A plain parked car can stand since the newest trip (parkedSince), so its line is written
+    // again with the list.
+    if (S.view === "overview" && S.parkedLine) $("o-loc-sub").textContent = parkedSince();
+    // Whether a session cut off with the engine on moved is known from the list (cutIdle), so
+    // the header and the Live banner are written again with it.
+    renderHeader();
   }
 
   // `t` is the drive's row of the trip list. The per-minute answer has no GPS distance.
@@ -1211,7 +1264,7 @@
     $("o-drive-sub").textContent = `${when(t.start_ts)} · ${tripMiles(t)} · ${dur(t.engine_s)} engine`;
     $("o-drive-chip").textContent = !moved(t) ? "idle only" : t.max_mph ? `top ${t.max_mph} mph` : "no speed readings";
     const open = $("o-drive-open");
-    open.hidden = false;
+    open.style.visibility = "";
     open.onclick = () => openTrip(t.id);
     if (S.view === "overview") drawOverviewCharts();
   }
@@ -1266,9 +1319,9 @@
     catch {
       if (req !== S.tripReq) return;  // a newer pick owns the card
       S.reveal = false;
-      // The card keeps the trip it shows, and its line says so again. The footer or the header
-      // says what failed.
-      if (S.tripData) $("t-sub").textContent = tripSub(S.tripData.trip);
+      // The card keeps the trip it shows, so the list marks that trip again and the card's line
+      // names it again. The footer or the header says what failed, and a tap tries again.
+      if (S.tripData) { S.selected = S.tripData.trip.id; markSelected(); $("t-sub").textContent = tripSub(S.tripData.trip); }
       return;
     }
     if (req !== S.tripReq) return;  // a newer trip was picked while this one loaded
@@ -1276,7 +1329,7 @@
     renderTrip();
   }
   const tripSub = (t) => `Trip ${sid(t.id)} · ${timeFmt.format(new Date(t.start_ts * 1000))} to ${timeFmt.format(new Date(t.end_ts * 1000))}` +
-    (t.id === liveBoot() ? " · in progress" : "") + (t.fw ? ` · firmware build ${t.fw}` : "");
+    (t.id === liveBoot() ? " · in progress" : "") + (t.id === cutBoot() ? " · end not received" : "") + (t.fw ? ` · firmware build ${t.fw}` : "");
   function renderTrip() {
     const d = S.tripData;
     // Drawn only while visible. Charts and the map need the real width, and show() comes back here.
@@ -1292,39 +1345,43 @@
     $("t-gap").innerHTML = t.unlogged_before_mi == null ? ""
       : `<div class="notice"><i class="dot warn"></i><span>${esc(`The odometer moved ${f1(t.unlogged_before_mi)} mi before this trip without being logged.`)}</span></div>`;
     // Twelve tiles in related pairs, so 6, 3 or 2 columns leave no tile alone. Idle is engine time
-    // without movement. A trip without speed readings has no moving time, so no idle time either.
-    const idle = Math.max(0, t.engine_s - t.moving_s);
+    // without movement. A trip whose distance comes from GPS or the odometer had no speed
+    // readings, so its moving time is not known, and its idle time neither.
+    const idle = Math.max(0, t.engine_s - t.moving_s), odo = odoOnly(t), noSpeed = t.gps_miles != null || odo;
     const stats = [
-      ["Distance", t.gps_miles != null ? `${f1(t.gps_miles)} mi by GPS` : `${f1(t.miles)} mi`], ["By odometer", t.odo_miles == null ? "–" : `${f1(t.odo_miles)} mi`],
-      ["Engine on", dur(t.engine_s)], ["Moving", dur(t.moving_s)],
+      ["Distance", t.gps_miles != null ? `${f1(t.gps_miles)} mi by GPS` : odo ? `${f1(t.odo_miles)} mi by odometer` : `${f1(t.miles)} mi`], ["By odometer", t.odo_miles == null ? "–" : `${f1(t.odo_miles)} mi`],
+      ["Engine on", dur(t.engine_s)], ["Moving", noSpeed ? "–" : dur(t.moving_s)],
       ["Fuel used (est.)", t.gallons ? `${t.gallons.toFixed(2)} gal` : "–"], ["MPG (est.)", f1(t.mpg)],
       ["Top speed", t.max_mph == null ? "–" : `${t.max_mph} mph`], ["Avg moving speed", t.avg_mph == null ? "–" : `${f0(t.avg_mph)} mph`],
       ["Max RPM", f0(t.max_rpm)], ["Avg RPM", f0(t.avg_rpm)],
       ["Max coolant", t.max_coolant_f == null ? "–" : `${f0(t.max_coolant_f)} °F`],
-      ["Idle", t.gps_miles != null || !t.engine_s ? "–" : `${dur(idle)} (${f0((idle / t.engine_s) * 100)} %)`],
+      ["Idle", noSpeed || !t.engine_s ? "–" : `${dur(idle)} (${f0((idle / t.engine_s) * 100)} %)`],
     ];
     $("t-stats").innerHTML = stats.map(([k, v]) => `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
     // One note per line, this trip's own first. The standing notes only where they apply.
-    const notes = [];
+    const notes = [], noMpg = t.gallons ? "There is no MPG figure." : "There are no fuel or MPG figures.";
     if (t.est) notes.push("Some times are estimated. The logger had no clock yet.");
-    if (t.gps_miles != null) notes.push("No speed readings on this trip. The distance is measured along the GPS route and reads a little short on curves. " +
-      (t.gallons ? "There is no MPG figure." : "There are no fuel or MPG figures."));
+    if (t.gps_miles != null) notes.push("No speed readings on this trip. The distance is measured along the GPS route and reads a little short on curves. " + noMpg);
+    if (odo) notes.push("No speed readings and no GPS route on this trip. The distance is from the odometer. " + noMpg);
     if (t.nolink_n) notes.push(`${f0(t.nolink_n)} readings have no engine data. The logger had no link to the OBD adapter.`);
     if (!d.unlogged_known) notes.push("Not known if miles went unlogged before this trip. An odometer reading is missing.");
     // From the first reading of the session, when it came before the engine started.
     if (d.battery_start_v != null) notes.push(`Battery at power-up ${d.battery_start_v.toFixed(1)} V, engine off.`);
     if (d.step > 1) notes.push(`The charts show 1 of every ${d.step} readings.`);
     if (t.gallons > 0) notes.push("Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.");
-    if (t.gps_miles == null && t.miles > 0) notes.push("Distance is added up from speed, about 1% under the odometer.");
+    if (t.gps_miles == null && !odo && t.miles > 0) notes.push("Distance is added up from speed, about 1% under the odometer.");
     $("t-note").innerHTML = notes.map((s) => `<div>${esc(s)}</div>`).join("");
     drawTripCharts();
     // The map box only shows when there is a position. Unhidden before the map is made, so
     // Leaflet measures a box that is on screen.
-    // The legend explains the colors, so the subtitle names the trip. A trip in progress ends at
-    // its latest position, not at an end.
-    const n = d.track ? d.track.length : 0, end = t.id === liveBoot() ? "Latest position" : "End";
-    $("t-route-sub").textContent = n >= 2 ? when(t.start_ts) : n === 1 ? "Only one GPS position was recorded on this trip"
-      : t.id === liveBoot() ? "No GPS position yet" : "No GPS positions were recorded on this trip";
+    // The legend explains the colors, so the subtitle names the trip. A trip in progress is not
+    // read again while the view stays open, so its route stops at the newest position of that
+    // answer. The end marker gives the time of that position, and the subtitle says up to when.
+    // An older Worker sends no track_end_ts, and then the time of the newest reading stands in.
+    const n = d.track ? d.track.length : 0, live = t.id === liveBoot();
+    const at = timeFmt.format(new Date((d.track_end_ts ?? t.end_ts) * 1000)), end = live ? "Position at " + at : "End";
+    $("t-route-sub").textContent = n >= 2 ? when(t.start_ts) + (live ? " · up to " + at : "") : n === 1 ? "Only one GPS position was recorded on this trip"
+      : live ? "No GPS position yet" : "No GPS positions were recorded on this trip";
     $("t-mapbox").hidden = n === 0;
     if (n >= 2) speedKey($("t-legend"), hasGrey(d.track), end); else $("t-legend").innerHTML = "";
     const m = n ? getMap("t", "t-map") : null;
@@ -1343,10 +1400,12 @@
   function drawTripCharts() {
     const d = S.tripData; if (!d) return;
     const s = d.series, thin = d.step > 1;
-    chart($("t-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 170, thin, readout: $("t-speed-r") });
-    chart($("t-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 170, thin, readout: $("t-rpm-r") });
-    chart($("t-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, thin, readout: $("t-cool-r"), ref: HOT_F, refColor: "#ef4444", refLabel: `Hot ${HOT_F} °F` });
-    chart($("t-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, thin, readout: $("t-thr-r"), min: 0 });
+    // A chart without readings says so. Only a trip in progress may still bring some.
+    const none = (what) => `No ${what} readings ${d.trip.id === liveBoot() ? "yet" : "on this trip"}`;
+    chart($("t-speed"), s.t, s.mph, { color: "#3d6ef5", unit: "mph", h: 170, thin, readout: $("t-speed-r"), empty: none("speed") });
+    chart($("t-rpm"), s.t, s.rpm, { color: "#f0732e", unit: "rpm", h: 170, thin, readout: $("t-rpm-r"), empty: none("RPM") });
+    chart($("t-cool"), s.t, s.coolant_f, { color: "#e8b423", unit: "°F", h: 150, thin, readout: $("t-cool-r"), ref: HOT_F, refColor: "#ef4444", refLabel: `Hot ${HOT_F} °F`, empty: none("coolant") });
+    chart($("t-thr"), s.t, s.throttle, { color: "#a855f7", unit: "%", h: 150, thin, readout: $("t-thr-r"), min: 0, empty: none("throttle") });
   }
 
   // ---------------------------------------------------------------- live
@@ -1384,7 +1443,8 @@
       : cs.link_down ? ["warn", `${head("Adapter link down.")} The logger is on but cannot reach the OBD adapter, so engine values are old.`]
       : on ? ["on", `${head("Engine running.")} Updates arrive about every 15 s.`]
       : cs.state === "no_signal" ? ["warn", `${head("No signal since " + esc(timeFmt.format(new Date(cs.last_seen_ts * 1000))) + ".")} The car may be out of coverage or was just switched off. ${tail}`]
-      : cs.ended_mid_drive ? ["", `${head("Parked.")} The logger went offline mid-drive, so the end of that drive is missing. ${tail}`]
+      : cs.ended_mid_drive ? ["", `${head("Parked.")} ${cutIdle() ? "The logger went offline while the engine idled, so the end of that session is missing."
+        : "The logger went offline mid-drive, so the end of that drive is missing."} ${tail}`]
       : ["", `${head("Engine off.")} ${tail}`];
     $("l-dot").className = "dot" + (dot ? " " + dot : "");
     $("l-banner-t").innerHTML = text;
@@ -1902,8 +1962,10 @@
   ["pointerdown", "keydown", "wheel", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { clearTimeout(timer); hiddenAt = Date.now(); return; }
-    // A newer page was deployed while this one was open. Coming back is the moment to load it.
-    if (S.stale) { location.reload(); return; }
+    // A newer page was deployed while this one was open. Coming back is the moment to load it,
+    // but only once the server answers (see get()). Offline, a reload would put the browser's
+    // error page in place of the last data, and a home-screen app has no way back from it.
+    if (S.stale) S.reloadOnAnswer = true;
     if (S.paused || Date.now() - hiddenAt > LONG_AWAY_MS) resume();
     else { lastInput = Date.now(); tick(); }
   });
