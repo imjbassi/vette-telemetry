@@ -1560,10 +1560,12 @@ async function behavior() {
       });
       return vals;
     };
-    // Every dot and every point of the line and its fill lies between the top (10) and the bottom of the plot.
+    // Every dot and every point of the line and its fill lies between the top (10) and the bottom
+    // of the plot. So does every mark of a chart of separate marks, from its top to its foot.
     const inside = (name, svg, h) => {
       const ys = [...svg.matchAll(/<circle cx="[\d.]+" cy="(-?[\d.]+)"/g)].map((m) => +m[1]);
       for (const d of svg.matchAll(/<path d="([^"]*)"/g)) for (const m of d[1].matchAll(/[ML](-?[\d.]+),(-?[\d.]+)/g)) ys.push(+m[2]);
+      for (const m of svg.matchAll(/<rect class="b[at]" x="[\d.]+" y="(-?[\d.]+)" width="[\d.]+" height="(-?[\d.]+)"/g)) ys.push(+m[1], Math.round((+m[1] + +m[2]) * 10) / 10);
       assert.ok(ys.length > 0, `${name}: nothing drawn`);
       assert.ok(ys.every((y) => y >= 10 && y <= h - 22), `${name}: drawn at ${ys.filter((y) => y < 10 || y > h - 22)}`);
     };
@@ -1620,6 +1622,179 @@ async function behavior() {
     assert.ok(volts.length >= 3, `${volts}`);
     for (const s of volts) assert.equal(s, num(s).toLocaleString(undefined, { maximumFractionDigits: 2 }), `${volts}`);
     assert.ok(volts.includes((14).toLocaleString()) && volts.includes((14.25).toLocaleString()), `${volts}`);
+    assert.deepEqual(p.errors, []);
+  });
+
+  // For the History chart of separate marks. The marks of one kind as the page drew them: "ba"
+  // is the average, "bt" the lighter part up to the highest reading.
+  const marks = (svg, cls) => [...svg.matchAll(new RegExp(`<rect class="${cls}" x="(-?[\\d.]+)" y="(-?[\\d.]+)" width="([\\d.]+)" height="([\\d.]+)"`, "g"))]
+    .map((m) => ({ x: +m[1], y: +m[2], w: +m[3], h: +m[4] }));
+  // Where the page puts a value on the y axis of a chart `H` high, read back from the axis labels.
+  const yScale = (svg, H) => {
+    const group = (1000).toLocaleString().replace(/\d/g, ""), point = (1.5).toLocaleString().replace(/\d/g, "");
+    const vals = [...svg.matchAll(/<text x="32" y="[\d.]+" text-anchor="end">([^<]*)<\/text>/g)].map((m) => +m[1].split(group).join("").replace(point, "."));
+    const lo = vals[0], hi = vals[vals.length - 1];
+    return Object.assign((v) => 10 + (1 - (v - lo) / (hi - lo)) * (H - 32), { lo, hi });
+  };
+  // Coordinates are written with one decimal, and a foot is a top plus a height: two roundings.
+  const close = (a, b) => Math.abs(a - b) <= 0.11;
+  const pickMetric = (p, m) => { p.groups["#h-metrics button"].find((b) => b.dataset.m === m).onclick(); return p.$("h-chart").innerHTML; };
+  // The answer the page drew last: the same request again.
+  const lastHistory = (env, p) => api(env, p.net.log.filter((x) => x.startsWith("api/history?")).pop());
+  const dayOf = (t) => new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" }).format(new Date(t * 1000));
+  const timeOf = (t) => new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(t * 1000));
+
+  check("history: 30 days draw one mark per interval, the average solid and the highest reading lighter above it, and no line", async () => {
+    const env = makeEnv();
+    // A power-up without the engine in the morning, with battery readings only. Then three
+    // drives of a minute each: Wednesday afternoon, two hours later in the interval beside it,
+    // and Thursday afternoon.
+    const quiet = drive({ boot: 11, n: 10, base: T0 - 6 * 3600, flags: F.QUIET })
+      .map((r) => ({ boot: r.boot, inst: r.inst, fw: r.fw, ms: r.ms, epoch: r.epoch, flags: r.flags, adapter_v: r.adapter_v, csq: r.csq }));
+    await upload(env, quiet, T0 - 6 * 3600 + 100);
+    await upload(env, drive({ boot: 12, n: 60 }), T0 + 100);
+    await upload(env, drive({ boot: 13, n: 60, base: T0 + 2 * 3600, odo0: 126800 }), T0 + 2 * 3600 + 100);
+    await upload(env, drive({ boot: 14, n: 60, base: T0 + 26 * 3600, odo0: 127600 }), T0 + 26 * 3600 + 100);
+    setNow(T0 + 27 * 3600);
+    const p = openPage(env, { hash: "history" });
+    await p.settle();
+    const d = await lastHistory(env, p);
+    assert.equal(d.bucket, 7200);
+    const t = d.series.t, W = 600, H = 230, foot = H - 22;
+    const having = (key) => t.map((_, i) => i).filter((i) => d.series[key][i] != null);
+    const at = having("speed");
+    assert.deepEqual([at, having("battery")], [[1, 2, 3], [0, 1, 2, 3]], "the morning has a battery reading and no speed, and each drive has an interval of its own");
+    assert.equal(t[2] - t[1], d.bucket, "the first two drives are in intervals side by side");
+    // The time axis runs from the first interval with any reading to the end of the last, so
+    // the speed marks start to the right of the morning.
+    const X = (x) => 40 + ((x - t[0]) / (t[t.length - 1] + d.bucket - t[0])) * (W - 48);
+    const svg = p.$("h-chart").innerHTML;
+    assert.ok(!/<path|<circle/.test(svg), "a line, a fill or a dot is drawn");
+    const avg = marks(svg, "ba"), top = marks(svg, "bt"), Y = yScale(svg, H);
+    assert.equal(Y.lo, 0);
+    assert.deepEqual([avg.length, top.length], [3, 3]);
+    assert.ok(svg.lastIndexOf('class="bt"') < svg.indexOf('class="ba"'), "a lighter part is drawn over an average");
+    at.forEach((i, k) => {
+      const a = d.series.speed[i], m = d.series.speed_max[i];
+      assert.ok(m > a, `interval ${k}: ${a} and ${m}`);
+      // In the middle of its two hours, and never wider than 24 px.
+      assert.ok(close(avg[k].x + avg[k].w / 2, X(t[i] + d.bucket / 2)), `interval ${k} is at ${avg[k].x}`);
+      assert.equal(avg[k].w, 24);
+      // A column from 0 to the average, and behind it one from 0 to the highest reading.
+      assert.ok(close(avg[k].y, Y(a)) && close(avg[k].y + avg[k].h, foot), `average ${k}: ${JSON.stringify(avg[k])}`);
+      assert.ok(close(top[k].y, Y(m)) && close(top[k].y + top[k].h, foot), `highest ${k}: ${JSON.stringify(top[k])}`);
+      assert.deepEqual([top[k].x, top[k].w], [avg[k].x, avg[k].w]);
+    });
+    // The summary gives only exact figures, and the highest reading is the Top speed of the card.
+    const f0 = (v) => Math.round(v).toLocaleString();
+    const base = `highest reading <b>${f0(d.totals.max_mph)}</b> · highest 2 h average <b>${f0(Math.max(...at.map((i) => d.series.speed[i])))}</b> mph`;
+    assert.equal(p.$("h-readout").innerHTML, base);
+    assert.equal(p.$("h-metric-sub").textContent, "Average and highest reading per 2 h");
+    // A key under the chart names the two parts, each with its swatch.
+    assert.match(svg, /<div class="cnote"><span class="k"><i style="background:#3d6ef5"><\/i>average of the readings in each 2 h block<\/span><span class="k"><i style="background:#3d6ef5;opacity:\.4"><\/i>up to the highest reading in it<\/span><\/div>$/);
+    // The pointer a third into the interval of the second drive: both figures and the two hours
+    // they stand for. Then two thirds into the interval before it, where the start of the second
+    // one is nearer than its own: the interval under the pointer counts, not the nearest start.
+    const el = p.$("h-chart"), send = (ev, e) => el.querySelector("svg").handlers[ev]({ pointerType: "mouse", ...e });
+    for (const [i, part] of [[at[1], 0.3], [at[0], 0.7]]) {
+      const figures = [f0(d.series.speed[i]), f0(d.series.speed_max[i])];
+      const hours = `${dayOf(t[i])}, ${timeOf(t[i])} to ${timeOf(t[i] + 7200)}`;
+      send("pointermove", { clientX: X(t[i] + part * d.bucket) });
+      assert.equal(p.$("h-readout").innerHTML, `<b>${figures[0]} mph</b> average · <b>${figures[1]} mph</b> highest · ${hours}`);
+      assert.equal(el.querySelector(".tip").innerHTML, `<b>avg ${figures[0]} · max ${figures[1]} mph</b>${hours}`);
+    }
+    send("pointerleave", {});
+    assert.equal(p.$("h-readout").innerHTML, base);
+
+    // The tank has no highest reading: columns from 0 on the full 0 to 100 %, in the same places.
+    const fuel = pickMetric(p, "fuel"), tank = at.map((k) => d.series.fuel[k]);
+    assert.deepEqual([marks(fuel, "ba").map((r) => r.x), marks(fuel, "bt")], [avg.map((r) => r.x), []]);
+    assert.deepEqual([yScale(fuel, H).lo, yScale(fuel, H).hi], [0, 100]);
+    marks(fuel, "ba").forEach((r, k) => assert.ok(close(r.y, yScale(fuel, H)(tank[k])) && close(r.y + r.h, foot), `fuel ${k}: ${JSON.stringify(r)}`));
+    assert.equal(p.$("h-readout").innerHTML, `highest 2 h average <b>${f0(Math.max(...tank))}</b> · lowest <b>${f0(Math.min(...tank))}</b> %`);
+    assert.equal(p.$("h-metric-sub").textContent, "Average per 2 h");
+    assert.match(fuel, /<div class="cnote">Each mark is the average of the readings in a 2 h block\.<\/div>$/);
+    // The battery axis does not start at 0, so a column would have no foot. The average is a
+    // dash 4 px thick at its own height.
+    // The morning has one too, at the left end of the axis.
+    const volt = pickMetric(p, "battery"), Yv = yScale(volt, H), volts = marks(volt, "ba");
+    assert.ok(Yv.lo > 0, `battery axis from ${Yv.lo}`);
+    assert.deepEqual([volts.length, marks(volt, "bt")], [4, []]);
+    assert.ok(close(volts[0].x + 12, X(t[0] + d.bucket / 2)) && volts[0].x < avg[0].x, `the morning is at ${volts[0].x}`);
+    volts.forEach((r, k) => assert.ok(r.h === 4 && close(r.y + 2, Yv(d.series.battery[k])), `battery ${k}: ${JSON.stringify(r)}`));
+    assert.equal(p.$("h-readout").innerHTML, `highest 2 h average <b>${Math.max(...d.series.battery).toFixed(2)}</b> · lowest <b>${Math.min(...d.series.battery).toFixed(2)}</b> V`);
+    // The coolant has both: a dash at the average and a lighter part from it up to the highest reading.
+    const cool = pickMetric(p, "coolant"), Yc = yScale(cool, H), dash = marks(cool, "ba"), up = marks(cool, "bt");
+    assert.ok(Yc.lo > 0, `coolant axis from ${Yc.lo}`);
+    assert.equal(up.length, 3);
+    dash.forEach((r, k) => {
+      assert.ok(r.h === 4 && close(r.y + 2, Yc(d.series.coolant[at[k]])), `coolant ${k}: ${JSON.stringify(r)}`);
+      assert.ok(close(up[k].y, Yc(d.series.coolant_max[at[k]])) && close(up[k].y + up[k].h, r.y + r.h), `coolant highest ${k}: ${JSON.stringify(up[k])}`);
+    });
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("history: under three days the chart is a line, from three days on it is separate marks", async () => {
+    const env = makeEnv();
+    await threeTrips(env, 126800);
+    const now = T0 + 8000;
+    // Two days have 10-minute intervals: the line chart, here with a dot per one-minute drive.
+    const two = openPage(env, { hash: `history/${now - 2 * 86400}-${now}` });
+    await two.settle();
+    assert.equal((await lastHistory(env, two)).bucket, 600);
+    assert.equal(marks(two.$("h-chart").innerHTML, "ba").length, 0);
+    assert.equal((two.$("h-chart").innerHTML.match(/<circle cx=/g) ?? []).length, 3 + 3, "a small dot and a large one per drive");
+    assert.equal(two.$("h-metric-sub").textContent, "Average per 10 min");
+    assert.match(two.$("h-chart").innerHTML, /<div class="cnote">Each point is the average over 10 min\. Highest single reading in this period: <b>\d+ mph<\/b>\.<\/div>$/);
+    assert.match(two.$("h-readout").innerHTML, /^avg <b>\d+<\/b> · highest average <b>\d+<\/b> mph$/);
+    // Three days have 15-minute intervals: marks.
+    const three = openPage(env, { hash: `history/${now - 3 * 86400}-${now}` });
+    await three.settle();
+    assert.equal((await lastHistory(env, three)).bucket, 900);
+    assert.equal(marks(three.$("h-chart").innerHTML, "ba").length, 3);
+    assert.ok(!/<path|<circle/.test(three.$("h-chart").innerHTML), "a line, a fill or a dot is drawn");
+    assert.equal(three.$("h-metric-sub").textContent, "Average and highest reading per 15 min");
+    assert.match(three.$("h-chart").innerHTML, /average of the readings in each 15 min block</);
+    assert.match(three.$("h-readout").innerHTML, /^highest reading <b>\d+<\/b> · highest 15 min average <b>\d+<\/b> mph$/);
+    assert.deepEqual([...two.errors, ...three.errors], []);
+  });
+
+  check("history: an interval that averaged 0 keeps a mark, a crowded axis keeps marks 2.5 px wide, and a day interval gives both its ends", async () => {
+    const env = makeEnv();
+    // A minute of idling four weeks ago, and a drive today.
+    const then = T0 - 28 * 86400;
+    await upload(env, drive({ boot: 12, n: 60, base: then }).map((r) => ({ ...r, speed_kph: 0 })), then + 100);
+    await upload(env, drive({ boot: 13, n: 60, odo0: 126800 }), T0 + 100);
+    setNow(T0 + 4000);
+    const p = openPage(env, { hash: "history", width: 390, touch: true });
+    await p.settle();
+    const d = await lastHistory(env, p);
+    assert.equal(d.bucket, 7200);
+    assert.deepEqual([d.series.speed[0], d.series.speed_max[0]], [0, 0]);
+    const svg = p.$("h-chart").innerHTML, avg = marks(svg, "ba"), foot = 230 - 22;
+    // On a phone four weeks of 2-hour intervals are about 1 px each.
+    assert.deepEqual(avg.map((r) => r.w), [2.5, 2.5]);
+    // The idle: 2 px on the axis and no lighter part. Only the drive has one.
+    assert.deepEqual([avg[0].y, avg[0].h], [foot - 2, 2]);
+    assert.equal(marks(svg, "bt").length, 1);
+    // A mark wider than its interval reaches past the plot (40 to 382) by under half its width.
+    assert.ok(avg.every((r) => r.x > 40 - 1.25 && r.x + r.w < 382 + 1.25), `marks at ${avg.map((r) => r.x)}`);
+
+    // 12 months: an interval is a day that starts at midnight UTC, 4 PM here the day before.
+    const year = p.groups["#h-presets button[data-p]"].find((b) => b.dataset.p === "year");
+    year.onclick();
+    await p.settle();
+    const y = await lastHistory(env, p);
+    assert.equal(y.bucket, 86400);
+    assert.equal(p.$("h-metric-sub").textContent, "Average and highest reading per day");
+    assert.match(p.$("h-chart").innerHTML, /average of the readings in each day</);
+    const f0 = (v) => Math.round(v).toLocaleString(), last = y.series.t.length - 1, t = y.series.t[last];
+    assert.equal(p.$("h-readout").innerHTML, `highest reading <b>${f0(y.totals.max_mph)}</b> · highest daily average <b>${f0(Math.max(...y.series.speed))}</b> mph`);
+    // A finger at the right end: the day of the drive, with the date and time of both ends.
+    p.$("h-chart").querySelector("svg").handlers.pointerdown({ clientX: 380, pointerType: "touch" });
+    assert.equal(p.$("h-readout").innerHTML, `<b>${f0(y.series.speed[last])} mph</b> average · <b>${f0(y.series.speed_max[last])} mph</b> highest · ` +
+      `${dayOf(t)}, ${timeOf(t)} to ${dayOf(t + 86400)}, ${timeOf(t + 86400)}`);
+    assert.notEqual(dayOf(t), dayOf(t + 86400));
     assert.deepEqual(p.errors, []);
   });
 
