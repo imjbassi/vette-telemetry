@@ -148,7 +148,7 @@ Commit your work first, or git carries it into the old checkout. `secrets.h` is 
 
 ### Not verified on the road
 
-- Firmware build 2 on the car. So far it has run only as `sim7670g-bench` on the car board at the desk (2026-11-18), with the old once-a-minute retry of skipped PIDs. That run passed drain 1 and drain 2: the probe schedule, the parked heartbeat, the queue through a dead zone and the drain afterwards, the upload backoff and the retry of a failed network bring-up. Not seen on a board yet: the fallback to 30-record uploads (drain 3), the 10 s retry of skipped PIDs, and everything with the real CX and modem.
+- Firmware build 2 on the car. So far it has run only as `sim7670g-bench` on the car board at the desk. A full run on 2026-11-18 passed all three drains with no record lost, duplicated or dropped: the probe schedule, the parked heartbeat, the queue through a dead zone and the drain afterwards, the upload backoff, the retry of a failed network bring-up, the fallback to 30-record uploads (drain 3: 970 records in 39 uploads after 3 refusals) and the 10 s retry of skipped PIDs (speed back as the scripted car starts moving). Not seen on a board yet: everything with the real CX and modem.
 - Adapter matching by paired address (`NimBLEDevice::isBonded` against the CX's advertised address).
 - The probe a Bluetooth reconnect is owed, with real link drops at crank.
 - Whether a C8 ECU that answers NO DATA at the start of a drive answers within the first 2 minutes, while skipped PIDs are retried every 10 s.
