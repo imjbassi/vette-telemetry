@@ -5,16 +5,24 @@
 namespace pids {
 
 // A supported PID that answers NO DATA 3 times in a row is skipped. Timeouts and bus
-// errors do not count, since they say nothing about the PID itself. Once a minute while
-// polling the strikes are cleared and a skipped PID is asked again: an ECU that is slow
+// errors do not count, since they say nothing about the PID itself. While polling the
+// strikes are cleared now and then and a skipped PID is asked again: an ECU that is slow
 // to answer at the start of a drive once cost a whole drive of speed and temperatures.
-// A PID the car never answers then costs at most 3 requests a minute. RPM (0C) is
-// never skipped: the engine gate runs on it, and three NO DATA answers during a short
-// stop would otherwise end all polling until the gate has gone quiet and come back.
+// In the first 2 minutes of polling that is every 10 s, because a slow start is when it
+// happens, and every second without speed is distance the backend never counts while
+// it still counts the fuel. After that it is once a minute. A PID the car never answers
+// then costs 3 requests every 10 s in the first 2 minutes and 3 a minute after that.
+// RPM (0C) is never skipped: the engine gate runs on it, and three NO DATA answers
+// during a short stop would otherwise end all polling until the gate has gone quiet and
+// come back.
 static uint8_t s_noData[256];
 static const uint8_t kMaxNoData = 3;
+static const uint32_t kEarlyMs = 120000;             // the first 2 minutes of polling
+static const uint32_t kClearEarlyEveryMs = 10000;
 static const uint32_t kClearStrikesEveryMs = 60000;
+static uint32_t s_pollStart = 0;     // millis() when polling started (probe or reset)
 static uint32_t s_strikesSince = 0;  // millis() when the strikes were last cleared
+static uint32_t s_clearEvery = kClearEarlyEveryMs;  // wait from that clear to the next one
 static bool s_lastRpmOk = false;     // the last pollFast() had an RPM reply
 
 // Supported-PID bitmasks from 0100, 0120, ... 01E0. Bit 31 of mask[i] is PID i*0x20+1.
@@ -29,13 +37,21 @@ static uint16_t s_slowValid;
 
 static const uint8_t kOurPids[] = {0x0C, 0x0D, 0x05, 0x0F, 0x10, 0x11, 0x2F, 0x42, 0xA6};
 
+// The wait to the next clear is fixed here, so the console line can say when a skipped
+// PID is asked again. The last clear inside the first 2 minutes waits 10 s more.
 static void clearStrikes() {
   memset(s_noData, 0, sizeof(s_noData));
   s_strikesSince = millis();
+  s_clearEvery = s_strikesSince - s_pollStart < kEarlyMs ? kClearEarlyEveryMs : kClearStrikesEveryMs;
+}
+
+static void startPolling() {
+  s_pollStart = millis();
+  clearStrikes();
 }
 
 void reset() {
-  clearStrikes();
+  startPolling();
   memset(s_mask, 0, sizeof(s_mask));
   s_haveMask = false;
   s_slowValid = 0;
@@ -102,7 +118,11 @@ static bool query(uint8_t pid, uint8_t* out, int nbytes) {
   String r = obd::cmd(c, OBD_CMD_TIMEOUT_MS);
   if (parseMode01(r, pid, out, nbytes)) { s_noData[pid] = 0; return true; }
   if (pid != 0x0C && r.indexOf("NO DATA") >= 0 && ++s_noData[pid] == kMaxNoData) {
-    Serial.printf("[pid] 01%02X keeps returning NO DATA, skipped until the next minute\n", pid);
+    // The slow round runs after the fast one, so the clear can be due already.
+    uint32_t gone = millis() - s_strikesSince;
+    uint32_t left = gone < s_clearEvery ? s_clearEvery - gone : 0;
+    Serial.printf("[pid] 01%02X keeps returning NO DATA, skipped for %lu s\n", pid,
+                  (unsigned long)(left ? (left + 999) / 1000 : 1));
   }
   return false;
 }
@@ -142,7 +162,7 @@ static void report() {
 }
 
 bool probe() {
-  clearStrikes();
+  startPolling();
   String why;
   if (readMasks(OBD_PROBE_TIMEOUT_MS, why)) { report(); return true; }
   why.replace("\n", " / ");
@@ -205,7 +225,7 @@ float adapterVolts() {
 void pollFast(Record& r) {
   uint8_t b[4];
   // Polling is the only caller, so this never runs while quiet, and it sends nothing.
-  if (millis() - s_strikesSince >= kClearStrikesEveryMs) clearStrikes();
+  if (millis() - s_strikesSince >= s_clearEvery) clearStrikes();
   // No RPM reply in this tick and the one before: no further questions. A car that is
   // shutting down gets one request per second for the 20 s until the gate goes quiet,
   // after one round of the others in the first tick without RPM. That round adds at most

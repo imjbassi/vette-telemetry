@@ -19,7 +19,8 @@ bool engineRpm(uint16_t& rpm);    // one 010C request, the only thing sent to th
 
 // RPM, speed, MAF, throttle, coolant, IAT. RPM is asked first. Without an RPM reply in
 // this call and the one before, nothing else is asked. A PID skipped after 3 NO DATA
-// answers is asked again within a minute.
+// answers is asked again within 10 s in the first 2 minutes of polling, within a minute
+// after that.
 void pollFast(Record& r);
 void pollSlow(Record& r);         // fuel level, ECU voltage, odometer. Call it only in a tick that has RPM.
 void carrySlow(Record& r);        // copy last slow values into r

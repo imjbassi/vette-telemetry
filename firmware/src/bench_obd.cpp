@@ -14,7 +14,7 @@ namespace obd {
 //   0:40  start      2 s crank dip to 10.9 V, then running
 //   0:42  drive      14.2 V, but 12.6 V from 2:30 to 3:20 (a running engine can sit near 12 V).
 //                    Speed answers NO DATA for the first 10 s of each drive, as the real car
-//                    once did. It is skipped, and back within a minute.
+//                    once did. It is skipped, and back about 10 s later.
 //   5:00  stop       engine off for 50 s, longer than the 20 s grace, so the gate goes quiet.
 //                    The voltage starts at 13.3 V and sinks: unanswered probes at charging
 //                    voltage again, but no search, because the car has answered in this boot.
@@ -110,7 +110,7 @@ static String mode01(const String& c, const Car& car) {
 bool begin() {
   Serial.println("[bench] scripted adapter, no Bluetooth. Car script: 10 min cycle of parked on a charger, start, drive, stop, restart");
   Serial.println("[bench] expect one protocol search about 15 s after the adapter connects, and none after that");
-  Serial.println("[bench] expect speed to be skipped at the start of each drive and back within a minute");
+  Serial.println("[bench] expect speed to be skipped at the start of each drive and back within 20 s");
   return true;
 }
 

@@ -1,8 +1,9 @@
 // The PID layer (src/pids.cpp) built for a PC: a stand-in Arduino core (shim/Arduino.h)
 // and a scripted adapter in place of src/obd_ble.cpp. It covers what the engine gate
 // relies on: RPM is never dropped, a silent ECU is asked for RPM only, one lost RPM
-// reply costs nothing else, a skipped PID comes back within a minute, and the protocol
-// search leaves the adapter on a fixed protocol or drops the link.
+// reply costs nothing else, a skipped PID comes back 10 s later at the start of a drive
+// and within a minute after that, and the protocol search leaves the adapter on a fixed
+// protocol or drops the link.
 #include <functional>
 #include <initializer_list>
 #include <string>
@@ -207,40 +208,61 @@ static void rpmIgnoresTheSupportMask() {
 
 // Seen on the car with the old firmware: the ECU answered NO DATA in the first seconds
 // of a drive, the PIDs were dropped for the session, and 16 minutes of driving had no
-// speed, airflow, temperatures, fuel or odometer. Now the strikes are cleared once a
-// minute while polling, and a skipped PID is back within 60 s.
-static void skippedPidComesBackWithinAMinute() {
+// speed, airflow, temperatures, fuel or odometer. Now the strikes are cleared while
+// polling: every 10 s in the first 2 minutes, then once a minute. A PID skipped at the
+// start of a drive is back 10 s later, one skipped later in the drive within a minute.
+static void skippedPidComesBack() {
   fresh();
+  // The adapter connected (reset) 5 minutes before the engine started, as when the car
+  // stood parked. The first 2 minutes count from the probe that finds the engine.
+  static uint32_t t0;
+  g_millis += 300000;
+  t0 = g_millis;
   g_reply = [](const std::string& c) {
+    int s = (int)((g_millis - t0) / 1000);
     if (c == "0100") return std::string("4100081B8001");  // the 0D range, and 0120 follows
     if (c == "0120") return std::string("412000020000");  // 2F (fuel level)
-    if (c == "010D1" && sentCount("010D1") <= 3) return std::string("NO DATA");
-    if (c == "012F1") return std::string(sentCount("012F1") <= 3 ? "NO DATA" : "412FBF");
+    // Speed: no answer in the first 5 s of the drive, and again for 5 s at 200 s.
+    if (c == "010D1" && (s < 5 || (s >= 200 && s < 205))) return std::string("NO DATA");
+    // Fuel level: no answer from 300 s to 325 s, three slow rounds in a row.
+    if (c == "012F1") return std::string(s >= 300 && s < 325 ? "NO DATA" : "412FBF");
     return running(c);
   };
-  CHECK(pids::probe());  // activation: the masks, and the minute starts
-  uint32_t t0 = g_millis;
-  int speedBack = -1, fuelBack = -1;
+  CHECK(pids::probe());  // activation: the masks, and the first 2 minutes start
+  bool speed[400] = {};
+  std::vector<int> fuelAsked;
   uint32_t cycle = 0;
-  for (int s = 0; s < 120; s++) {
+  for (int s = 0; s < 400; s++) {
     Record r = {};
     pollAt(t0, s, r);
     // The slow round every 10th tick with RPM, as tick() runs it.
+    int before = sentCount("012F1");
     if ((r.valid & V_RPM) && cycle++ % SLOW_EVERY_N == 0) pids::pollSlow(r);
     else pids::carrySlow(r);
+    if (sentCount("012F1") > before) fuelAsked.push_back(s);
     CHECK(r.valid & V_RPM);
-    if (s >= 3 && s < 60) CHECK(!(r.valid & V_SPEED));  // skipped
-    if ((r.valid & V_SPEED) && speedBack < 0) speedBack = s;
-    if ((r.valid & V_FUEL) && fuelBack < 0) fuelBack = s;
+    speed[s] = (r.valid & V_SPEED) != 0;
   }
-  CHECK_EQ(speedBack, 60);
-  CHECK_EQ(fuelBack, 60);
-  CHECK_EQ(sentCount("010D1"), 3 + 60);  // ticks 0 to 2, then 60 to 119
-  CHECK_EQ(sentCount("012F1"), 3 + 6);   // ticks 0, 10, 20, then 60 to 110
+  // Asked at 0, 1 and 2 s, skipped, asked again at 10 s. The old code waited to 60 s.
+  for (int s = 0; s < 10; s++) CHECK(!speed[s]);
+  for (int s = 10; s < 200; s++) CHECK(speed[s]);
+  // Past the first 2 minutes the clears are at 120, 180 and 240 s: asked at 200, 201
+  // and 202 s, skipped, asked again at 240 s.
+  for (int s = 200; s < 240; s++) CHECK(!speed[s]);
+  for (int s = 240; s < 400; s++) CHECK(speed[s]);
+  CHECK_EQ(sentCount("010D1"), 3 + (203 - 10) + (400 - 240));
+  // Fuel level is asked every 10 s. Its third NO DATA at 320 s skips it until the clear
+  // at 360 s, so nothing is asked at 330, 340 and 350 s.
+  std::vector<int> want;
+  for (int s = 0; s < 400; s += 10) {
+    if (s < 330 || s >= 360) want.push_back(s);
+  }
+  CHECK(fuelAsked == want);
 
-  // A PID the car never answers costs at most 3 requests a minute, and the others keep
-  // coming. Then the engine stops at 650 s and the ECU goes silent. The minute that ends
-  // at 660 s while the gate waits out its 20 s adds no request: RPM only, one per tick.
+  // A PID the car never answers costs 3 requests every 10 s in the first 2 minutes,
+  // then 3 a minute, and the others keep coming. Then the engine stops at 650 s and the
+  // ECU goes silent. The clear at 660 s while the gate waits out its 20 s adds no
+  // request: RPM only, one per tick.
   fresh();
   static bool stopped;
   stopped = false;
@@ -255,7 +277,8 @@ static void skippedPidComesBackWithinAMinute() {
     pollAt(t0, s, r);
     CHECK_EQ(r.valid, kFast & ~V_SPEED);
     if (s == 599) {
-      CHECK_EQ(sentCount("010D1"), 3 * 10);
+      // Clears at 0, 10, ... 120 s, then 180, 240, ... 540 s.
+      CHECK_EQ(sentCount("010D1"), 3 * (13 + 7));
       CHECK_EQ(sentCount("010C1"), 600);
     }
   }
@@ -335,7 +358,7 @@ int main() {
   otherPidsAreStillDropped();
   oneLostRpmReplyKeepsTheRest();
   rpmIgnoresTheSupportMask();
-  skippedPidComesBackWithinAMinute();
+  skippedPidComesBack();
   searchRestoresTheProtocol();
   searchFindsAProtocol();
   return finish("test_pids");
