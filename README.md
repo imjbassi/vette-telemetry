@@ -309,6 +309,8 @@ Only table names and row counts are printed. Either form holds every reading and
 
 D1 Free allows 5,000,000 rows read and 100,000 rows written per day, and 500 MB per database. D1 counts every row a query scans. A spent quota blocks reads and writes until 00:00 UTC, so a page that reads too much can stop uploads from being stored.
 
+Storage, measured 2026-11-19: the live database held 14,702 readings in 2.1 MB, about 145 bytes per reading with the rollups, the indexes and the upload log included. Local copies after VACUUM give 97 to 118 bytes per reading for `samples` and its index. That is about 0.5 MB per hour of driving at 1 Hz, so the 500 MB limit comes after roughly 1,000 hours of driving. The upload log (`ingests`) keeps only 30 days, so it does not grow with time.
+
 Raw readings live in `samples` (one per second while driving), but nothing that refreshes reads them in bulk. Each upload folds its readings into three rollups (`src/rollup.ts`): `trips` (one row per session), `minutes` (per-minute aggregates) and `track` (a GPS point every 15 s). The dashboard and Claude tools read those, so a 30-day trips lookup reads a handful of rows instead of thousands. Raw readings are only read for one trip's detail or CSV, the newest readings in Logs, live updates newer than what the page already has, and History windows of an hour or less.
 
 Every `/api/*` answer of the dashboard carries `X-Rows-Read`, the rows D1 reported for that request, and `X-Page`, the id of the page that is deployed. The id costs no rows.
