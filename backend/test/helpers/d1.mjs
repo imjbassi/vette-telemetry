@@ -8,7 +8,9 @@
 // Like D1, numbers are bound as REAL (node:sqlite does the same), and a batch is one
 // transaction: if any statement fails, nothing of the batch is kept.
 // Not the same as D1: meta.rows_read is the number of rows returned, not rows scanned, and
-// meta.rows_written is the number of changed rows without index writes.
+// meta.rows_written is the number of changed rows without index writes. meta.size_after is
+// the size of the in-memory database (pages times page size), or sizeAfter when a test sets it
+// to stand for a database of that size.
 import { DatabaseSync } from "node:sqlite";
 import schemaSql from "../../schema.sql";
 
@@ -87,7 +89,7 @@ class Statement {
         changes,
         last_row_id: lastRowId,
         changed_db: changes > 0,
-        size_after: 0,
+        size_after: this.db.sizeAfter ?? this.db.size(),
         rows_read: results.length,
         rows_written: changes,
       },
@@ -122,6 +124,14 @@ export class TestD1 {
     this.compiled = new Map();
     this.statements = 0; // statements executed so far, in and out of batches
     this.batches = []; // statement count of every batch() call so far
+    this.sizeAfter = null; // bytes to report as meta.size_after in place of the real size
+    this.pageCount = sqlite.prepare("PRAGMA page_count");
+    this.pageSize = sqlite.prepare("PRAGMA page_size").get().page_size;
+  }
+
+  // Bytes the database takes now, as D1 reports it in meta.size_after.
+  size() {
+    return this.pageCount.get().page_count * this.pageSize;
   }
 
   prepare(sql) {

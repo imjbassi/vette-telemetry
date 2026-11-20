@@ -46,7 +46,9 @@ const TOOLS: Tool[] = [
       "nothing. battery_note appears when the voltage is old: the voltage now is not known. engine_values_as_of dates the " +
       "newest engine value. A value that stopped arriving is null, and engine_values_stale lists it with its own age. " +
       "odometer_as_of appears when the odometer reading is older than the last report. firmware_build 0 is firmware from " +
-      "before build 2. " +
+      "before build 2. database gives the storage used: used_mb of the free plan's limit_mb and used_pct, with " +
+      "driving_hours_left_est (hours of driving until it is full) and full_in_days_est (days at the pace of the last 30 days, " +
+      "null without driving in them). Both are estimates. A warning appears from 80 % on: once full, new readings are not stored. " +
       `Range is an estimate from the 30-day airflow-based MPG. With fewer than ${MPG30_MIN_MILES} logged miles in 30 days ` +
       "it uses a rough MPG of those miles when that is lower than the EPA rating, and the EPA rating otherwise. range_basis " +
       "says which. Returns no position.",

@@ -292,6 +292,7 @@
   <symbol id="i-cal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 3v3M16 3v3M7.5 13.5h3M13.5 13.5h3M7.5 17h3"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
   <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V8M7 13l5-5 5 5M5 4h14"/></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
 </svg>
 
 <div class="app">
@@ -317,6 +318,8 @@
 
     <!-- ====================================================== OVERVIEW -->
     <section class="view" id="v-overview">
+      <!-- Only while the database is nearly full: once it is full, new readings are not stored. -->
+      <div class="notice" id="o-db" hidden></div>
       <div class="grid kpis">
         <div class="card kpi"><div class="lab"><span class="ico"><svg style="color:var(--green)"><use href="#i-fuel"/></svg></span>Fuel level</div>
           <div class="val" id="k-fuel">–</div><div class="delta" id="k-fuel-d">&nbsp;</div><div class="meter"><i id="k-fuel-m" style="width:0"></i></div></div>
@@ -477,6 +480,12 @@
     <!-- ====================================================== LOGS -->
     <section class="view" id="v-logs">
       <div class="grid three" id="g-health"></div>
+      <div class="card kpi mt" id="g-db">
+        <div class="lab"><span class="ico"><svg style="color:var(--cyan)"><use href="#i-db"/></svg></span>Database storage</div>
+        <div class="val" id="g-db-val">–</div>
+        <div class="meter"><i id="g-db-m" style="width:0"></i></div>
+        <div class="delta mt" id="g-db-d">&nbsp;</div>
+      </div>
       <div class="card mt">
         <div class="card-head"><div><h3>Upload log</h3><div class="sub">Uploads from the logger, newest first</div></div><span class="chip" id="g-up-chip">–</span></div>
         <div class="tablewrap" style="max-height:300px"><table id="g-uploads"></table></div>
@@ -535,6 +544,9 @@
     view: null, status: null, trips: [], selected: null, tripData: null, live: null, maps: {},
     err: null, errAt: 0, note: null, rows: null, clock: 0, paused: false, shown: null, tripReq: 0, liveReq: 0, reveal: false,
     tripsFails: 0, econFails: 0, stale: false, reloadOnAnswer: false, wasActive: false,
+    // db: the size of the database and its limit, from the headers of the newest answer.
+    // storage: the readings behind the estimates, read when Logs opens and every 10 minutes.
+    db: null, storage: null, storageAt: 0,
   };
 
   // ---------------------------------------------------------------- utils
@@ -619,6 +631,8 @@
       if (pid && S.reloadOnAnswer) { S.reloadOnAnswer = false; if (S.stale) location.reload(); }
       const rr = r.headers.get("X-Rows-Read");
       if (rr != null && isFinite(+rr)) S.rows = { name: path.split("?")[0], n: +rr };
+      const dbB = +r.headers.get("X-DB-Bytes"), dbL = +r.headers.get("X-DB-Limit");
+      if (dbB > 0 && dbL > 0) S.db = { bytes: dbB, limit: dbL };
       if (!r.ok) {
         // The Worker answers its errors in JSON with an error text. Any other answer came from in
         // front of it, such as a Cloudflare error page. A 429 there is most likely the free plan's
@@ -1158,6 +1172,7 @@
   }
 
   function renderOverview() {
+    renderDbNotice();
     const s = S.status; if (!s || !s.car) return;
     const fuel = lv("fuel_pct"), tank = s.car.tank_gal, epa = s.car.epa.combined;
     const gal = fuel == null ? null : (fuel / 100) * tank;
@@ -1639,9 +1654,72 @@
     if (f & 1) return '<span class="tag ok">engine</span>';
     return '<span class="tag mid">off</span>';
   }
+  // ---------------------------------------------------------------- database storage
+  // The same shares as DB_WARN_PCT in queries.ts, which /api/storage sends as warn_pct.
+  // check:dash compares the two.
+  const DB_WARN_PCT = 80, DB_BAD_PCT = 95;
+  const MB = 1e6; // decimal, as the free plan's 500 MB limit is read on the server
+  const mbNum = (b) => (b < 10 * MB ? f1(b / MB) : f0(b / MB));
+  const pctText = (p) => (p < 10 ? f1(p) : f0(p)) + " %";
+  const dbPct = () => (S.db ? (S.db.bytes / S.db.limit) * 100 : null);
+  // Whole hours, rounded the more the further off they are.
+  function hoursText(h) {
+    const r = h < 100 ? h : h < 1000 ? Math.round(h / 10) * 10 : Math.round(h / 100) * 100;
+    return `${f0(r)} hour${r === 1 ? "" : "s"}`;
+  }
+  // How long until full, in days, months or years.
+  function fullIn(d) {
+    if (d < 1) return "Full in less than a day";
+    if (d >= 3652) return "Full in more than 10 years";
+    const t = d < 60 ? `${f0(d)} day${Math.round(d) === 1 ? "" : "s"}` : d < 730 ? `${f0(d / 30.44)} months` : `${f1(d / 365.25)} years`;
+    return `Full in about ${t}`;
+  }
+  // Overview says something only while the database is nearly full.
+  function renderDbNotice() {
+    const el = $("o-db"), p = dbPct();
+    el.hidden = p == null || p < DB_WARN_PCT;
+    if (el.hidden) { el.innerHTML = ""; return; }
+    el.innerHTML = `<i class="dot ${p >= DB_BAD_PCT ? "bad" : "warn"}"></i><span>Database ${pctText(p)} full ` +
+      `(${mbNum(S.db.bytes)} of ${mbNum(S.db.limit)} MB). Once it is full, new readings are not stored. ` +
+      `<a href="#logs">Logs</a> gives the time left.</span>`;
+  }
+  function renderStorage() {
+    const p = dbPct(), st = S.storage, m = $("g-db-m");
+    if (p == null) {
+      $("g-db-val").textContent = "–";
+      $("g-db-d").textContent = "The database has not reported its size.";
+      m.style.width = "0";
+      return;
+    }
+    $("g-db-val").innerHTML = `${mbNum(S.db.bytes)}<small>MB of ${mbNum(S.db.limit)} MB</small>`;
+    // A sliver at least, so an almost empty database still shows the bar.
+    m.style.width = Math.min(100, Math.max(p, 1)) + "%";
+    m.style.background = p >= DB_BAD_PCT ? "var(--red)" : p >= DB_WARN_PCT ? "var(--yellow)" : "var(--cyan)";
+    const lines = [`${pctText(p)} used`];
+    if (st && st.bytes_per_reading != null) lines.push(`${f0(st.readings)} readings, about ${f0(st.bytes_per_reading)} bytes each with summaries and indexes`);
+    if (st && st.driving_hours_left == null) lines.push("The time left needs an hour of readings to estimate.");
+    else if (st) {
+      lines.push(`About ${hoursText(st.driving_hours_left)} of driving left, at one reading per second`);
+      lines.push(st.days_left_at_pace == null ? "No readings in the last 30 days, so no pace to go by"
+        : `${fullIn(st.days_left_at_pace)} at the pace of the last 30 days (${f1(st.recent_engine_hours)} h with the engine on)`);
+    }
+    // The flash queue of the car board holds about 15 hours of driving (see README, Database cost).
+    if (p >= DB_WARN_PCT) lines.push("Once it is full, new readings are not stored. The logger holds about 15 hours of driving until there is room.");
+    $("g-db-d").innerHTML = lines.map((l) => `<div>${esc(l)}</div>`).join("");
+  }
+  // Reads every session row, so not on every poll.
+  const STORAGE_EVERY_MS = 10 * 60 * 1000;
+  async function loadStorage() {
+    let d; try { d = await get("api/storage"); } catch { return; }
+    S.storage = d.storage; S.storageAt = Date.now();
+    renderStorage();
+  }
+
   async function loadLogs() {
     let d; try { d = await get("api/logs?limit=200"); } catch { return; }
     absorb(d); renderHeader();
+    renderStorage();
+    if (!S.storageAt || Date.now() - S.storageAt >= STORAGE_EVERY_MS) loadStorage();
     const L = d.latest, h = d.stats.hour || {};
     const lastUp = L.last_upload ? L.last_upload.ts : null;
     const fresh = lastUp && now() - lastUp < 120;

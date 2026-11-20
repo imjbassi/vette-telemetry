@@ -190,6 +190,11 @@ test("the dashboard and the connector open only under their secret paths, and th
   assert.match(api.headers.get("Content-Type"), /^application\/json/);
   assert.equal(api.headers.get("Cache-Control"), "no-store");
   assert.match(api.headers.get("X-Rows-Read") ?? "", /^\d+$/);
+  // The size of the database as D1 gave it with the answer, and the free plan's limit.
+  assert.equal(api.headers.get("X-DB-Bytes"), String(env.DB.size()));
+  assert.equal(api.headers.get("X-DB-Limit"), "500000000");
+  const st = await send("/dash/test-dash-secret/api/storage");
+  assert.deepEqual(Object.keys(await st.json()), ["storage", "warn_pct"]);
   // The answer names the page that is served, so an open page can tell when it is out of date.
   assert.match(api.headers.get("X-Page") ?? "", /^[0-9a-f]{8}$/);
   assert.ok(html.includes(`const PAGE_ID = "${api.headers.get("X-Page")}";`));

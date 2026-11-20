@@ -2,9 +2,9 @@
 import page from "./dash.html";
 import { Env, getLatest, Latest } from "./ingest";
 import {
-  CAR, carState, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES, powerUpBattery, recentTripAggs, roughMpg,
-  STATE_RULES, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching, tripLabel, tripNumbers, tripNumbersList,
-  tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, windowOdometerMiles, withGpsMiles,
+  CAR, carState, DB_LIMIT_BYTES, DB_WARN_PCT, dbBytesOf, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES,
+  powerUpBattery, recentTripAggs, roughMpg, STATE_RULES, storage, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching,
+  tripLabel, tripNumbers, tripNumbersList, tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, windowOdometerMiles, withGpsMiles,
 } from "./queries";
 
 const json = (data: unknown, status = 200) =>
@@ -16,12 +16,15 @@ const MAX_TRACK = 1500; // map polyline points
 const nowS = () => Math.floor(Date.now() / 1000);
 
 // D1 bills every row a statement scans and reports it as meta.rows_read. This wraps the binding
-// for one request and adds those numbers up, so every answer can say what it cost.
-interface RowCount { rows: number }
+// for one request and adds those numbers up, so every answer can say what it cost. D1 also gives
+// the size of the database with every answer (meta.size_after). The newest one is kept, so every
+// answer can say how full the database is without a query of its own.
+interface RowCount { rows: number; size: number | null }
 
 function countRows(db: D1Database, count: RowCount): D1Database {
   const add = <R extends D1Result<unknown>>(r: R): R => {
     count.rows += Number(r.meta?.rows_read) || 0;
+    count.size = dbBytesOf(r) ?? count.size;
     return r;
   };
   const wrap = (st: D1PreparedStatement): D1PreparedStatement =>
@@ -441,6 +444,8 @@ async function api(env: Env, rest: string, url: URL): Promise<Response> {
     return json(await history(env, from, to));
   }
   if (rest === "/api/logs") return json(await logs(env, num("limit", 150, 500)));
+  // Reads every session row, so the page asks for it when Logs opens and then every 10 minutes.
+  if (rest === "/api/storage") return json({ storage: await storage(env), warn_pct: DB_WARN_PCT });
   const csv = rest.match(/^\/api\/trip\/(\d+)\.csv$/);
   if (csv) {
     const id = parseInt(csv[1], 10);
@@ -505,7 +510,7 @@ export async function handleDash(req: Request, env: Env, rest: string, base: str
   if (!rest.startsWith("/api/")) return new Response("not found", { status: 404 });
 
   // Every statement of this request goes through the counter, and the sum goes out as a header.
-  const count: RowCount = { rows: 0 };
+  const count: RowCount = { rows: 0, size: null };
   let res: Response;
   try {
     res = await api({ ...env, DB: countRows(env.DB, count) }, rest, new URL(req.url));
@@ -517,5 +522,10 @@ export async function handleDash(req: Request, env: Env, rest: string, base: str
   }
   res.headers.set("X-Rows-Read", String(count.rows));
   res.headers.set("X-Page", PAGE_ID);
+  // The size of the database and its limit, so Overview can warn before it is full.
+  if (count.size != null) {
+    res.headers.set("X-DB-Bytes", String(count.size));
+    res.headers.set("X-DB-Limit", String(DB_LIMIT_BYTES));
+  }
   return res;
 }

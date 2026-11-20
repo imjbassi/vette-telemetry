@@ -10,7 +10,7 @@ import {
   latestBattery, latestStatus, listTrips, liveBoot, localDay, location, mpg30, MPG30_MIN_MILES, odometerSpanMiles, offsetSpans,
   parseDay, parseTripId, powerUpBattery, resolveWindow, roughMpg, sameRecord, STATE_RULES, tripAgg, tripBefore, tripLabel,
   tripMoved, tripNumbers, tripNumbersList, tripNumbersWithGaps, tripSummary, tzOffset, unloggedAtLeast, unloggedMiles,
-  unloggedTotal, routeKm, withGpsMiles,
+  unloggedTotal, routeKm, withGpsMiles, storage, storageNums, DB_LIMIT_BYTES, dbBytesOf,
 } from "../src/queries.ts";
 import { makeEnv } from "./helpers/d1.mjs";
 
@@ -563,7 +563,8 @@ test("tools/list: every field the answers carry is named in the description", as
   const fields = {
     // The battery words as one phrase: alone, "low" would also match the "lower" of the range text.
     get_latest_status: ["battery_note", "engine_values_as_of", "engine_values_stale", "odometer_as_of", "cell_signal_dbm",
-      "firmware_build 0", "range_basis", '(charging, "engine on, not charging", engine off, low)'],
+      "firmware_build 0", "range_basis", '(charging, "engine on, not charging", engine off, low)',
+      "used_mb", "limit_mb", "used_pct", "driving_hours_left_est", "full_in_days_est", "warning"],
     get_location: ["fix_before_last_report_min", "parked"],
     get_trip_summary: ["newer_sessions_without_driving", "end_not_received", "times_estimated", "gps_distance_mi", "in_progress"],
     list_trips: ["end_not_received", "times_estimated", "gps_distance_mi", "more_trips_exist"],
@@ -1289,7 +1290,7 @@ test("get_latest_status: running car, no coordinates", async () => {
   assert.deepEqual(Object.keys(s), [
     "car_state", "engine_running_at_last_report", "fuel", "battery_v", "battery_context", "battery_as_of", "ecu_v",
     "coolant_f", "intake_air_f", "last_speed_mph", "last_rpm", "engine_values_as_of", "odometer_mi", "cell_signal_csq",
-    "cell_signal_dbm", "logger", "note",
+    "cell_signal_dbm", "logger", "database", "note",
   ]);
   assert.equal(s.car_state.state, "running");
   assert.equal(s.car_state.summary, "The engine is running, last report 5s ago.");
@@ -1306,6 +1307,68 @@ test("get_latest_status: running car, no coordinates", async () => {
   assert.doesNotMatch(JSON.stringify(s), /"lat"|"lon"|"location"|"map"|37\.8199|122\.4783|maps\.google/);
   // Nothing in the answer points toward a location call.
   assert.doesNotMatch(s.note, /get_location|position/);
+  // The storage of the database, with no warning while it is far from full.
+  assert.deepEqual(Object.keys(s.database), ["used_mb", "limit_mb", "used_pct", "driving_hours_left_est", "full_in_days_est"]);
+  assert.equal(s.database.limit_mb, 500);
+  assert.equal(s.database.used_mb, Math.round(e.DB.size() / 1e5) / 10);
+});
+
+test("storage: bytes per reading over everything stored, hours of driving left at 1 Hz, days at the 30-day pace", () => {
+  // The live database on 2026-11-19: 14,702 readings in 2,134,016 bytes, all of them in the last 30 days.
+  const live = storageNums(2_134_016, { readings: 14_702, recent_readings: 14_702, recent_engine_s: 12_528 });
+  const per = 2_134_016 / 14_702, left = DB_LIMIT_BYTES - 2_134_016;
+  assert.deepEqual(live, {
+    used_bytes: 2_134_016, limit_bytes: 500_000_000, used_pct: 0.4, readings: 14_702, bytes_per_reading: 145,
+    driving_hours_left: Math.floor(left / (per * 3600)), days_left_at_pace: Math.floor(left / ((per * 14_702) / 30)),
+    recent_engine_hours: 3.5,
+  });
+  assert.equal(live.driving_hours_left, 952);
+  // Under an hour of readings the fixed part of the size would swamp the rate: no estimate yet.
+  const young = storageNums(400_000, { readings: 3599, recent_readings: 3599, recent_engine_s: 3599 });
+  assert.deepEqual([young.bytes_per_reading, young.driving_hours_left, young.days_left_at_pace, young.used_pct], [null, null, null, 0.1]);
+  // 111 bytes per reading, 400 kB per hour: 499.6 MB left lasts 1,249 hours.
+  assert.equal(storageNums(400_000, { readings: 3600, recent_readings: 3600, recent_engine_s: 0 }).driving_hours_left, 1249);
+  // The pace counts only the readings of the last 30 days: half as many, twice as long.
+  const half = storageNums(2_134_016, { readings: 14_702, recent_readings: 7351, recent_engine_s: 6264 });
+  assert.equal(half.days_left_at_pace, Math.floor(left / ((per * 7351) / 30)));
+  assert.ok(Math.abs(half.days_left_at_pace - 2 * live.days_left_at_pace) <= 2);
+  // Nothing in the last 30 days: hours left, but no pace.
+  const idle = storageNums(2_134_016, { readings: 14_702, recent_readings: 0, recent_engine_s: 0 });
+  assert.deepEqual([idle.driving_hours_left, idle.days_left_at_pace, idle.recent_engine_hours], [952, null, 0]);
+  // Full or past it: nothing left.
+  const full = storageNums(510_000_000, { readings: 3_000_000, recent_readings: 90_000, recent_engine_s: 90_000 });
+  assert.deepEqual([full.used_pct, full.driving_hours_left, full.days_left_at_pace], [102, 0, 0]);
+  // Without a size there is nothing to say.
+  assert.equal(storageNums(null, { readings: 1, recent_readings: 1, recent_engine_s: 1 }), null);
+  assert.deepEqual([dbBytesOf({ meta: { size_after: 4096 } }), dbBytesOf({ meta: { size_after: 0 } }), dbBytesOf({ meta: {} }), dbBytesOf(null)],
+    [4096, null, null, null]);
+});
+
+test("storage: counts the readings of every session and of the last 30 days, with the size D1 gives", async () => {
+  const e = carEnv(); // 201 minutes of sessions from Nov 1 to Nov 3
+  const st = await storage(e, utc(2026, 11, 4, 12));
+  assert.equal(st.readings, 201 * 60);
+  assert.equal(st.used_bytes, e.DB.size());
+  assert.equal(st.bytes_per_reading, Math.round(e.DB.size() / (201 * 60)));
+  // 40 days on none of the sessions ended within the last 30 days: the readings stay, the pace goes.
+  const later = await storage(e, utc(2026, 12, 14, 12));
+  assert.deepEqual([later.readings, later.days_left_at_pace, later.recent_engine_hours], [201 * 60, null, 0]);
+  // The engine time of the sessions in the window: 60 s of every minute with the engine on.
+  assert.equal(st.recent_engine_hours, Math.round(((201 - 5) * 60) / 360) / 10);
+});
+
+test("get_latest_status: a warning from 80 % full", async () => {
+  const e = carEnv();
+  const now = utc(2026, 11, 3, 20, 10);
+  setLatest(e, drivingLatest(now));
+  e.DB.sizeAfter = 399_000_000;
+  assert.equal((await latestStatus(e, now)).database.warning, undefined);
+  e.DB.sizeAfter = 400_000_000;
+  assert.equal(typeof (await latestStatus(e, now)).database.warning, "string");
+  e.DB.sizeAfter = 410_000_000;
+  const s = await latestStatus(e, now);
+  assert.deepEqual([s.database.used_mb, s.database.used_pct], [410, 82]);
+  assert.equal(s.database.warning, "The database is nearly full. When it is full, new readings are not stored until room is made.");
 });
 
 test("get_latest_status: no signal, parked, link down, legacy firmware and the EPA fallback", async () => {

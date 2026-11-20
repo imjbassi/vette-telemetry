@@ -384,6 +384,60 @@ const ODOMETER_LAG_S = 600;
 // PARKED_FIX_LAG_S in dash.html.
 const PARKED_FIX_LAG_S = 600;
 
+// ---- Database storage ----
+// D1 Free keeps at most 500 MB per database. Read as decimal megabytes, the smaller reading.
+export const DB_LIMIT_BYTES = 500_000_000;
+// From this share on the dashboard warns on Overview and the status tool adds a warning.
+export const DB_WARN_PCT = 80;
+// Below this many readings the fixed part of the size (schema, part-filled pages, the 30 days of
+// upload log) would make the bytes per reading look far too large. One hour at 1 Hz.
+const DB_RATE_MIN_READINGS = 3600;
+const DAY_S = 86400;
+
+// The size D1 gives with every answer (meta.size_after), in bytes. Null when there is none.
+export function dbBytesOf(r: { meta?: { size_after?: unknown } } | null | undefined): number | null {
+  const b = Number(r?.meta?.size_after);
+  return Number.isFinite(b) && b > 0 ? b : null;
+}
+
+export interface StorageCounts { readings: number; recent_readings: number; recent_engine_s: number }
+
+// How full the database is and how long it lasts. The bytes per reading are the whole size over
+// all readings stored, so the rollups, the indexes and the upload log are part of them. Null
+// without a size.
+export function storageNums(bytes: number | null, c: StorageCounts, limit = DB_LIMIT_BYTES) {
+  if (bytes == null) return null;
+  const perReading = c.readings >= DB_RATE_MIN_READINGS ? bytes / c.readings : null;
+  const left = Math.max(0, limit - bytes);
+  const perDay = perReading != null && c.recent_readings > 0 ? (perReading * c.recent_readings) / 30 : null;
+  return {
+    used_bytes: bytes,
+    limit_bytes: limit,
+    used_pct: r1((bytes / limit) * 100) ?? 0,
+    readings: c.readings,
+    bytes_per_reading: perReading == null ? null : Math.round(perReading),
+    // At one reading per second, the rate while the logger runs.
+    driving_hours_left: perReading == null ? null : Math.floor(left / (perReading * 3600)),
+    // At the rate the readings of the last 30 days came in. Null without any in them.
+    days_left_at_pace: perDay == null ? null : Math.floor(left / perDay),
+    recent_engine_hours: r1(c.recent_engine_s / 3600) ?? 0,
+  };
+}
+
+// One query over the session rows (one per logger power-up, so a few thousand after years) for
+// the readings stored and those of the last 30 days. The size comes with its answer.
+export async function storage(env: Env, now = nowS()) {
+  const r = await env.DB.prepare(
+    `SELECT COALESCE(SUM(n), 0) AS readings,
+            COALESCE(SUM(CASE WHEN end_ts >= ?1 THEN n ELSE 0 END), 0) AS recent_readings,
+            COALESCE(SUM(CASE WHEN end_ts >= ?1 THEN engine_s ELSE 0 END), 0) AS recent_engine_s
+     FROM trips`,
+  ).bind(now - 30 * DAY_S).all<StorageCounts>();
+  return storageNums(dbBytesOf(r), r.results[0] ?? { readings: 0, recent_readings: 0, recent_engine_s: 0 });
+}
+
+const mb = (bytes: number) => r1(bytes / 1e6) ?? 0;
+
 export async function latestStatus(env: Env, now = nowS()) {
   const L = await getLatest(env);
   if (!Object.keys(L).length) return { error: "No data received yet." };
@@ -393,7 +447,7 @@ export async function latestStatus(env: Env, now = nowS()) {
   const cs = carState(L, now);
   const fuelPct = val("fuel_pct");
   const gal = fuelPct == null ? null : (fuelPct / 100) * TANK_GAL;
-  const [econ, moved] = await Promise.all([fuelPct == null ? null : mpg30(env, now), cutOffMoved(env, L, now)]);
+  const [econ, moved, db] = await Promise.all([fuelPct == null ? null : mpg30(env, now), cutOffMoved(env, L, now), storage(env, now)]);
   // Under the minimum of logged miles the car's own rough figure is used when it is below the
   // EPA rating. A rough figure above it would stretch the range, so EPA stays then.
   const rough = econ ? roughMpg(econ) : null;
@@ -455,6 +509,16 @@ export async function latestStatus(env: Env, now = nowS()) {
       firmware_build: val("fw"),
       adapter_link: L.link ? (L.link.v === 1 ? "up" : "down") : null,
       last_upload: when("last_upload"),
+    },
+    database: db == null ? null : {
+      used_mb: mb(db.used_bytes),
+      limit_mb: mb(db.limit_bytes),
+      used_pct: db.used_pct,
+      driving_hours_left_est: db.driving_hours_left,
+      full_in_days_est: db.days_left_at_pace,
+      ...(db.used_pct >= DB_WARN_PCT ? {
+        warning: "The database is nearly full. When it is full, new readings are not stored until room is made.",
+      } : {}),
     },
     note: "When the car is parked the logger has no power, so these are the last values it reported. " +
       "Range is an estimate.",

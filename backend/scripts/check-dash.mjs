@@ -1243,6 +1243,89 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("logs: the storage card gives the size, the readings, the hours of driving left and the pace, and is read again only after 10 minutes", async () => {
+    const env = makeEnv();
+    // More than an hour of readings, so the time left can be estimated.
+    await upload(env, drive({ n: 4000 }), T0 + 4100);
+    setNow(T0 + 4200);
+    const { storage: st, warn_pct } = await api(env, "api/storage");
+    // The page warns at the share the server names.
+    assert.equal(Number(/const DB_WARN_PCT = (\d+)/.exec(html)[1]), warn_pct);
+    assert.equal(st.readings, 4000);
+    assert.equal(st.bytes_per_reading, Math.round(st.used_bytes / 4000));
+    assert.ok(st.days_left_at_pace >= 3652, "a tiny database at this pace lasts more than 10 years");
+    const p = openPage(env, { hash: "logs" });
+    await p.settle();
+    const loc = (x) => (Math.round(x * 10) / 10).toLocaleString();
+    assert.equal(p.$("g-db-val").innerHTML, `${loc(st.used_bytes / 1e6)}<small>MB of 500 MB</small>`);
+    const h = st.driving_hours_left, hr = h < 100 ? h : h < 1000 ? Math.round(h / 10) * 10 : Math.round(h / 100) * 100;
+    assert.equal(p.$("g-db-d").innerHTML, [
+      `${loc(st.used_bytes / 5e6)} % used`,
+      `4,000 readings, about ${st.bytes_per_reading.toLocaleString()} bytes each with summaries and indexes`,
+      `About ${hr.toLocaleString()} hours of driving left, at one reading per second`,
+      `Full in more than 10 years at the pace of the last 30 days (${loc(st.recent_engine_hours)} h with the engine on)`,
+    ].map((l) => `<div>${l}</div>`).join(""));
+    // Under 1 % the bar keeps a sliver, in the card's own color.
+    assert.deepEqual([p.$("g-db-m").style.width, p.$("g-db-m").style.background], ["1%", "var(--cyan)"]);
+    // Read when Logs opened, not on the next poll, and again once 10 minutes have passed.
+    assert.equal(p.requests("api/storage"), 1);
+    await p.poll();
+    assert.equal(p.requests("api/storage"), 1);
+    setNow(T0 + 4200 + 600);
+    await p.poll();
+    assert.equal(p.requests("api/storage"), 2);
+    // A month without driving: the hours stay, the pace has nothing to go by.
+    setNow(T0 + 4200 + 31 * 86400);
+    const q = openPage(env, { hash: "logs" });
+    await q.settle();
+    assert.match(q.$("g-db-d").innerHTML, /<div>No readings in the last 30 days, so no pace to go by<\/div>$/);
+    assert.deepEqual([...p.errors, ...q.errors], []);
+  });
+
+  check("storage: from 80 % full Overview says so, red from 95 %, Logs warns too, and a database without a size says nothing", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    const p = openPage(env);
+    await p.settle();
+    assert.equal(p.$("o-db").hidden, true);
+    env.DB.sizeAfter = 410e6;
+    await p.poll();
+    assert.equal(p.$("o-db").hidden, false);
+    assert.equal(p.$("o-db").innerHTML, '<i class="dot warn"></i><span>Database 82 % full (410 of 500 MB). ' +
+      'Once it is full, new readings are not stored. <a href="#logs">Logs</a> gives the time left.</span>');
+    env.DB.sizeAfter = 480e6;
+    await p.poll();
+    assert.match(p.$("o-db").innerHTML, /^<i class="dot bad"><\/i><span>Database 96 % full \(480 of 500 MB\)\. /);
+    env.DB.sizeAfter = 399e6;
+    await p.poll();
+    assert.deepEqual([p.$("o-db").hidden, p.$("o-db").innerHTML], [true, ""]);
+
+    // Logs: a yellow bar, and with only a few minutes of readings no estimate of the time left.
+    env.DB.sizeAfter = 410e6;
+    const q = openPage(env, { hash: "logs" });
+    await q.settle();
+    assert.deepEqual([q.$("g-db-m").style.width, q.$("g-db-m").style.background], ["82%", "var(--yellow)"]);
+    assert.equal(q.$("g-db-d").innerHTML, "<div>82 % used</div><div>The time left needs an hour of readings to estimate.</div>" +
+      "<div>Once it is full, new readings are not stored. The logger holds about 15 hours of driving until there is room.</div>");
+    env.DB.sizeAfter = 490e6;
+    const r = openPage(env, { hash: "logs" });
+    await r.settle();
+    assert.equal(r.$("g-db-m").style.background, "var(--red)");
+
+    // A database that gives no size: no header, no line on Overview, and Logs says so.
+    const none = makeEnv();
+    await parkedCar(none);
+    none.DB.sizeAfter = 0;
+    assert.equal((await call(none, "api/status")).headers.get("X-DB-Bytes"), null);
+    const s = openPage(none);
+    await s.settle();
+    assert.equal(s.$("o-db").hidden, true);
+    const t = openPage(none, { hash: "logs" });
+    await t.settle();
+    assert.deepEqual([t.$("g-db-val").textContent, t.$("g-db-d").textContent], ["–", "The database has not reported its size."]);
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors, ...s.errors, ...t.errors], []);
+  });
+
   check("durations: a full hour is 1 h, an upload gap of days is in days, and an old upload or reading gives its date", async () => {
     const env = makeEnv();
     // Three uploads: one, an hour after it, and five days after that.
