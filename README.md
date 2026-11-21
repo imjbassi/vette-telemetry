@@ -283,7 +283,7 @@ Do not paste the three as one block. A shell runs the later lines even when the 
 
 `backend/maintenance/rebuild-rollups.sql` rebuilds `trips`, `minutes` and `track` from `samples`. Rows left over from before a repair do not survive it. Run it after repairing readings by hand, and once after deploying a change to the rollup rules (such as the 0.5 km/h added to speed on 2026-11-20), so that older sessions follow the new rules. Deploy first: readings the old Worker folds after the run keep the old rules. Run it while the car is parked. The command is in its header. It is safe to run again. Readings do not store the firmware build, so it is kept from the old trip row.
 
-Rows read: about 3 per reading. Rows written depend on the kind of reading, because every minute and route row is deleted and written again, and D1 counts index entries too. About 0.3 per reading while driving at 1 Hz. About 5 per parked heartbeat with a GPS fix: build 2 stores one every 30 s while parked, and each becomes a route point. About 1 per heartbeat without a fix. A parked day with a fix costs about 14,000.
+Rows read: about 11 per reading. The run on 2026-11-20 read 431,060 rows for 37,774 readings and wrote 8,853. D1 Free allows 5,000,000 rows read per day, so past about 400,000 readings, roughly 110 hours of driving at 1 Hz, one run uses up the reads of a day. Rows written depend on the kind of reading, because every minute and route row is deleted and written again, and D1 counts index entries too. About 0.3 per reading while driving at 1 Hz. About 5 per parked heartbeat with a GPS fix: build 2 stores one every 30 s while parked, and each becomes a route point. About 1 per heartbeat without a fix. A parked day with a fix costs about 14,000.
 
 D1 Free allows 100,000 rows written per day. Count before a remote run. This reads each rollup row once:
 
@@ -291,7 +291,7 @@ D1 Free allows 100,000 rows written per day. Count before a remote run. This rea
 npx wrangler d1 execute vette --remote --config wrangler.local.toml --command "SELECT (SELECT COUNT(*) FROM track) * 4 + (SELECT COUNT(*) FROM minutes) * 2 + (SELECT COUNT(*) FROM trips) * 4 AS writes"
 ```
 
-Run the file in one go only when `writes` is under about 90,000. Writes the uploads made earlier that UTC day count too. The remote run is one unit. As written it cannot run in parts or be continued the next day, and the database answers nothing while it runs. A run that uses up the daily writes leaves every upload answering 503 until 00:00 UTC.
+Run the file in one go only when `writes` is under about 90,000 and there are under about 400,000 readings. The count is on the safe side: it said 11,280 for the 8,853 rows the 2026-11-20 run wrote. Reads and writes the uploads made earlier that UTC day count too. The remote run is one unit. As written it cannot run in parts or be continued the next day, and the database answers nothing while it runs. A run that uses up the daily reads or writes leaves every upload answering 503 until 00:00 UTC.
 
 Past that size do not run the file as it is. Rebuild one range of sessions per UTC day with the `WHERE boot BETWEEN` edit described in its header, and count the range first as the header says. Or move the account to the Workers Paid plan for the rebuild.
 

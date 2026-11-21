@@ -10,8 +10,10 @@
 -- an upload that lands between two statements would be folded into half-built rows.
 --
 -- Cost on the D1 Free plan (limits 5,000,000 rows read and 100,000 rows written a day).
--- Rows read: about 3 per sample. Rows written depend on the kind of sample, because every
--- minute and route row is deleted and written again, and D1 counts index entries too:
+-- Rows read: about 11 per sample (431,060 for 37,774 samples on 2026-11-20), so past about
+-- 400,000 samples one run uses up the reads of a day. Rows written depend on the kind of
+-- sample, because every minute and route row is deleted and written again, and D1 counts
+-- index entries too:
 --   driving at 1 Hz with GPS          about 0.3 per sample
 --   parked heartbeat with a GPS fix   about 5 per sample. Build 2 stores one every 30 s
 --                                     while parked, and each becomes a route point.
@@ -19,11 +21,12 @@
 -- The writes come to about track rows x 4 + minutes rows x 2 + trips rows x 4, so count
 -- them first. This reads each rollup row once:
 --   npx wrangler d1 execute vette --remote --config wrangler.local.toml --command "SELECT (SELECT COUNT(*) FROM track) * 4 + (SELECT COUNT(*) FROM minutes) * 2 + (SELECT COUNT(*) FROM trips) * 4 AS writes"
--- Run the whole file only when that is under about 90,000. Writes that uploads made earlier
--- in the same UTC day count too. The remote run is one unit: the database answers nothing
--- while it runs, and a run that fails changes nothing. A run that uses up the daily writes
--- leaves every upload answering 503 until 00:00 UTC. The logger keeps its data and sends it
--- afterwards.
+-- The count is on the safe side: on 2026-11-20 it said 11,280 for a run that wrote 8,853.
+-- Run the whole file only when it is under about 90,000 and there are under about 400,000
+-- samples. Reads and writes that uploads made earlier in the same UTC day count too. The
+-- remote run is one unit: the database answers nothing while it runs, and a run that fails
+-- changes nothing. A run that uses up the daily reads or writes leaves every upload answering
+-- 503 until 00:00 UTC. The logger keeps its data and sends it afterwards.
 -- Past that size, rebuild one range of sessions per UTC day. Add
 -- `WHERE boot BETWEEN <lo> AND <hi>` in five places, with the same two numbers in all five:
 -- after both DELETEs below, after `SELECT DISTINCT boot, -1 FROM samples`, and after
