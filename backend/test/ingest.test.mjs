@@ -496,8 +496,9 @@ test("clock learning: estimated times are fixed by a later upload that carries t
   // Not in upload 2, so still the value from upload 1, but with its time corrected.
   assert.deepEqual(L.odo_km, { v: all[39].odo_km, ts: base + 41, boot, ms: 41000 });
   assert.ok(Object.values(L).every((e) => !e.est), "no estimated entry is left");
-  // Minute buckets keep the slot they were first counted in. Only the total is exact.
-  assert.deepEqual(rows(env, "SELECT t, n FROM minutes ORDER BY t"), [{ t: T0 + 60, n: 68 }, { t: T0 + 120, n: 2 }]);
+  // The minutes of upload 1 move from the minute of their estimated time to that of their real
+  // one: ms 2000 to 9000 were written at T0 + 52 to T0 + 59. Upload 1 had filed them all later.
+  assert.deepEqual(rows(env, "SELECT t, n FROM minutes ORDER BY t"), [{ t: T0, n: 8 }, { t: T0 + 60, n: 60 }, { t: T0 + 120, n: 2 }]);
 
   // Upload 3: records without a time again. The stored base dates them.
   setNow(T0 + 145);
@@ -600,6 +601,9 @@ test("a true clock that arrives hours later with the tail is still learned", asy
   assert.equal(one(env, "SELECT COUNT(*) AS n FROM samples WHERE ts_est = 0 AND ts = ? + ms / 1000", T0).n, 90);
   assert.deepEqual(one(env, "SELECT n, start_ts, end_ts, est FROM trips WHERE boot = ?", boot),
     { n: 90, start_ts: WRITTEN(all[0]), end_ts: WRITTEN(all[89]), est: 0 });
+  // The live part was filed one second late, 39 and 21 readings (see assertStillEstimated). Now
+  // every reading is in the minute it was written in.
+  assert.deepEqual(rows(env, "SELECT t, n FROM minutes WHERE boot = ? ORDER BY t", boot), [{ t: T0, n: 40 }, { t: T0 + 60, n: 50 }]);
 });
 
 test("the legacy GPS correction applies to firmware build 0 only", async () => {

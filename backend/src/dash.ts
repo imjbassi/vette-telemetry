@@ -3,7 +3,7 @@ import page from "./dash.html";
 import { Env, getLatest, Latest } from "./ingest";
 import {
   CAR, carState, DB_LIMIT_BYTES, DB_WARN_PCT, dbBytesOf, enoughMpgMiles, latestBattery, milesDown, mpg30, MPG30_MIN_MILES,
-  powerUpBattery, recentTripAggs, roughMpg, STATE_RULES, storage, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching,
+  powerUpBattery, recentTripAggs, roughMpg, STATE_RULES, storage, TANK_FULL_MINUTE, tankLevel, tripAgg, tripAggsBetween, tripAggsSince, tripAggsTouching,
   tripLabel, tripNumbers, tripNumbersList, tripNumbersWithGaps, unloggedAtLeast, unloggedTotal, windowOdometerMiles, withGpsMiles,
 } from "./queries";
 
@@ -71,9 +71,16 @@ function carInfo(latest: Latest, now: number) {
 
 async function status(env: Env) {
   const now = nowS();
-  const [latest, econ] = await Promise.all([getLatest(env), mpg30(env, now)]);
+  const [[latest, tank], econ] = await Promise.all([
+    getLatest(env).then(async (L) => [L, await tankLevel(env, L)] as const),
+    mpg30(env, now),
+  ]);
   return {
     ...carInfo(latest, now),
+    // The tank level for the Fuel card (see tankLevel). Null without any reading. Only this answer
+    // carries it, the newest reading is in `latest`. `boot` is the session of the reading it is
+    // worked out for: the page shows a newer session's reading as it is until the next status.
+    tank: tank == null ? null : { pct: Math.round(tank.pct * 10) / 10, minutes: tank.minutes, basis: tank.basis, boot: tank.boot },
     // Null until enough miles are logged in the 30 days. The page then uses the EPA figure
     // and says how many miles are missing.
     mpg30: econ.mpg,
@@ -247,6 +254,10 @@ async function history(env: Env, from: number, to: number) {
 
   // Fuel leaves out 0 % readings (the stray-zero rule in ingest.ts). A minute row only keeps
   // its lowest reading, so the rollup path drops every minute that holds one.
+  // The tank range (fuel_min and fuel_max) is the lowest and highest minute average with at
+  // least TANK_FULL_MINUTE readings, on both paths. While driving single readings stray up to 20
+  // points from the tank level: on 2026-11-20 they spanned 5 to 99 % against a real 25 to 98 %.
+  // A minute of a few readings, such as the first or last of a drive, is about as far off.
   const seriesSql = raw
     ? `SELECT (ts / ${B}) * ${B} AS t,
               AVG(speed_kph) AS spd, MAX(speed_kph) AS spd_max,
@@ -266,15 +277,20 @@ async function history(env: Env, from: number, to: number) {
               SUM(iat_sum) / NULLIF(SUM(iat_n), 0) AS iat,
               SUM(maf_sum) / NULLIF(SUM(maf_n), 0) AS maf, MAX(maf_max) AS maf_max
        FROM minutes WHERE t BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`;
+  const R = TANK_FULL_MINUTE;
   const extremesSql = raw
-    ? `SELECT COUNT(*) AS n, MAX(speed_kph) AS spd_max, MAX(rpm) AS rpm_max, MAX(coolant_c) AS cool_max,
-              AVG(CASE WHEN flags & 1 THEN coolant_c END) AS cool_avg, MIN(NULLIF(fuel_pct, 0)) AS fuel_min, MAX(fuel_pct) AS fuel_max,
+    ? `WITH tank AS (SELECT AVG(fuel_pct) AS f FROM samples WHERE ts BETWEEN ?1 AND ?2 AND fuel_pct IS NOT NULL
+                     GROUP BY boot, ts / 60 HAVING MIN(fuel_pct) > 0 AND COUNT(*) >= ${R})
+       SELECT COUNT(*) AS n, MAX(speed_kph) AS spd_max, MAX(rpm) AS rpm_max, MAX(coolant_c) AS cool_max,
+              AVG(CASE WHEN flags & 1 THEN coolant_c END) AS cool_avg,
+              (SELECT MIN(f) FROM tank) AS fuel_min, (SELECT MAX(f) FROM tank) AS fuel_max,
               MIN(adapter_v) AS volt_min, MAX(adapter_v) AS volt_max, MAX(throttle_pct) AS thr_max,
               MIN(intake_c) AS iat_min, MAX(intake_c) AS iat_max, SUM(lat IS NOT NULL) AS gps
-       FROM samples WHERE ts BETWEEN ? AND ?`
+       FROM samples WHERE ts BETWEEN ?1 AND ?2`
     : `SELECT SUM(n) AS n, MAX(spd_max) AS spd_max, MAX(rpm_max) AS rpm_max, MAX(cool_max) AS cool_max,
-              SUM(cool_eng_sum) / NULLIF(SUM(cool_eng_n), 0) AS cool_avg, MIN(CASE WHEN fuel_min > 0 THEN fuel_min END) AS fuel_min,
-              MAX(fuel_max) AS fuel_max,
+              SUM(cool_eng_sum) / NULLIF(SUM(cool_eng_n), 0) AS cool_avg,
+              MIN(CASE WHEN fuel_min > 0 AND fuel_n >= ${R} THEN fuel_sum / fuel_n END) AS fuel_min,
+              MAX(CASE WHEN fuel_min > 0 AND fuel_n >= ${R} THEN fuel_sum / fuel_n END) AS fuel_max,
               MIN(volt_min) AS volt_min, MAX(volt_max) AS volt_max, MAX(thr_max) AS thr_max,
               MIN(iat_min) AS iat_min, MAX(iat_max) AS iat_max, SUM(gps_n) AS gps
        FROM minutes WHERE t BETWEEN ? AND ?`;

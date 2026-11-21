@@ -1,5 +1,5 @@
 import { decode, engineOn, F, Sample } from "./record";
-import { emptyTrip, fold, MINUTE_UPSERT_SQL, Stamped, TRIP_UPSERT_SQL, tripParams, TripRow } from "./rollup";
+import { emptyTrip, fold, MINUTE_REBUILD_SQL, MINUTE_UPSERT_SQL, Stamped, TRIP_UPSERT_SQL, tripParams, TripRow } from "./rollup";
 
 export interface Env {
   DB: D1Database;
@@ -106,6 +106,8 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
   // Copied out of the trip rows here because fold() changes them further down.
   const anchors = new Map<number, { end: number; ms: number }>();
   for (const t of tripRows) if (t.est && t.end_ts != null) anchors.set(t.boot, { end: t.end_ts, ms: t.last_ms });
+  // Sessions that have readings stored with estimated times, also copied before fold().
+  const estimated = new Set(tripRows.filter((t) => t.est).map((t) => t.boot));
   const bound = (s: Sample) => {
     const a = anchors.get(s.boot);
     return a ? Math.min(now, a.end + Math.ceil((s.ms - a.ms) / 1000)) : now;
@@ -210,14 +212,24 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
   for (const [boot, base] of learned) {
     stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO boots (boot, epoch_base) VALUES (?, ?)`).bind(boot, base));
     // Earlier uploads from this boot were stored with estimated times. Fix them, and the
-    // trip's start/end and route times with them. Minute buckets keep their estimated slot,
-    // which is off by at most one upload interval.
+    // trip's start/end and route times with them.
     stmts.push(env.DB.prepare(`UPDATE samples SET ts = ? + ms / 1000, ts_est = 0 WHERE boot = ? AND ts_est = 1`).bind(base, boot));
     stmts.push(env.DB.prepare(`UPDATE track SET ts = ? + ms / 1000 WHERE boot = ?`).bind(base, boot));
     stmts.push(env.DB.prepare(
       `UPDATE trips SET start_ts = (SELECT MIN(ts) FROM samples WHERE boot = ?1),
                         end_ts = (SELECT MAX(ts) FROM samples WHERE boot = ?1), est = 0 WHERE boot = ?1`,
     ).bind(boot));
+    // The minute rows of those uploads sit in the minute of the estimated time. A backlog that
+    // goes up late without a clock is dated as if just written, many minutes after its real
+    // time (11 to 13 minutes on 2026-11-20). So the session's minute rows are built again from
+    // the corrected readings, this upload's included. Every one of them lies between the start
+    // and end of the folded trip, so the delete reads only that stretch of the minutes key.
+    const t = trips.get(boot);
+    if (estimated.has(boot) && t?.start_ts != null && t.end_ts != null) {
+      stmts.push(env.DB.prepare(`DELETE FROM minutes WHERE t BETWEEN ?1 AND ?2 AND boot = ?3`)
+        .bind(Math.floor(t.start_ts / 60) * 60, t.end_ts, boot));
+      stmts.push(env.DB.prepare(MINUTE_REBUILD_SQL).bind(boot));
+    }
   }
 
   if (samples.length) {

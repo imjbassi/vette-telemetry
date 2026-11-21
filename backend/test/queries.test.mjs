@@ -10,8 +10,9 @@ import {
   latestBattery, latestStatus, listTrips, liveBoot, localDay, location, mpg30, MPG30_MIN_MILES, odometerSpanMiles, offsetSpans,
   parseDay, parseTripId, powerUpBattery, resolveWindow, roughMpg, sameRecord, STATE_RULES, tripAgg, tripBefore, tripLabel,
   tripMoved, tripNumbers, tripNumbersList, tripNumbersWithGaps, tripSummary, tzOffset, unloggedAtLeast, unloggedMiles,
-  unloggedTotal, routeKm, withGpsMiles, storage, storageNums, DB_LIMIT_BYTES, dbBytesOf,
+  unloggedTotal, routeKm, withGpsMiles, storage, storageNums, DB_LIMIT_BYTES, dbBytesOf, tankFromMinutes, tankLevel,
 } from "../src/queries.ts";
+import { getLatest } from "../src/ingest.ts";
 import { makeEnv } from "./helpers/d1.mjs";
 
 const LA = "America/Los_Angeles";
@@ -1140,7 +1141,7 @@ test("get_trip_summary: field names, odometer, and locations only on request", a
   assert.deepEqual(noFix.fuel_level_pct, { start: null, end: null }); // no minute of trip 13 has a reading
   // Without a gauge reading the note does not explain the gauge. The rest still applies.
   assert.doesNotMatch(noFix.note, /fuel_level_pct/);
-  assert.match(noFix.note, /^Fuel used and MPG are estimates from engine airflow.* distance_mi is integrated from speed/);
+  assert.match(noFix.note, /^Fuel used and MPG are estimates from engine airflow.* distance_mi is added up from speed/);
 
   // No id means the newest trip. An id sent as a string works too.
   assert.equal((await tripSummary(e, {}, now)).trip_id, 15);
@@ -1295,8 +1296,11 @@ test("get_latest_status: running car, no coordinates", async () => {
   assert.equal(s.car_state.state, "running");
   assert.equal(s.car_state.summary, "The engine is running, last report 5s ago.");
   assert.deepEqual([s.car_state.ended_mid_drive, s.car_state.link_down, s.car_state.last_report.age], [false, false, "5s ago"]);
+  // The minute rows of this database hold no gauge readings, so the newest reading stands.
   assert.deepEqual({ ...s.fuel, as_of: null }, {
-    level_pct: 50, est_gallons_left: 9.3, est_range_mi: 190, range_basis_mpg: 20.5,
+    level_pct: 50,
+    level_basis: "the newest single gauge reading (after a refuel, or with no driving to average), which can be several points off while parked or idling",
+    est_gallons_left: 9.3, est_range_mi: 190, range_basis_mpg: 20.5,
     range_basis: "estimated MPG of the last 30 days", as_of: null,
   });
   assert.deepEqual([s.battery_v, s.battery_context, s.ecu_v], [12.1, "engine on, not charging", 12]);
@@ -1311,6 +1315,141 @@ test("get_latest_status: running car, no coordinates", async () => {
   assert.deepEqual(Object.keys(s.database), ["used_mb", "limit_mb", "used_pct", "driving_hours_left_est", "full_in_days_est"]);
   assert.equal(s.database.limit_mb, 500);
   assert.equal(s.database.used_mb, Math.round(e.DB.size() / 1e5) / 10);
+});
+
+// A minute row's gauge and speed, as the rollup keeps them: `n` readings of each.
+const tm = (pct, kph, n = 60) => ({ fuel_sum: pct * n, fuel_n: n, spd_sum: kph == null ? null : kph * n, spd_n: kph == null ? null : n });
+
+// What tankFromMinutes gives back.
+const walk = (pct, minutes, refuel = false) => ({ pct, minutes, refuel });
+
+test("tankFromMinutes: the gauge averaged over the newest minutes of driving, never across a refuel", () => {
+  // Newest first. Parked at the end and reading 58 %, driving before that at about 62 %.
+  assert.deepEqual(tankFromMinutes([tm(58, 0), tm(58, 0), tm(62, 50), tm(63, 70), tm(61, 30, 30)], true),
+    walk((62 * 60 + 63 * 60 + 61 * 30) / 150, 3));
+  // Under 20 km/h is not driving, 20 is.
+  assert.deepEqual(tankFromMinutes([tm(40, 19.9)], true), walk(null, 0));
+  assert.deepEqual(tankFromMinutes([tm(40, 20)], true), walk(40, 1));
+  // At most 10 minutes of driving. Newest first the tank was fuller the further back.
+  assert.deepEqual(tankFromMinutes(Array.from({ length: 15 }, (_, i) => tm(30 + i, 60)), true), walk(34.5, 10));
+  // A level needs 30 readings of driving. One gauge read carried into 10 records is not one.
+  assert.deepEqual(tankFromMinutes([tm(40, 60, 10)], true), walk(null, 0));
+  assert.deepEqual(tankFromMinutes([tm(40, 60, 10), tm(38, 60, 20)], true), walk((40 * 10 + 38 * 20) / 30, 2));
+  // Filled up: idling at the pump at 98 %, the drive before at 25 %. That drive measured another
+  // tank, so there is nothing to average yet.
+  assert.deepEqual(tankFromMinutes([tm(98, 0), tm(97, 0), tm(25, 60), tm(26, 60)], true), walk(null, 0, true));
+  assert.deepEqual(tankFromMinutes([tm(97, 60), tm(98, 40), tm(98, 0), tm(25, 60)], true), walk(97.5, 2, true));
+  // A slow pump climbs under 20 points a minute. The drive before is still left out.
+  assert.deepEqual(tankFromMinutes([tm(90, 50), tm(80, 0), tm(65, 0), tm(50, 0), tm(35, 0), tm(25, 60)], true), walk(90, 1, true));
+  // 15.5 points, the largest rise inside one session of the first build 2 drives, is no refuel.
+  assert.deepEqual(tankFromMinutes([tm(60, 60), tm(44.5, 60)], true), walk(52.25, 2));
+  // A minute of a few readings counts by its weight but is never taken for a refuel: one gauge
+  // read 22 points high in the newest minute, then the drive at 36 %.
+  assert.deepEqual(tankFromMinutes([tm(58, 60, 8), tm(36, 60), tm(36, 60)], true), walk((58 * 8 + 36 * 120) / 128, 3));
+  // Nor a last minute of 23 readings, parked and tilted 23 points above the drive.
+  assert.deepEqual(tankFromMinutes([tm(80, 0, 23), tm(57, 60), tm(57, 60)], true), walk(57, 2));
+  // From the start, oldest first, a refuel is a rise.
+  assert.deepEqual(tankFromMinutes([tm(25, 60), tm(24, 60), tm(98, 0), tm(97, 60)], false), walk(24.5, 2, true));
+  // Rows without speed readings are not driving.
+  assert.deepEqual(tankFromMinutes([tm(50, null)], true), walk(null, 0));
+  assert.deepEqual(tankFromMinutes([], true), walk(null, 0));
+});
+
+test("fuel level: status and trip summary average the gauge over minutes of driving", async () => {
+  const e = carEnv();
+  // Trip 13, Nov 3 20:00 to 20:19 UTC. Parked at the start reading 66 %, then 16 minutes of
+  // driving, 8 at 60 % and 8 at 52 %, then parked at the end reading 45 %.
+  const start = utc(2026, 11, 3, 20);
+  const gauge = e.DB.sqlite.prepare(
+    "UPDATE minutes SET fuel_sum = ?1 * 60, fuel_n = 60, fuel_min = ?1, fuel_max = ?1, spd_sum = ?2 * 60, spd_n = 60 WHERE boot = 13 AND t = ?3",
+  );
+  for (let i = 0; i < 20; i++) gauge.run(i < 2 ? 66 : i < 10 ? 60 : i < 18 ? 52 : 45, i < 2 || i >= 18 ? 0 : 80, start + i * 60);
+  const now = utc(2026, 11, 3, 20, 25);
+  setLatest(e, drivingLatest(now, 13, { fuel_pct: 45, engine_on: 0, speed_kph: 0 }));
+
+  // The newest reading says 45 %. The last 10 minutes of driving say (8 x 52 + 2 x 60) / 10.
+  assert.deepEqual(await tankLevel(e, await getLatest(e)), { pct: 53.6, minutes: 10, basis: "driving", boot: 13 });
+  const s = await latestStatus(e, now);
+  assert.deepEqual([s.fuel.level_pct, s.fuel.level_basis, s.fuel.est_gallons_left],
+    [53.6, "average of the tank gauge over the last 10 min of driving", 9.9]);
+  // The trip summary's gauge at both ends, by the same rule: (8 x 60 + 2 x 52) / 10 at the start.
+  assert.deepEqual((await tripSummary(e, { trip_id: 13 }, now)).fuel_level_pct, { start: 58, end: 54 });
+
+  // Trip 15 (23:30 UTC) has no gauge readings in its minute rows yet: the level of the driving
+  // before it stands, less the 0.02 gal trip 15 burned by airflow (0.108 points), as long as its
+  // newest reading is not more than 20 points above it.
+  const later = utc(2026, 11, 3, 23, 31);
+  const level3 = async () => { const l = await tankLevel(e, await getLatest(e)); return { ...l, pct: Math.round(l.pct * 1000) / 1000 }; };
+  setLatest(e, drivingLatest(later, 15, { fuel_pct: 45 }));
+  assert.deepEqual(await level3(), { pct: 53.492, minutes: 10, basis: "earlier", boot: 15 });
+  assert.equal((await latestStatus(e, later)).fuel.level_basis,
+    "average of the tank gauge over the last 10 min of driving before the newest trip, minus the fuel that trip has used " +
+    "so far, estimated from airflow. That trip has had too little driving to average yet");
+  // 26.5 points above it: filled up in between, so the newest reading stands.
+  setLatest(e, drivingLatest(later, 15, { fuel_pct: 80 }));
+  assert.deepEqual(await tankLevel(e, await getLatest(e)), { pct: 80, minutes: 0, basis: "reading", boot: 15 });
+
+  // A minute holding 0 % readings from one bad reply is skipped, and the next older minute of
+  // driving takes its place: (7 x 52 + 3 x 60) / 10. The same when the level is carried.
+  e.DB.sqlite.prepare("UPDATE minutes SET fuel_sum = 52 * 50, fuel_min = 0 WHERE boot = 13 AND t = ?").run(start + 15 * 60);
+  setLatest(e, drivingLatest(now, 13, { fuel_pct: 45, engine_on: 0, speed_kph: 0 }));
+  assert.deepEqual(await tankLevel(e, await getLatest(e)), { pct: 54.4, minutes: 10, basis: "driving", boot: 13 });
+  setLatest(e, drivingLatest(later, 15, { fuel_pct: 45 }));
+  assert.deepEqual(await level3(), { pct: 54.292, minutes: 10, basis: "earlier", boot: 15 });
+
+  // Trip 16 the next morning, 5 minutes at 20 mpg: 0.25 gal by airflow, 1.351 points. With 2
+  // minutes of driving its own average (51 %) does not count yet, the carried level does.
+  const t16 = utc(2026, 11, 4, 16);
+  addSession(e, { boot: 16, start: t16, minutes: 5 });
+  const g16 = e.DB.sqlite.prepare(
+    "UPDATE minutes SET fuel_sum = 51 * 60, fuel_n = 60, fuel_min = 51, fuel_max = 51, spd_sum = ?1 * 60, spd_n = 60 WHERE boot = 16 AND t = ?2",
+  );
+  for (let i = 0; i < 5; i++) g16.run(i < 2 ? 80 : 0, t16 + i * 60);
+  setLatest(e, drivingLatest(t16 + 300, 16, { fuel_pct: 51 }));
+  assert.deepEqual(await level3(), { pct: 53.049, minutes: 10, basis: "earlier", boot: 16 });
+  // From the third minute of driving its own average stands.
+  g16.run(80, t16 + 2 * 60);
+  assert.deepEqual(await tankLevel(e, await getLatest(e)), { pct: 51, minutes: 3, basis: "driving", boot: 16 });
+
+  // Without any reading there is no level.
+  setLatest(e, drivingLatest(now, 13, { fuel_pct: undefined }));
+  assert.equal(await tankLevel(e, await getLatest(e)), null);
+  assert.equal((await latestStatus(e, now)).fuel, null);
+});
+
+// D1 bills every row a query walks, and the test double only counts rows returned. A tank query
+// without its time bounds would walk the whole minutes table on every status poll.
+test("tank level queries walk the minutes key between two times, never the whole table", async () => {
+  const e = carEnv();
+  const seen = [];
+  const prepare = e.DB.prepare.bind(e.DB);
+  e.DB.prepare = (sql) => {
+    if (/fuel_sum, fuel_n, spd_sum, spd_n FROM minutes/.test(sql)) seen.push(sql);
+    return prepare(sql);
+  };
+  // Trip 15 has no gauge minutes, so both scans of tankLevel run. The trip summary runs one from each end.
+  setLatest(e, drivingLatest(utc(2026, 11, 3, 23, 31), 15, { fuel_pct: 45 }));
+  await tankLevel(e, await getLatest(e));
+  await tripSummary(e, { trip_id: 13 }, utc(2026, 11, 4, 20));
+  assert.equal(seen.length, 4);
+  for (const sql of seen) {
+    const plan = e.DB.sqlite.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map((r) => r.detail).join(" | ");
+    assert.match(plan, /^SEARCH minutes USING PRIMARY KEY \(t>\? AND t<\?\)/, sql);
+    assert.doesNotMatch(plan, /TEMP B-TREE/, sql);
+  }
+});
+
+test("get_trip_summary: the gauge at each end stops at a refuel inside the trip", async () => {
+  const e = carEnv();
+  // Trip 13: 4 minutes of driving at 25 %, 2 idling at the pump at 98 %, then 3 of driving at 97 %.
+  const start = utc(2026, 11, 3, 20);
+  const gauge = e.DB.sqlite.prepare(
+    "UPDATE minutes SET fuel_sum = ?1 * 60, fuel_n = 60, fuel_min = ?1, fuel_max = ?1, spd_sum = ?2 * 60, spd_n = 60 WHERE boot = 13 AND t = ?3",
+  );
+  for (let i = 0; i < 9; i++) gauge.run(i < 4 ? 25.1 : i < 6 ? 98 : 96.9, i < 4 || i >= 6 ? 80 : 0, start + i * 60);
+  const t = await tripSummary(e, { trip_id: 13 }, utc(2026, 11, 3, 21));
+  // From the start the walk stops at the rise to 98, from the end at the drop to 25.
+  assert.deepEqual(t.fuel_level_pct, { start: 25, end: 97 });
 });
 
 test("storage: bytes per reading over everything stored, hours of driving left at 1 Hz, days at the 30-day pace", () => {

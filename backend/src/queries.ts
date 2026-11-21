@@ -438,6 +438,113 @@ export async function storage(env: Env, now = nowS()) {
 
 const mb = (bytes: number) => r1(bytes / 1e6) ?? 0;
 
+// ---- Tank level
+// The tank gauge (PID 2F) moves with the fuel sloshing and with how the car stands. While driving
+// single readings stray up to 20 points from the tank level, and a parked car reads up to 11
+// points off, so the newest reading is a poor tank level. The level is the mean of the gauge over
+// the newest minutes of driving at TANK_DRIVING_KPH or more, up to TANK_MINUTES of them, from the
+// minute rows. At the end of each of the first 11 drives of build 2 that came within 2.4 points
+// of the tank line, where the newest reading was up to 11 off.
+// The tank only rises at a refuel, so a minute more than TANK_REFUEL_PTS under a newer one (from
+// the end) or over an older one (from the start) means a refuel in between, and the minutes past
+// it measured another tank. Only minutes of TANK_FULL_MINUTE readings or more are compared: the
+// gauge is read every 10 s, so a younger minute holds one or two reads. Without a refuel no such
+// minute of those drives was more than 15.5 points under a newer one. The refuel was 73.
+const TANK_DRIVING_KPH = 20;
+const TANK_MINUTES = 10;
+const TANK_REFUEL_PTS = 20;
+// Minutes of driving a session needs before its own average replaces a level carried from
+// earlier driving. Averages of one or two minutes were up to 8 points off on those drives.
+const TANK_SETTLED_MINUTES = 3;
+// Half a minute at 1 Hz, about three gauge reads. A level needs this many readings of driving,
+// and only a minute with this many is compared for a refuel. The History tank range in dash.ts
+// counts only minutes with this many readings too.
+export const TANK_FULL_MINUTE = 30;
+// Minute rows with a reading looked at from one end of a session. Enough to find TANK_MINUTES of
+// driving in a drive with long idling.
+const TANK_SCAN = 60;
+// How far back from a session start earlier driving is looked for.
+const TANK_EARLIER_S = 30 * DAY_S;
+
+export interface TankMinute { fuel_sum: number; fuel_n: number; spd_sum: number | null; spd_n: number | null }
+export interface TankWalk { pct: number | null; minutes: number; refuel: boolean }
+
+// `mins` are minute rows that hold a reading and no 0 % one, from one end inward: newest first for
+// the level at the end, oldest first for the level at the start. `pct` is the mean over the
+// minutes of driving before a refuel, null when they hold fewer than TANK_FULL_MINUTE readings.
+// `minutes` is how many minutes of driving that mean covers. `refuel` is true when the walk
+// stopped at a refuel.
+export function tankFromMinutes(mins: TankMinute[], newestFirst: boolean): TankWalk {
+  let sum = 0, n = 0, used = 0, refuel = false;
+  let edge: number | null = null; // highest full minute so far from the end, lowest from the start
+  for (const m of mins) {
+    if (used >= TANK_MINUTES) break;
+    if (!(m.fuel_n > 0)) continue;
+    const v = m.fuel_sum / m.fuel_n;
+    if (m.fuel_n >= TANK_FULL_MINUTE) {
+      if (edge != null && (newestFirst ? edge - v : v - edge) > TANK_REFUEL_PTS) { refuel = true; break; }
+      edge = edge == null ? v : newestFirst ? Math.max(edge, v) : Math.min(edge, v);
+    }
+    if (m.spd_n && m.spd_sum != null && m.spd_sum / m.spd_n >= TANK_DRIVING_KPH) {
+      sum += m.fuel_sum; n += m.fuel_n; used++;
+    }
+  }
+  return { pct: n >= TANK_FULL_MINUTE ? sum / n : null, minutes: n >= TANK_FULL_MINUTE ? used : 0, refuel };
+}
+
+// "driving": the newest minutes of driving of the newest reading's session. "earlier": that
+// session has under TANK_SETTLED_MINUTES of driving among its newest minute rows (a drive that
+// has only just begun, an engine start without driving, a long idle or crawl), so the level of
+// the driving before it stands, less the fuel the session has burned by airflow. "reading": the
+// newest reading itself, after a refuel, or when no driving is known.
+export type TankBasis = "driving" | "earlier" | "reading";
+export interface TankLevel { pct: number; minutes: number; basis: TankBasis; boot: number }
+
+// The tank level as of the newest gauge reading, null without one. `boot` is the session of that
+// reading. First the rule above over the newest minutes of its session: one indexed range of at
+// most TANK_SCAN minute rows, back to the start of the session (one trips row). With fewer than
+// TANK_SETTLED_MINUTES of driving there and no refuel, the same over the minute rows before the
+// session, up to TANK_EARLIER_S back, less the session's airflow fuel (trips.maf_g). That stands
+// unless the newest reading is more than TANK_REFUEL_PTS above it, which only a refuel can do.
+// Then a shorter average of the session's own, else the newest reading. Minutes holding a 0 %
+// reading are left out, see the stray-zero rule in ingest.ts.
+export async function tankLevel(env: Env, L: Latest): Promise<TankLevel | null> {
+  const e = L.fuel_pct;
+  if (!e) return null;
+  const level = (pct: number, minutes: number, basis: TankBasis): TankLevel => ({ pct, minutes, basis, boot: e.boot });
+  const start = `(SELECT (start_ts / 60) * 60 FROM trips WHERE boot = ?1)`;
+  const own = tankFromMinutes((await env.DB.prepare(
+    `SELECT fuel_sum, fuel_n, spd_sum, spd_n FROM minutes
+     WHERE t BETWEEN ${start} AND ?2 AND boot = ?1 AND fuel_n > 0 AND fuel_min > 0 ORDER BY t DESC LIMIT ${TANK_SCAN}`,
+  ).bind(e.boot, e.ts).all<TankMinute>()).results, true);
+  if (own.pct != null && own.minutes >= TANK_SETTLED_MINUTES) return level(own.pct, own.minutes, "driving");
+  if (!own.refuel) {
+    const [rows, trip] = await Promise.all([
+      env.DB.prepare(
+        `SELECT fuel_sum, fuel_n, spd_sum, spd_n FROM minutes
+         WHERE t BETWEEN ${start} - ${TANK_EARLIER_S} AND ${start} - 1 AND fuel_n > 0 AND fuel_min > 0
+         ORDER BY t DESC LIMIT ${TANK_SCAN}`,
+      ).bind(e.boot).all<TankMinute>(),
+      env.DB.prepare(`SELECT maf_g FROM trips WHERE boot = ?`).bind(e.boot).first<{ maf_g: number | null }>(),
+    ]);
+    const before = tankFromMinutes(rows.results, true);
+    if (before.pct != null) {
+      const pct = Math.max(0, before.pct - (gallonsOf(trip?.maf_g) / TANK_GAL) * 100);
+      if (e.v - pct <= TANK_REFUEL_PTS) return level(pct, before.minutes, "earlier");
+    }
+  }
+  return own.pct != null ? level(own.pct, own.minutes, "driving") : level(e.v, 0, "reading");
+}
+
+// What get_latest_status says about where its fuel level comes from.
+const TANK_BASIS_TEXT: Record<TankBasis, (minutes: number) => string> = {
+  driving: (m) => `average of the tank gauge over the last ${m} min of driving`,
+  earlier: (m) => `average of the tank gauge over the last ${m} min of driving before the newest trip, minus the ` +
+    "fuel that trip has used so far, estimated from airflow. That trip has had too little driving to average yet",
+  reading: () => "the newest single gauge reading (after a refuel, or with no driving to average), " +
+    "which can be several points off while parked or idling",
+};
+
 export async function latestStatus(env: Env, now = nowS()) {
   const L = await getLatest(env);
   if (!Object.keys(L).length) return { error: "No data received yet." };
@@ -445,9 +552,11 @@ export async function latestStatus(env: Env, now = nowS()) {
   const at = (e: LatestEntry | null | undefined) => (e ? { at: fmtTime(env, e.ts), age: ago(e.ts, now) } : null);
   const when = (k: string) => at(L[k]);
   const cs = carState(L, now);
-  const fuelPct = val("fuel_pct");
+  const [econ, moved, db, tank] = await Promise.all([
+    L.fuel_pct ? mpg30(env, now) : null, cutOffMoved(env, L, now), storage(env, now), tankLevel(env, L),
+  ]);
+  const fuelPct = tank == null ? null : r1(tank.pct);
   const gal = fuelPct == null ? null : (fuelPct / 100) * TANK_GAL;
-  const [econ, moved, db] = await Promise.all([fuelPct == null ? null : mpg30(env, now), cutOffMoved(env, L, now), storage(env, now)]);
   // Under the minimum of logged miles the car's own rough figure is used when it is below the
   // EPA rating. A rough figure above it would stretch the range, so EPA stays then.
   const rough = econ ? roughMpg(econ) : null;
@@ -474,6 +583,7 @@ export async function latestStatus(env: Env, now = nowS()) {
     engine_running_at_last_report: cs.link_down ? null : val("engine_on") === 1,
     fuel: fuelPct == null ? null : {
       level_pct: fuelPct,
+      level_basis: TANK_BASIS_TEXT[tank!.basis](tank!.minutes),
       est_gallons_left: r1(gal),
       est_range_mi: Math.round((gal ?? 0) * basis),
       range_basis_mpg: basis,
@@ -900,15 +1010,17 @@ export async function listTrips(env: Env, a: { limit?: unknown; from?: unknown; 
   };
 }
 
-// Tank gauge in whole percent at the first or last minute of a trip that has a reading. Reads
-// the trip's minute rows from one end, never `samples`. A minute with a 0 % reading is skipped,
-// see the stray-zero rule in ingest.ts.
+// Tank gauge in whole percent at the start or the end of a trip, by the tank level rule (see
+// tankFromMinutes) over the trip's minute rows from that end. When the trip has too little
+// driving there, the first or last minute with a reading. Reads at most TANK_SCAN minute rows,
+// never `samples`. A minute with a 0 % reading is skipped, see the stray-zero rule in ingest.ts.
 async function gaugeEdge(env: Env, agg: TripAgg, dir: "ASC" | "DESC"): Promise<number | null> {
-  const row = await env.DB.prepare(
-    `SELECT ROUND(fuel_sum / fuel_n) AS pct FROM minutes
-     WHERE t BETWEEN ?1 AND ?2 AND boot = ?3 AND fuel_n > 0 AND fuel_min > 0 ORDER BY t ${dir} LIMIT 1`,
-  ).bind(Math.floor(agg.start_ts / 60) * 60, agg.end_ts, agg.boot).first<{ pct: number }>();
-  return row?.pct ?? null;
+  const rows = (await env.DB.prepare(
+    `SELECT fuel_sum, fuel_n, spd_sum, spd_n FROM minutes
+     WHERE t BETWEEN ?1 AND ?2 AND boot = ?3 AND fuel_n > 0 AND fuel_min > 0 ORDER BY t ${dir} LIMIT ${TANK_SCAN}`,
+  ).bind(Math.floor(agg.start_ts / 60) * 60, agg.end_ts, agg.boot).all<TankMinute>()).results;
+  if (!rows.length) return null;
+  return Math.round(tankFromMinutes(rows, dir === "DESC").pct ?? rows[0].fuel_sum / rows[0].fuel_n);
 }
 
 // First or last route point of a trip. Every `track` row has a position, so this reads one
@@ -970,10 +1082,11 @@ export async function tripSummary(env: Env, a: { trip_id?: unknown; include_loca
         "throttle and high while coasting."
       : "There are no fuel or MPG figures, no airflow readings came through.",
     f0 != null || f1 != null
-      ? "fuel_level_pct is the tank gauge in whole percent. It swings by several points while driving, so the difference " +
-        "between start and end is not fuel used."
+      ? "fuel_level_pct is the tank gauge in whole percent, averaged over up to 10 minutes of driving at each end of the " +
+        "trip, or the reading of the first or last minute when that end had too little driving, which can be up to 11 " +
+        "points off while the car stands. The difference between start and end is not fuel used."
       : null,
-    n.gps_miles == null && n.miles > 0 ? "distance_mi is integrated from speed and usually reads about 1% under the odometer." : null,
+    n.gps_miles == null && n.miles > 0 ? "distance_mi is added up from speed and usually lands within 0.1 mi of the odometer." : null,
   ];
   return {
     ...shapeTrip(env, n, liveBoot(L, now), cut),

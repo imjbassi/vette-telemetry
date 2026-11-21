@@ -7,6 +7,7 @@ import rebuildSql from "../maintenance/rebuild-rollups.sql";
 import changeSql from "../schema-changes/0001-trips-odometer-fw.sql";
 import schemaSql from "../schema.sql";
 import { F } from "../scripts/lib/record-encode.mjs";
+import { MINUTE_REBUILD_SQL } from "../src/rollup.ts";
 import { execFile, makeEnv, one, rows } from "./helpers/d1.mjs";
 import { assertRowsNear, drive, noLink, post, postChunks, restoreNow, setNow, sid, snapshot, T0 } from "./helpers/drive.mjs";
 
@@ -49,10 +50,16 @@ async function fleet() {
   setNow(T0 + 12200);
   await post(env, quiet);
 
-  // Clock learned late: first upload estimated, second one carries the time.
-  const f = drive({ boot: 21, n: 70, ms0: 2000, base: T0 + 14050 });
+  // Clock learned late: first upload estimated, second one carries the time. Like 162-127 its
+  // first readings have no fix, and there is a gap over 5 s and an engine stop with RPM 0.
+  const f = drive({ boot: 21, n: 70, ms0: 2000, base: T0 + 14050 })
+    .filter((_, i) => i < 8 || i > 14)
+    .map((r, i) => (i < 20 ? (({ lat, lon, sats, ...rest }) => rest)(r) : r))
+    .map((r, i) => (i === 25 ? { ...r, rpm: 0, flags: 0 } : r));
   setNow(T0 + 14100);
   await post(env, f.slice(0, 40).map((r) => ({ ...r, epoch: 0 })));
+  // The minute each reading of the first upload was filed in, by its estimated time.
+  env.lateEstimated = rows(env, "SELECT ms, (ts / 60) * 60 AS t FROM samples WHERE boot = ? ORDER BY ms", LATE);
   setNow(T0 + 14130);
   await post(env, f.slice(40));
 
@@ -60,8 +67,10 @@ async function fleet() {
   setNow(T0 + 16000);
   await post(env, drive({ boot: 22, n: 20, clock: false }));
 
-  // Gaps inside a drive: exactly 5 s still counts, 6 s does not.
-  const h = drive({ boot: 23, n: 60, base: T0 + 18000 }).filter((_, i) => !(i >= 10 && i <= 13) && !(i >= 30 && i <= 34));
+  // Gaps inside a drive: exactly 5 s still counts, 6 s does not. An engine stop with RPM 0 in a
+  // session that only fold() builds.
+  const h = drive({ boot: 23, n: 60, base: T0 + 18000 }).filter((_, i) => !(i >= 10 && i <= 13) && !(i >= 30 && i <= 34))
+    .map((r, i) => (i === 40 ? { ...r, rpm: 0, flags: 0 } : r));
   setNow(T0 + 18100);
   await post(env, h);
 
@@ -89,29 +98,29 @@ test("rebuild-rollups.sql reproduces what incremental ingest built", async () =>
   assert.deepEqual(rebuilt.trips.map((t) => t.fw).sort(), [0, 2, 2, 2, 2, 2, 2, 3]);
   assert.deepEqual(rebuilt.track, built.track);
 
-  // Minutes match row for row, except for the session whose first upload had estimated
-  // times: ingest left those samples in the estimated minute, the rebuild uses the real one.
-  const others = (m) => m.boot !== LATE;
-  assertRowsNear(rebuilt.minutes.filter(others), built.minutes.filter(others), { label: "minutes" });
-  const total = (list) => {
-    const sum = {};
-    for (const m of list.filter((x) => x.boot === LATE)) {
-      for (const [k, v] of Object.entries(m)) {
-        if (k === "t" || k === "boot") continue;
-        if (/_max$/.test(k)) sum[k] = sum[k] == null || v > sum[k] ? v : sum[k];
-        else if (/_min$/.test(k)) sum[k] = sum[k] == null || v < sum[k] ? v : sum[k];
-        else sum[k] = (sum[k] ?? 0) + v;
-      }
-    }
-    return sum;
-  };
-  assertRowsNear(total(rebuilt.minutes), total(built.minutes), { label: "minute totals of the late-clock session" });
-  assert.notDeepEqual(rebuilt.minutes.filter((m) => m.boot === LATE).map((m) => [m.t, m.n]),
-    built.minutes.filter((m) => m.boot === LATE).map((m) => [m.t, m.n]), "the test really has moved buckets");
+  // Minutes match row for row, also for the session whose first upload had estimated times:
+  // ingest moved those readings to the minute of their real time when the clock came.
+  assertRowsNear(rebuilt.minutes, built.minutes, { label: "minutes" });
+  const real = rows(env, "SELECT ms, (ts / 60) * 60 AS t FROM samples WHERE boot = ? ORDER BY ms", LATE);
+  assert.ok(env.lateEstimated.some((r, i) => r.t !== real[i].t), "the test really has readings that changed minute");
 
   // Running it again changes nothing.
   execFile(env, rebuildSql);
   assert.deepEqual(snapshot(env), rebuilt);
+});
+
+// ingest.ts runs MINUTE_REBUILD_SQL for one session when its clock comes late. It has to give
+// every kind of session the rows fold() builds: gaps, no fix, link down, quiet, legacy, replays.
+test("MINUTE_REBUILD_SQL gives every session the minute rows ingest built", async () => {
+  const env = await fleet();
+  const built = snapshot(env).minutes;
+  const sessions = rows(env, "SELECT boot FROM trips ORDER BY boot");
+  assert.equal(sessions.length, 8);
+  for (const { boot } of sessions) {
+    env.DB.sqlite.prepare("DELETE FROM minutes WHERE boot = ?").run(boot);
+    env.DB.sqlite.prepare(MINUTE_REBUILD_SQL).run(boot);
+  }
+  assertRowsNear(snapshot(env).minutes, built, { label: "minutes" });
 });
 
 test("a session continues correctly after a rebuild", async () => {
@@ -135,8 +144,30 @@ test("a session continues correctly after a rebuild", async () => {
   assert.deepEqual(a.track, b.track);
   // Every trip, the two that continued and the ones the rebuild alone wrote, build byte included.
   assertRowsNear(a.trips, b.trips, { label: "trips" });
-  const others = (m) => m.boot !== LATE;
-  assertRowsNear(a.minutes.filter(others), b.minutes.filter(others), { label: "minutes" });
+  assertRowsNear(a.minutes, b.minutes, { label: "minutes" });
+});
+
+// 162-127 on 2026-11-20: its first 3 minutes went up 11 to 14 minutes late, in uploads without a
+// clock, so they were dated as if just written, 11 to 13 minutes after their real time. The
+// clock came with a later upload.
+test("a backlog uploaded late without a clock moves to its real minutes when the clock comes", async () => {
+  const env = makeEnv();
+  const boot = sid(27, 173);
+  const all = drive({ boot: 27, n: 300, ms0: 10000 }); // written at T0 + 10 to T0 + 309
+  setNow(T0 + 189 + 720);
+  await post(env, all.slice(0, 180).map((r) => ({ ...r, epoch: 0 })));
+  assert.ok(rows(env, "SELECT t FROM minutes WHERE boot = ?", boot).every((m) => m.t >= T0 + 720), "filed 12 minutes late");
+  setNow(T0 + 920);
+  await post(env, all.slice(180));
+  assert.deepEqual(rows(env, "SELECT t, n FROM minutes WHERE boot = ? ORDER BY t", boot), [
+    { t: T0, n: 50 }, { t: T0 + 60, n: 60 }, { t: T0 + 120, n: 60 }, { t: T0 + 180, n: 60 }, { t: T0 + 240, n: 60 }, { t: T0 + 300, n: 10 },
+  ]);
+  assert.deepEqual(one(env, "SELECT start_ts, end_ts, est FROM trips WHERE boot = ?", boot), { start_ts: T0 + 10, end_ts: T0 + 309, est: 0 });
+  // What the rebuild script makes from the same readings, distance and fuel included.
+  const built = snapshot(env);
+  execFile(env, rebuildSql);
+  assertRowsNear(snapshot(env).minutes, built.minutes, { label: "minutes" });
+  assertRowsNear(snapshot(env).trips, built.trips, { label: "trips" });
 });
 
 test("rebuild-rollups.sql clears rollup rows that no sample backs any more", async () => {

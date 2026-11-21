@@ -711,7 +711,9 @@
   // Takes the car state out of any answer that carries it (status, live, logs).
   function absorb(d) {
     S.status = S.status || {};
-    for (const k of ["latest", "state", "rules", "battery", "car", "mpg30", "mpg30_miles", "mpg30_min_miles", "mpg30_rough"]) if (d[k] !== undefined) S.status[k] = d[k];
+    for (const k of ["latest", "state", "rules", "battery", "car", "mpg30", "mpg30_miles", "mpg30_min_miles", "mpg30_rough", "tank"]) if (d[k] !== undefined) S.status[k] = d[k];
+    // Live and Logs answers bring newer readings but no tank level. Overview then asks for one.
+    if (d.latest !== undefined) S.levelBehind = d.tank === undefined;
   }
   // The same comparisons as carState() in queries.ts, run again here with the rules the server
   // sent, so the state keeps moving with the age of the newest record between polls.
@@ -1174,10 +1176,15 @@
   function renderOverview() {
     renderDbNotice();
     const s = S.status; if (!s || !s.car) return;
-    const fuel = lv("fuel_pct"), tank = s.car.tank_gal, epa = s.car.epa.combined;
+    // The tank level of the status answer: the gauge averaged over minutes of driving. Single
+    // readings stray while driving and read several points off while parked. Live and Logs bring
+    // newer readings but no level, so a reading from a newer session (a refuel starts one) shows
+    // as it is until the next status answer. So does a page without a status answer, or an
+    // older Worker.
+    const nf = L_().fuel_pct, lvl = s.tank != null && nf != null && s.tank.boot === nf.boot ? s.tank.pct : null;
+    const fuel = lvl != null ? lvl : lv("fuel_pct"), tank = s.car.tank_gal, epa = s.car.epa.combined;
     const gal = fuel == null ? null : (fuel / 100) * tank;
     $("k-fuel").innerHTML = fuel == null ? "–" : `${f0(fuel)}<small>%</small>`;
-    // Gallons from the tank gauge, which reads in whole percent and swings while driving.
     $("k-fuel-d").textContent = gal == null ? "No reading yet" : `about ${f1(gal)} of ${tank} gal · ${ago(lt("fuel_pct"))}`;
     const m = $("k-fuel-m");
     m.style.width = (fuel ?? 0) + "%";
@@ -1476,7 +1483,7 @@
     if (d.battery_start_v != null) notes.push(`Battery at power-up ${d.battery_start_v.toFixed(1)} V, engine off.`);
     if (d.step > 1) notes.push(`The charts show 1 of every ${d.step} readings.`);
     if (t.gallons > 0) notes.push("Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.");
-    if (t.gps_miles == null && !odo && t.miles > 0) notes.push("Distance is added up from speed, about 1% under the odometer.");
+    if (t.gps_miles == null && !odo && t.miles > 0) notes.push("Distance is added up from speed and usually lands within 0.1 mi of the odometer.");
     $("t-note").innerHTML = notes.map((s) => `<div>${esc(s)}</div>`).join("");
     drawTripCharts();
     // The map box only shows when there is a position. Unhidden before the map is made, so
@@ -1606,6 +1613,8 @@
       else if (k === "coolant" && v != null) extra = v < 160 ? "Warming up" : v > HOT_F ? '<span class="down">Hot</span>' : "Normal";
       // The server's word, as on Overview. It knows whether the engine ran, voltage alone cannot tell.
       else if (k === "volts" && v != null) extra = battWord();
+      // Every Live card is the newest reading. For fuel that is not the level Overview shows.
+      else if (k === "fuel" && v != null) extra = "Single reading";
       return `<div class="${cls}"><div class="lab"><span class="ico" style="color:${color}"><svg><use href="#${icon}"/></svg></span>${label}</div>
         <div class="val">${val}<small>${unit}</small></div><div class="delta">${extra || "&nbsp;"}</div>${spark}</div>`;
     }).join("");
@@ -1920,8 +1929,9 @@
       ["i-route", "var(--blue)", "Distance", `${f1(T.miles)}<small>mi</small>`, `${d.trips.length} trip${d.trips.length === 1 ? "" : "s"}` +
         (odo ? ` · <span class="warn">${esc(f1(T.odometer_mi))} mi by odometer</span>` : "")],
       ["i-clock", "var(--cyan)", "Engine on", dur(T.engine_s).replace(/ (s|min|h|d)\b/g, "<small>$1</small>"), `${dur(T.moving_s)} moving · ${dur(T.idle_s)} idle`],
-      // The lowest and highest tank reading. Which came first is not known from these two, so the
-      // line names them as a range. "57 to 98" next to the fuel used would read as a fill-up.
+      // The lowest and highest tank level, each a minute's average (single readings swing too far).
+      // Which came first is not known from these two, so the line names them as a range. "57 to
+      // 98" next to the fuel used would read as a fill-up.
       ["i-fuel", "var(--green)", "Fuel used (est.)", `${galText(T.gallons)}<small>gal</small>`, T.fuel_min == null ? "&nbsp;"
         : f0(T.fuel_min) === f0(T.fuel_max) ? `tank at ${f0(T.fuel_min)} %` : `tank between ${f0(T.fuel_min)} and ${f0(T.fuel_max)} %`],
       ["i-drop", "var(--purple)", "MPG (est.)", T.mpg == null ? "–" : `${f1(T.mpg)}<small>mpg</small>`,
@@ -2086,7 +2096,10 @@
     if (changed) window.scrollTo(0, 0);
     // As in tick(): an error while drawing still reaches the console, and the poll is set anyway.
     try {
-      if (view === "overview") { renderOverview(); drawOverviewCharts(); }
+      // After a Live or Logs answer the tank level and the 30-day figures may be older than the
+      // readings, also when Trips or History came in between. Overview asks at once instead of
+      // at the next poll.
+      if (view === "overview") { renderOverview(); drawOverviewCharts(); if (S.levelBehind) loadStatus(); }
       if (view === "live") { renderLive(); loadLive(); }
       if (view === "trips") showTrip();
       if (view === "logs") loadLogs();

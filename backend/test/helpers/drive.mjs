@@ -127,7 +127,8 @@ export function referenceTrip(fields) {
     const on = (r.flags & 1) !== 0 && !noLinkRec;
     const gap = prev == null ? 0 : r.ms - prev;
     if (gap >= 1 && gap <= 5000) {
-      if (r.speed_kph != null) t.km += (r.speed_kph * gap) / 3600000;
+      // Whole km/h readings, rounded down by the car: half a km/h more while moving.
+      if (r.speed_kph > 0) t.km += ((r.speed_kph + 0.5) * gap) / 3600000;
       if (r.maf_gs != null) t.maf_g += (r.maf_gs * gap) / 1000;
       if (on) t.engine_s += gap / 1000;
       if (r.speed_kph > 0) t.moving_s += gap / 1000;

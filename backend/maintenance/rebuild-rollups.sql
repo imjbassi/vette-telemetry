@@ -1,7 +1,9 @@
 -- Rebuild the rollup tables (trips, minutes, track) from `samples`.
 -- Minute and route rows are cleared first and every trip row is written again, so rows left
--- over from before a repair cannot survive and be counted twice. Run it only after repairing
--- samples by hand:
+-- over from before a repair cannot survive and be counted twice. Run it after repairing samples
+-- by hand, and once after deploying a change to the rollup rules (such as SPEED_ROUNDING_KPH on
+-- 2026-11-20) so that older sessions follow them. Deploy first: readings the old Worker folds
+-- after the run keep the old rules. The commands:
 --   remote: npx wrangler d1 execute vette --remote --config wrangler.local.toml --file=maintenance/rebuild-rollups.sql
 --   local:  npx wrangler d1 execute vette --local --file=maintenance/rebuild-rollups.sql
 -- Safe to run again, also after a run that stopped half way. Run it while the car is parked:
@@ -30,12 +32,14 @@
 -- with the same `WHERE boot BETWEEN <lo> AND <hi>` after each of its three table names.
 --
 -- Same rules as src/rollup.ts: each sample covers the gap since the previous one in its
--- session, gaps over 5 s count as missing, and a record written without the adapter link
--- (flags & 4) never counts as engine-on. Two things differ from what uploads built:
+-- session, gaps over 5 s count as missing, a moving speed reading counts 0.5 km/h more
+-- (SPEED_ROUNDING_KPH), and a record written without the adapter link (flags & 4) never
+-- counts as engine-on. One thing differs from what uploads built:
 --   trips.fw is kept from the old trip row of the session, because samples do not store
 --   the firmware build byte. A session without a trip row gets 0.
---   Minutes of a session whose clock was learned late move from the estimated slot to the
---   real one, because samples only keep the corrected time.
+-- Until 2026-11-20, uploads left the minutes of a session whose clock was learned late in
+-- their estimated slot. This moves them to the real one, because samples only keep the
+-- corrected time. Uploads have done the same since (MINUTE_REBUILD_SQL in src/rollup.ts).
 
 -- trips is not cleared here: the INSERT further down reads fw from the old rows.
 DELETE FROM minutes;
@@ -61,7 +65,7 @@ INSERT OR REPLACE INTO trips (boot, start_ts, end_ts, last_ms, track_ms, n, gps_
 SELECT boot, MIN(ts), MAX(ts), MAX(ms),
   COALESCE((SELECT MAX(t.ms) FROM track t WHERE t.boot = x.boot), -1),
   COUNT(*), SUM(lat IS NOT NULL AND lon IS NOT NULL), SUM((flags & 5) = 1),
-  COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 THEN speed_kph * dms / 3600000.0 END), 0),
+  COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND speed_kph > 0 THEN (speed_kph + 0.5) * dms / 3600000.0 END), 0),
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 THEN maf_gs * dms / 1000.0 END), 0),
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND (flags & 5) = 1 THEN dms END), 0) / 1000.0,
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND speed_kph > 0 THEN dms END), 0) / 1000.0,
@@ -81,7 +85,7 @@ INSERT OR REPLACE INTO minutes (t, boot, n, engine_n, gps_n, km, maf_g, engine_s
   fuel_sum, fuel_n, fuel_min, fuel_max, volt_sum, volt_n, volt_min, volt_max, thr_sum, thr_n, thr_max,
   iat_sum, iat_n, iat_min, iat_max, maf_sum, maf_n, maf_max)
 SELECT (ts / 60) * 60, boot, COUNT(*), SUM((flags & 5) = 1), SUM(lat IS NOT NULL AND lon IS NOT NULL),
-  COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 THEN speed_kph * dms / 3600000.0 END), 0),
+  COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND speed_kph > 0 THEN (speed_kph + 0.5) * dms / 3600000.0 END), 0),
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 THEN maf_gs * dms / 1000.0 END), 0),
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND (flags & 5) = 1 THEN dms END), 0) / 1000.0,
   COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND 5000 AND speed_kph > 0 THEN dms END), 0) / 1000.0,

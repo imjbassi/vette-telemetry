@@ -508,7 +508,8 @@ async function behavior() {
     // split there: its readings up to `to` are inside.
     const to = T0 + 3899;
     const h = await api(env, `api/history?from=${T0 - 600}&to=${to}`);
-    const km = (rs) => rs.slice(1).reduce((a, r) => a + r.speed_kph / 3600, 0);
+    // Logged the way the rollups count it: a moving reading counts 0.5 km/h more.
+    const km = (rs) => rs.slice(1).reduce((a, r) => a + (r.speed_kph > 0 ? r.speed_kph + 0.5 : 0) / 3600, 0);
     const inside = km(second.filter((r) => r.epoch <= to));
     const r1 = (x) => Math.round(x * 10) / 10;
     // From the first reading of the first trip to the first of the second, gap included, plus
@@ -1033,7 +1034,7 @@ async function behavior() {
     assert.equal((stats.match(/class="stat"/g) ?? []).length, 12);
     assert.match(stats, /Idle<\/div><div class="v">\d+ s \(\d+ %\)</);
     assert.equal(p.$("t-note").innerHTML, "<div>Fuel used and MPG are estimated from engine airflow. They read low at full throttle and high while coasting.</div>" +
-      "<div>Distance is added up from speed, about 1% under the odometer.</div>");
+      "<div>Distance is added up from speed and usually lands within 0.1 mi of the odometer.</div>");
     // No trip came before the first one, so there is no gap line.
     p.$("t-list").children[2].onclick();
     await p.settle();
@@ -1193,8 +1194,8 @@ async function behavior() {
     const p = openPage(env, { hash: "history/24h" });
     await p.settle();
     const kpis = p.$("h-kpis").innerHTML;
-    // The lowest and highest tank reading, named as a range. "tank 62 to 63 %" next to the fuel
-    // used reads as a fill-up, and an arrow as a start and an end.
+    // The lowest and highest minute average of the tank, named as a range. "tank 62 to 63 %" next
+    // to the fuel used reads as a fill-up, and an arrow as a start and an end.
     assert.ok(kpis.includes(`Fuel used (est.)</div><div class="val">${h.totals.gallons.toFixed(2)}<small>gal</small></div>` +
       `<div class="delta">tank between ${Math.round(h.totals.fuel_min)} and ${Math.round(h.totals.fuel_max)} %</div>`), kpis);
     // Under 25 logged miles: grey, called rough, and no verdict against EPA.
@@ -1228,6 +1229,27 @@ async function behavior() {
     await r.settle();
     assert.match(r.$("h-kpis").innerHTML, new RegExp(`<div class="delta">tank at ${Math.round(one.totals.fuel_min)} %</div>`));
     assert.deepEqual([...p.errors, ...q.errors, ...r.errors], []);
+  });
+
+  check("history: the tank line is the range of minute averages, so a sloshing gauge does not stretch it", async () => {
+    const env = makeEnv();
+    // Single readings jump between 29.8 % (raw 76) and 70.2 % (raw 179). Each whole minute
+    // averages 50 %. The last minute reads 98 % (raw 250), but it has 20 readings, under the 30 a
+    // minute needs, so it does not count.
+    await upload(env, drive({ n: 200, ms0: 0 }).map((r, i) => ({ ...r, fuel_raw: i >= 180 ? 250 : i % 2 ? 179 : 76 })), T0 + 300);
+    // A short session reading 3.9 % (raw 10), 20 readings in its minute, does not count either.
+    await upload(env, drive({ boot: 13, n: 20, base: T0 + 300 }).map((r) => ({ ...r, fuel_raw: 10 })), T0 + 345);
+    setNow(T0 + 400);
+    // The raw readings, then the per-minute rollup.
+    for (const [from, to] of [[T0, T0 + 600], [T0 - 3600, T0 + 3600]]) {
+      const h = await api(env, `api/history?from=${from}&to=${to}`);
+      assert.deepEqual([h.source, Math.round(h.totals.fuel_min * 10) / 10, Math.round(h.totals.fuel_max * 10) / 10],
+        [to - from > 3600 ? "minutes" : "raw", 50, 50]);
+      const p = openPage(env, { hash: `history/${from}-${to}` });
+      await p.settle();
+      assert.match(p.$("h-kpis").innerHTML, /<div class="delta">tank at 50 %<\/div>/);
+      assert.deepEqual(p.errors, []);
+    }
   });
 
   check("logs: the GPS card gives the age of the fix, and no card or table prints coordinates", async () => {
@@ -2644,6 +2666,68 @@ async function behavior() {
     assert.deepEqual(p.errors, []);
   });
 
+  check("overview: the Fuel card averages the gauge over minutes of driving, keeps it through a start without driving, and a refuel starts over", async () => {
+    const env = makeEnv();
+    const tank = async () => (await api(env, "api/status")).tank;
+    // Session 12: ten minutes of driving with the gauge at 62.7 % (raw 160), then two minutes
+    // idling where the car stands tilted and the gauge reads 47.1 % (raw 120).
+    const driving = drive({ n: 600, ms0: 0 }).map((r) => ({ ...r, fuel_raw: 160 }));
+    const parked = drive({ n: 120, ms0: 600000, odo0: null }).map((r) => ({ ...r, speed_kph: 0, fuel_raw: 120 }));
+    await upload(env, [...driving, ...parked], T0 + 720);
+    setNow(T0 + 730);
+    const st = await api(env, "api/status");
+    assert.deepEqual([st.latest.fuel_pct.v, st.tank], [47.1, { pct: 62.7, minutes: 10, basis: "driving", boot: sid(12, INST) }]);
+    const p = openPage(env);
+    await p.settle();
+    assert.equal(p.$("k-fuel").innerHTML, "63<small>%</small>");
+    assert.match(p.$("k-fuel-d").textContent, /^about 11\.6 of 18\.5 gal · /);
+    assert.equal(p.$("k-fuel-m").style.width, "62.7%");
+
+    // Session 13, an hour later: the engine idles two minutes without driving at 20 g/s of air,
+    // and the gauge reads 55.3 % (raw 141). The level of the driving before stands, less the
+    // 2,380 g of air burned since: 0.060 gal, 0.33 points.
+    const idle = drive({ boot: 13, n: 120, base: T0 + 3600, odo0: null }).map((r) => ({ ...r, speed_kph: 0, maf_gs: 20, fuel_raw: 141 }));
+    await upload(env, idle, T0 + 3760);
+    setNow(T0 + 3765);
+    assert.deepEqual(await tank(), { pct: 62.4, minutes: 10, basis: "earlier", boot: sid(13, INST) });
+    // p has been idle past the 15-minute pause, so a new page shows it.
+    const r = openPage(env);
+    await r.settle();
+    assert.equal(r.$("k-fuel").innerHTML, "62<small>%</small>");
+    const q = openPage(env, { hash: "live" });
+    await q.settle();
+    // Live's Fuel card is the newest reading, and says so.
+    assert.match(q.$("l-gauges").innerHTML, /Fuel<\/div>\s*<div class="val">55<small>%<\/small><\/div><div class="delta">Single reading<\/div>/);
+
+    // Session 14 after a refuel, watched on Live: the engine idles at the pump and the gauge reads
+    // 98 % (raw 250), more than 20 points above the level before. So the newest reading stands.
+    await upload(env, drive({ boot: 14, n: 40, base: T0 + 7200, odo0: null }).map((r) => ({ ...r, speed_kph: 0, fuel_raw: 250 })), T0 + 7260);
+    setNow(T0 + 7265);
+    await q.poll();
+    assert.deepEqual(await tank(), { pct: 98, minutes: 0, basis: "reading", boot: sid(14, INST) });
+    // Live brought the reading of session 14 but no level, and the page's level is from session
+    // 13. Overview, reached through Trips, which asks for no status, shows the newest reading at
+    // once and asks for the status on the way in. That request fails here, so the card shows
+    // what it drew without it.
+    q.nav("trips");
+    await q.settle();
+    const asked = q.requests("api/status");
+    q.net.reject = (path) => path.startsWith("api/status") && "late";
+    q.nav("overview");
+    await q.settle();
+    assert.equal(q.requests("api/status"), asked + 1);
+    assert.equal(q.$("k-fuel").innerHTML, "98<small>%</small>");
+    q.net.reject = null;
+    await q.poll();
+    assert.equal(q.$("k-fuel").innerHTML, "98<small>%</small>");
+
+    // Two minutes of driving after the refuel at 97.6 % (raw 249): only those count.
+    await upload(env, drive({ boot: 14, n: 120, ms0: 60000, base: T0 + 7200, odo0: null }).map((r) => ({ ...r, fuel_raw: 249 })), T0 + 7380);
+    setNow(T0 + 7385);
+    assert.deepEqual(await tank(), { pct: 97.6, minutes: 2, basis: "driving", boot: sid(14, INST) });
+    assert.deepEqual([...p.errors, ...q.errors, ...r.errors], []);
+  });
+
   check("overview: under 25 logged miles a rough MPG below EPA sets the range, and both cards call it rough", async () => {
     const f1 = (x) => (Math.round(x * 10) / 10).toLocaleString();
     // About 14 miles at about 10 mpg: more airflow for the same speeds.
@@ -2654,7 +2738,10 @@ async function behavior() {
     assert.ok(st.mpg30 == null && st.mpg30_rough > 9 && st.mpg30_rough < 11, JSON.stringify([st.mpg30, st.mpg30_rough]));
     const p = openPage(env);
     await p.settle();
-    const gal = (st.latest.fuel_pct.v / 100) * 18.5;
+    // Range rests on the tank level of the status answer, the gauge over the last 10 minutes of
+    // driving. The tank went down during the drive, so it is above the newest reading.
+    assert.ok(st.tank.minutes === 10 && st.tank.pct > st.latest.fuel_pct.v, JSON.stringify([st.tank, st.latest.fuel_pct.v]));
+    const gal = (st.tank.pct / 100) * 18.5;
     assert.equal(p.$("k-range").innerHTML, `${Math.round(gal * st.mpg30_rough).toLocaleString()}<small>mi</small>`);
     assert.equal(p.$("k-range-d").textContent, `rough, at ${f1(st.mpg30_rough)} mpg`);
     assert.equal(p.$("k-mpg").innerHTML, `${f1(st.mpg30_rough)}<small>mpg</small>`);

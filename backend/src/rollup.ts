@@ -3,6 +3,10 @@
 import { engineOn, F, type Sample } from "./record";
 
 export const MAX_GAP_MS = 5000; // gaps longer than this (quiet mode, BLE drops) are not integrated
+// PID 0D gives whole km/h and the car drops the fraction, so a moving reading is on average half
+// a km/h under the true speed. Distance adds it back. Over the first 449 km of firmware build 2
+// the shortfall against the odometer was 0.48 km/h of moving time, the same at every speed.
+export const SPEED_ROUNDING_KPH = 0.5;
 const TRACK_EVERY_MS = 15000;
 const KM_TO_MI = 0.621371;
 
@@ -37,6 +41,35 @@ export const MINUTE_UPSERT_SQL =
     ...MAX.map((c) => `${c} = CASE WHEN excluded.${c} IS NULL THEN ${c} WHEN ${c} IS NULL OR excluded.${c} > ${c} THEN excluded.${c} ELSE ${c} END`),
     ...MIN.map((c) => `${c} = CASE WHEN excluded.${c} IS NULL THEN ${c} WHEN ${c} IS NULL OR excluded.${c} < ${c} THEN excluded.${c} ELSE ${c} END`),
   ].join(", ");
+
+// One session's minute rows built again from its stored readings (?1 is the session), by the
+// rules of fold(). The minutes INSERT of maintenance/rebuild-rollups.sql is the same for all
+// sessions: keep the two in step. ingest.ts runs this after deleting the session's minute rows
+// when the session learns its clock after uploads with estimated times, so the readings of those
+// uploads move from the minute of their estimated time to the minute of their real one. OR
+// REPLACE so that a row the delete missed can never fail the upload and stall the logger.
+export const MINUTE_REBUILD_SQL =
+  `INSERT OR REPLACE INTO minutes (t, boot, n, engine_n, gps_n, km, maf_g, engine_s, moving_s,
+     spd_sum, spd_n, spd_max, rpm_sum, rpm_n, rpm_max, cool_sum, cool_n, cool_max, cool_eng_sum, cool_eng_n,
+     fuel_sum, fuel_n, fuel_min, fuel_max, volt_sum, volt_n, volt_min, volt_max, thr_sum, thr_n, thr_max,
+     iat_sum, iat_n, iat_min, iat_max, maf_sum, maf_n, maf_max)
+   SELECT (ts / 60) * 60, boot, COUNT(*), SUM((flags & 5) = 1), SUM(lat IS NOT NULL AND lon IS NOT NULL),
+     COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} AND speed_kph > 0 THEN (speed_kph + ${SPEED_ROUNDING_KPH}) * dms / 3600000.0 END), 0),
+     COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} THEN maf_gs * dms / 1000.0 END), 0),
+     COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} AND (flags & 5) = 1 THEN dms END), 0) / 1000.0,
+     COALESCE(SUM(CASE WHEN dms BETWEEN 1 AND ${MAX_GAP_MS} AND speed_kph > 0 THEN dms END), 0) / 1000.0,
+     COALESCE(SUM(speed_kph), 0), COUNT(speed_kph), MAX(speed_kph),
+     COALESCE(SUM(CASE WHEN rpm > 0 THEN rpm END), 0), COALESCE(SUM(rpm > 0), 0), MAX(rpm),
+     COALESCE(SUM(coolant_c), 0), COUNT(coolant_c), MAX(coolant_c),
+     COALESCE(SUM(CASE WHEN (flags & 5) = 1 THEN coolant_c END), 0),
+     SUM(CASE WHEN (flags & 5) = 1 AND coolant_c IS NOT NULL THEN 1 ELSE 0 END),
+     COALESCE(SUM(fuel_pct), 0), COUNT(fuel_pct), MIN(fuel_pct), MAX(fuel_pct),
+     COALESCE(SUM(adapter_v), 0), COUNT(adapter_v), MIN(adapter_v), MAX(adapter_v),
+     COALESCE(SUM(throttle_pct), 0), COUNT(throttle_pct), MAX(throttle_pct),
+     COALESCE(SUM(intake_c), 0), COUNT(intake_c), MIN(intake_c), MAX(intake_c),
+     COALESCE(SUM(maf_gs), 0), COUNT(maf_gs), MAX(maf_gs)
+   FROM (SELECT *, ms - LAG(ms) OVER (ORDER BY ms) AS dms FROM samples WHERE boot = ?1)
+   GROUP BY 1, 2`;
 
 // INSERT OR REPLACE with a fixed column list: a trips column left out here is reset to its
 // default on every upload. Keep this list, tripParams and TripRow in step with schema.sql.
@@ -76,7 +109,7 @@ export function fold(trip: TripRow, items: Stamped[]) {
     const on = engineOn(s.flags);
     const dms = prev == null ? 0 : s.ms - prev;
     if (dms >= 1 && dms <= MAX_GAP_MS) {
-      const km = s.speed_kph == null ? 0 : (s.speed_kph * dms) / 3600000;
+      const km = s.speed_kph == null || s.speed_kph <= 0 ? 0 : ((s.speed_kph + SPEED_ROUNDING_KPH) * dms) / 3600000;
       const g = s.maf_gs == null ? 0 : (s.maf_gs * dms) / 1000;
       const eng = on ? dms / 1000 : 0;
       const mov = s.speed_kph != null && s.speed_kph > 0 ? dms / 1000 : 0;

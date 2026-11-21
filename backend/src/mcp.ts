@@ -38,7 +38,8 @@ const TOOLS: Tool[] = [
     title: "Car status",
     description:
       "Current or last known state of the owner's 2024 Corvette Stingray. Returns car_state (running, no_signal, parked or " +
-      "unknown, with one sentence that explains it and how old the last report is), fuel level in percent with estimated " +
+      "unknown, with one sentence that explains it and how old the last report is), fuel level in percent (the tank gauge " +
+      "averaged over recent minutes of driving, level_basis says how it was found) with estimated " +
       "gallons left and estimated range in miles, battery voltage with a context word for the moment it was measured " +
       "(charging, \"engine on, not charging\", engine off, low), coolant and intake air temperature in °F, last speed in mph " +
       "and RPM, odometer in miles (null if never read), cell signal as cell_signal_csq and cell_signal_dbm (dBm), and the " +
@@ -82,8 +83,8 @@ const TOOLS: Tool[] = [
       "and this one that the logger missed, null if none or unknown), fuel_used_gal_est and mpg_est (estimates from engine " +
       "airflow, not from fill-ups, null when no airflow readings came through), average moving speed and top speed in mph, " +
       "max and average RPM, max coolant in °F, fuel " +
-      "gauge percent near the start and end (whole percent, the gauge swings by several points while driving, so do not " +
-      "derive fuel used from it), odometer in miles at start and end, and in_progress (true while the trip is still going). " +
+      "gauge percent near the start and end (whole percent, averaged over up to 10 minutes of driving at each end, or the " +
+      "first or last minute's reading when that end had too little driving, so do not derive fuel used from it), odometer in miles at start and end, and in_progress (true while the trip is still going). " +
       "end_not_received appears on the newest trip when the logger stopped sending while the engine was on, so its end, " +
       "distance and fuel may be incomplete. times_estimated is true when the logger had no clock, so start and end are " +
       "estimates. Start and end coordinates are left out unless include_locations is true.",
