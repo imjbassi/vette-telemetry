@@ -257,7 +257,9 @@ static void readGnss() {
     }
     int sats = 0;
     for (int i = 1; i < ns - 1; i++) sats += tok[i].toInt();
-    f.sats = (uint8_t)min(sats, 255);
+    // A valid fix with every count field empty keeps the last count of this power-up.
+    static uint8_t lastSats = 0;
+    f.sats = lastSats = netpol::fixSats(sats, lastSats);
     // date ddmmyy, time hhmmss.s (UTC)
     const String& d = tok[ns + 3];
     const String& t = tok[ns + 4];
@@ -283,14 +285,15 @@ void service() {
   if (epochBase() == 0 && now - s_lastClk > 10000) { s_lastClk = now; readClock(); }
 }
 
-int post(const uint8_t* body, size_t len) {
+int post(const uint8_t* body, size_t len, const char* query) {
   if (!s_ready) return -1;
   at("AT+HTTPTERM");  // clear any stale session, ignore result
   if (!atOk("AT+HTTPINIT", 5000)) { s_ready = false; return -2; }
   int code = -3;
   do {
     atOk("AT+HTTPPARA=\"SSLCFG\",0");  // use TLS context 0 from begin(). Optional on some firmware.
-    if (!atOk(String("AT+HTTPPARA=\"URL\",\"https://") + INGEST_HOST + INGEST_PATH + "\"")) break;
+    // The query holds only digits, letters and ? & = , . - so it needs no escaping here.
+    if (!atOk(String("AT+HTTPPARA=\"URL\",\"https://") + INGEST_HOST + INGEST_PATH + query + "\"")) break;
     if (!atOk("AT+HTTPPARA=\"CONTENT\",\"application/octet-stream\"")) break;
     if (!atOk(String("AT+HTTPPARA=\"USERDATA\",\"Authorization: Bearer ") + DEVICE_TOKEN + "\"")) break;
     bool ok;

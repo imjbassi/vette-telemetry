@@ -49,19 +49,22 @@ int checkBackend() {
   return code;
 }
 
-int post(const uint8_t* body, size_t len) {
+int post(const uint8_t* body, size_t len, const char* query) {
   if (!ready()) return -1;
   WiFiClientSecure tls;
   tls.setInsecure();  // desk testing only. The modem path is the production path.
   HTTPClient http;
-  String url = String("https://") + INGEST_HOST + INGEST_PATH;
+  String url = String("https://") + INGEST_HOST + INGEST_PATH + query;
   if (!http.begin(tls, url)) return -2;
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
   http.setTimeout(15000);
   int code = http.POST(const_cast<uint8_t*>(body), len);
   http.end();
-  return code;
+  // HTTPClient's negative codes mean other things than the modem's in net.h (its -3 is a body
+  // that did not go out, its -4 and -5 a lost connection). The upload policy and diagnostics
+  // read the modem's, so every transport error here counts as no answer.
+  return code < 0 ? -7 : code;
 }
 
 }  // namespace net

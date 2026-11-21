@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import rebuildSql from "../maintenance/rebuild-rollups.sql";
 import changeSql from "../schema-changes/0001-trips-odometer-fw.sql";
+import change2Sql from "../schema-changes/0002-ingests-diag.sql";
 import schemaSql from "../schema.sql";
 import { F } from "../scripts/lib/record-encode.mjs";
 import { MINUTE_REBUILD_SQL } from "../src/rollup.ts";
@@ -319,6 +320,36 @@ test("schema change 0001 turns the old trips table into today's", async () => {
   assert.deepEqual((await post(old, next)).json, { ok: true, records: 2, rejected: 0 });
   assert.deepEqual(one(old, "SELECT n, last_ms, odo_start, odo_end, fw, nolink_n, engine_s, rpm_n FROM trips WHERE boot = 9"),
     { n: 7, last_ms: 7000, odo_start: 12671.1, odo_end: 12671.6, fw: 2, nolink_n: 0, engine_s: 6, rpm_n: 7 });
+});
+
+// ------------------------------------------------------------ schema change 0002
+
+// The ingests table as it was before 0002 (schema.sql at commit 1eb2a81).
+const OLD_INGESTS = `
+CREATE TABLE IF NOT EXISTS ingests (
+  received_at INTEGER NOT NULL,
+  bytes       INTEGER NOT NULL,
+  records     INTEGER NOT NULL,
+  rejected    INTEGER NOT NULL
+);`;
+
+test("schema change 0002 adds ingests.diag and keeps the upload log", async () => {
+  const old = makeEnv({ schema: OLD_INGESTS + schemaSql });
+  const fresh = makeEnv();
+  const cols = (env) => rows(env, "PRAGMA table_info(ingests)");
+  assert.equal(cols(old).length, 4, "the old database really has the old table");
+  old.DB.sqlite.exec("INSERT INTO ingests VALUES (1794436900, 96, 2, 0)");
+  // Before the change an upload fails loudly (index.ts answers 503) and stores nothing.
+  setNow(T0 + 100);
+  await assert.rejects(post(old, drive({ n: 2 })), /diag/);
+  assert.equal(one(old, "SELECT COUNT(*) AS n FROM samples").n, 0);
+
+  execFile(old, change2Sql);
+  assert.deepEqual(cols(old), cols(fresh));
+  assert.deepEqual(rows(old, "SELECT * FROM ingests"), [{ received_at: 1794436900, bytes: 96, records: 2, rejected: 0, diag: null }]);
+  // Not idempotent, as its header says.
+  assert.throws(() => execFile(old, change2Sql), /duplicate column name/);
+  assert.equal((await post(old, drive({ n: 2 }))).status, 200);
 });
 
 test("without schema change 0001 an upload fails loudly and stores nothing", async () => {

@@ -212,7 +212,7 @@ async function logs(env: Env, limit: number) {
   const now = nowS();
   // Every query here is bounded by an index and a LIMIT, so each poll reads a few hundred rows.
   const [ingests, samples, boots, hour] = await Promise.all([
-    env.DB.prepare(`SELECT received_at, bytes, records, rejected FROM ingests ORDER BY received_at DESC LIMIT 100`).all(),
+    env.DB.prepare(`SELECT received_at, bytes, records, rejected, diag FROM ingests ORDER BY received_at DESC LIMIT 100`).all(),
     env.DB.prepare(
       `SELECT boot, ms, ts, ts_est, lat, lon, sats, rpm, speed_kph, coolant_c, intake_c, maf_gs, throttle_pct, fuel_pct,
               adapter_v, ecu_v, odo_km, csq, flags

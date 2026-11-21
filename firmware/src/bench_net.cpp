@@ -161,12 +161,19 @@ void service() {
 
 int checkBackend() { return ready() ? 200 : -1; }
 
-int post(const uint8_t* body, size_t len) {
+int post(const uint8_t* body, size_t len, const char* query) {
   if (!ready()) return -1;
   vTaskDelay(pdMS_TO_TICKS(1500));  // about what an LTE upload takes
   Phase p = phaseNow();
   if (p == Phase::Down) return -7;  // the link dropped during the upload. Nothing arrived.
-  if (p == Phase::Refusing || (refusesLargeBodies() && len > UPLOAD_FALLBACK_BYTES)) { s_refused++; return 503; }
+  bool probe = strstr(query, "p=1") != nullptr;  // the body size test sends no records
+  if (p == Phase::Refusing || (refusesLargeBodies() && len > UPLOAD_FALLBACK_BYTES)) {
+    if (!probe) s_refused++;
+    return 503;
+  }
+  if (probe) return 200;
+  // What the backend would store with this upload.
+  if (query[0]) Serial.printf("[bench] diag %s\n", query);
 
   s_posts++;
   if (len % sizeof(Record)) {

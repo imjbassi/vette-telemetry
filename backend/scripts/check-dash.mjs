@@ -124,8 +124,9 @@ function syntax(src) {
 // Only runs inside the bundle. Plain node cannot resolve these imports, and never gets here.
 async function behavior() {
   const { handleDash } = await import("../src/dash");
+  const { handleIngest } = await import("../src/ingest");
   const { makeEnv } = await import("../test/helpers/d1.mjs");
-  const { drive, noLink, postChunks, restoreNow, setNow, sid, T0 } = await import("../test/helpers/drive.mjs");
+  const { drive, encodeAll, noLink, postChunks, restoreNow, setNow, sid, T0 } = await import("../test/helpers/drive.mjs");
   const { F } = await import("./lib/record-encode.mjs");
 
   const realSetTimeout = setTimeout;
@@ -1262,6 +1263,54 @@ async function behavior() {
     assert.match(raw, /<th>GPS<\/th>/);
     assert.match(raw, /<span class="tag ok">fix<\/span>/);
     for (const text of [health, raw]) assert.doesNotMatch(text, /\d+\.\d{5}, -?\d+\.\d{5}/);
+    assert.deepEqual(p.errors, []);
+  });
+
+  check("logs: an upload after trouble says what went wrong before it, and a size test is not called rejected", async () => {
+    const env = makeEnv();
+    await parkedCar(env);
+    // Firmware build 3 puts what went wrong before an upload into its URL.
+    const send = async (query, body, at) => {
+      setNow(at);
+      const res = await handleIngest(new Request(`https://logger.test/ingest${query}`, { method: "POST", body }), env);
+      assert.equal(res.status, 200);
+    };
+    await send("?f=4&g=2700&d=2400&e=-4.2,503.1,-7.1&a=720&r=16368", encodeAll(drive({ boot: 12, n: 15, base: T0 + 3000 })), T0 + 3100);
+    await send("?p=1", new Uint8Array(30 * 48), T0 + 3200);
+    await send("?f=0&g=45&d=40&b=1", encodeAll(drive({ boot: 13, n: 15, base: T0 + 3300 })), T0 + 3400);
+    // A long gap with the link up all along, and failures with more codes than the logger keeps.
+    await send("?f=0&g=600&d=0&a=720", encodeAll(drive({ boot: 14, n: 15, base: T0 + 3340 })), T0 + 3420);
+    await send("?f=8&g=1&d=0&e=-1.2,-7.1,706.1,-2.1,x.3&a=720&r=4800", encodeAll(drive({ boot: 15, n: 15, base: T0 + 3380 })), T0 + 3460);
+    // Reports that waited: the upload before went through without them.
+    await send("?f=1&g=135&d=45&b=1&w=1&e=-7.1&a=720", encodeAll(drive({ boot: 16, n: 15, base: T0 + 3390 })), T0 + 3470);
+    await send("?f=3&g=2703&d=2400&w=1&e=-4.2,-5.1&a=1440&r=16368", encodeAll(drive({ boot: 17, n: 15, base: T0 + 3400 })), T0 + 3480);
+    await send("?f=2&g=50&d=0&w=2&e=-7.2&a=1440", encodeAll(drive({ boot: 18, n: 15, base: T0 + 3410 })), T0 + 3490);
+    // The logger sends the largest body accepted before this upload. This one, 30 records, went through too.
+    await send("?f=1&g=20&d=0&e=-7.1&a=720", encodeAll(drive({ boot: 19, n: 30, base: T0 + 3420 })), T0 + 3495);
+    setNow(T0 + 3500);
+    const p = openPage(env, { hash: "logs" });
+    await p.settle();
+    const html = p.$("g-uploads").innerHTML;
+    assert.match(html, /<tr class="diag"><td colspan="5">First upload after power-up, 45 s after it, 40 s of it without a data link<\/td><\/tr>/);
+    assert.match(html, new RegExp("<tr class=\"diag\"><td colspan=\"5\">45 min since the last accepted upload, 40 min of it without a data link · " +
+      "4 failed before it: body not taken ×2, HTTP 503 ×1, no answer ×1 · largest body through since power-up 720 B, smallest refused 16,368 B</td></tr>"));
+    assert.match(html, /<tr class="diag"><td colspan="5">10 min since the last accepted upload · largest body through since power-up 720 B<\/td><\/tr>/);
+    assert.match(html, new RegExp("<tr class=\"diag\"><td colspan=\"5\">1 s since the last accepted upload · 8 failed before it: no data link ×2, " +
+      "no answer ×1, modem error 706 ×1, HTTP start refused ×1, other ×3 · largest body through since power-up 720 B, smallest refused 4,800 B</td></tr>"));
+    assert.match(html, new RegExp("<tr class=\"diag\"><td colspan=\"5\">The upload before this one went through without this report · " +
+      "2 min since power-up, 45 s of it without a data link · 1 failed before it: no answer ×1 · largest body through since power-up 720 B</td></tr>"));
+    assert.match(html, new RegExp("<tr class=\"diag\"><td colspan=\"5\">The upload before this one went through without this report · " +
+      "45 min since the last accepted upload before that one, 40 min of it without a data link · 3 failed before it: body not taken ×2, " +
+      "body not confirmed ×1 · largest body through since power-up 1,440 B, smallest refused 16,368 B</td></tr>"));
+    assert.match(html, new RegExp("<tr class=\"diag\"><td colspan=\"5\">The 2 uploads before this one went through without this report · " +
+      "50 s since the last accepted upload before those · 2 failed before it: no answer ×2 · largest body through since power-up 1,440 B</td></tr>"));
+    assert.doesNotMatch(html, /First upload after power-up, 2 min/);
+    assert.match(html, /<tr class="diag"><td colspan="5">20 s since the last accepted upload · 1 failed before it: no answer ×1 · largest body through since power-up 1,440 B<\/td><\/tr>/);
+    assert.match(html, /<td><span class="tag off">size test<\/span><\/td>/);
+    assert.doesNotMatch(html, /rejected/);
+    assert.doesNotMatch(p.$("g-up-chip").textContent, /rejected/);
+    // An upload with nothing to say gets no line.
+    assert.equal((html.match(/class="diag"/g) ?? []).length, 8);
     assert.deepEqual(p.errors, []);
   });
 

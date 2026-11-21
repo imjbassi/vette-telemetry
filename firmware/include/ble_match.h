@@ -27,4 +27,13 @@ constexpr int rank(bool paired, bool named, bool fff0, bool anyPaired) {
   return 0;
 }
 
+// True when a result of this rank is the adapter beyond doubt, so the scan can stop at once
+// instead of running its full 5 s. A paired address is the adapter. While nothing is paired,
+// a name that starts with OBDLink is the best there is. While a pairing is stored, a name
+// alone is not enough: the paired adapter may still come. With one such result in range the
+// scan then takes what a full scan takes. With two (two paired adapters, or two OBDLink names
+// while nothing is paired) it stops at the first whose scan response NimBLE reports, which
+// need not be the one a full scan would pick.
+constexpr bool settles(int rank, bool anyPaired) { return anyPaired ? rank >= 3 : rank >= 2; }
+
 }  // namespace blematch

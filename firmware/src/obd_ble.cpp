@@ -161,46 +161,82 @@ static bool pickChars(NimBLEClient* c) {
   return false;
 }
 
+// What blematch::rank() needs to know about one scan result, and its rank.
+struct Seen {
+  bool named, svc, paired, nullAddr;
+  int rank;
+};
+static Seen seenOf(NimBLEAdvertisedDevice* d, bool anyPaired) {
+  static const NimBLEUUID kSvc(OBD_SERVICE_UUID);
+  std::string lower = d->getName();
+  for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
+  std::string prefix = OBD_NAME_PREFIX;
+  for (auto& ch : prefix) ch = (char)tolower((unsigned char)ch);
+  Seen s;
+  s.named = !lower.empty() && lower.rfind(prefix, 0) == 0;
+  s.svc = d->isAdvertisingService(kSvc);
+  s.nullAddr = d->getAddress().toString() == "00:00:00:00:00:00";
+  // A null address is never treated as paired, so a bad stored identity cannot match.
+  s.paired = !s.nullAddr && NimBLEDevice::isBonded(d->getAddress());
+  s.rank = blematch::rank(s.paired, s.named, s.svc, anyPaired);
+  return s;
+}
+
+// Stops the scan at the first result that is the adapter beyond doubt (blematch::settles),
+// so the power-up does not wait out the whole scan. Runs in the NimBLE host task. The scan
+// calls it when the adapter's scan response arrives. Without one it calls it only after the
+// scan ended, and the scan runs its full time as before.
+static volatile bool s_scanAnyPaired = false;
+static volatile bool s_scanStopped = false;  // this scan was ended here, at the adapter
+class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* d) override {
+    Seen s = seenOf(d, s_scanAnyPaired);
+    // Only while the scan still runs, so a scan that already ended does not wake the waiting
+    // task a second time.
+    if (!s.nullAddr && blematch::settles(s.rank, s_scanAnyPaired) && NimBLEDevice::getScan()->isScanning()) {
+      // Set before stop(): stop() wakes connect() on the other core, which reads it at once.
+      s_scanStopped = true;
+      if (!NimBLEDevice::getScan()->stop()) s_scanStopped = false;
+    }
+  }
+};
+static ScanCb s_scanCb;
+
 bool connect(uint32_t scanSeconds) {
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
   scan->setInterval(45);
   scan->setWindow(30);
-  Serial.printf("[ble] scanning %us for \"%s*\"\n", scanSeconds, OBD_NAME_PREFIX);
+  s_scanAnyPaired = NimBLEDevice::getNumBonds() != 0;
+  s_scanStopped = false;
+  scan->setAdvertisedDeviceCallbacks(&s_scanCb, false);
+  Serial.printf("[ble] scanning up to %us for \"%s*\"\n", scanSeconds, OBD_NAME_PREFIX);
+  uint32_t t0 = millis();
   NimBLEScanResults res = scan->start(scanSeconds, false);
+  if (s_scanStopped) Serial.printf("[ble] scan stopped at the adapter after %lu ms\n", (unsigned long)(millis() - t0));
 
   // Which result is the adapter: see blematch::rank() in ble_match.h. An address with a
   // stored pairing is the adapter whatever its name. The name is only there when the scan
   // response was heard, and a paired adapter must not wait for that. Then a name that
   // starts with OBDLink (case-insensitive). A device that only advertises the generic
   // FFF0 service is used only while nothing is paired yet.
-  static const NimBLEUUID kSvc(OBD_SERVICE_UUID);
-  bool anyPaired = NimBLEDevice::getNumBonds() != 0;
+  bool anyPaired = s_scanAnyPaired;
   NimBLEAdvertisedDevice* target = nullptr;
   int best = 0;
   bool nullMatch = false, strayFff0 = false;
   for (auto it = res.begin(); it != res.end(); ++it) {
     std::string name = (*it)->getName();
-    std::string lower = name;
-    for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
-    std::string prefix = OBD_NAME_PREFIX;
-    for (auto& ch : prefix) ch = (char)tolower((unsigned char)ch);
-    bool svc = (*it)->isAdvertisingService(kSvc);
-    bool named = !name.empty() && lower.rfind(prefix, 0) == 0;
-    bool nullAddr = (*it)->getAddress().toString() == "00:00:00:00:00:00";
-    // A null address is never treated as paired, so a bad stored identity cannot match.
-    bool paired = !nullAddr && NimBLEDevice::isBonded((*it)->getAddress());
-    if (!name.empty() || svc || paired) {
+    Seen s = seenOf(*it, anyPaired);
+    if (!name.empty() || s.svc || s.paired) {
       Serial.printf("  seen %s \"%s\" rssi %d%s%s\n", (*it)->getAddress().toString().c_str(), name.c_str(),
-                    (*it)->getRSSI(), svc ? " [FFF0]" : "", paired ? " [paired]" : "");
+                    (*it)->getRSSI(), s.svc ? " [FFF0]" : "", s.paired ? " [paired]" : "");
     }
-    if (!named && !svc && !paired) continue;
+    if (!s.named && !s.svc && !s.paired) continue;
     // A null address means a stored bond has a bad identity for this adapter. There is
     // nothing to connect to, so skip it. One such advert no longer wipes the pairings.
-    if (nullAddr) { nullMatch = true; continue; }
-    int r = blematch::rank(paired, named, svc, anyPaired);
-    if (r == 0) strayFff0 = true;
-    if (r > best) { best = r; target = *it; }  // the first one seen wins a tie
+    if (s.nullAddr) { nullMatch = true; continue; }
+    if (s.rank == 0) strayFff0 = true;
+    if (s.rank > best) { best = s.rank; target = *it; }  // the first one seen wins a tie
   }
   if (!target && strayFff0) {
     Serial.println("[ble] ignoring an unnamed FFF0 device: a pairing is stored and this is not its address");

@@ -3,9 +3,11 @@
 
 // ---- Identity ----
 // Written into byte 45 of every record. 0 = firmware from before this byte existed.
-// 2 = stage 1 (outage-proof queue, engine gate, install id). Raise it with every flash
-// that changes behavior, so the backend can tell which firmware wrote a session.
-#define FW_BUILD             2
+// 2 = stage 1 (outage-proof queue, engine gate, install id). 3 = upload diagnostics, the
+// upload size test, the scan stops at the adapter, a fix keeps its satellite count. Raise
+// it with every flash that changes behavior, so the backend can tell which firmware wrote
+// a session.
+#define FW_BUILD             3
 
 // Desk build with a scripted adapter and a scripted network (env atoms3-bench).
 #ifndef BENCH
@@ -48,10 +50,13 @@
 #define UPLOAD_MAX_WAIT_MS   300000 // ceiling for the wait after HTTP 400 to 599
 #define UPLOAD_MAX_POSTS     4      // POSTs per pass, so GNSS and signal keep being read
 #define NET_BEGIN_RETRY_MS   30000  // network bring-up is tried again this often until it works
-// One upload body. A segment file never holds more than this: 341 records.
+// One upload body. A segment file never holds more than this: 341 records. Not proven on
+// the real modem: on 2026-11-20 three 341-record uploads failed after an outage. The "u"
+// console command tests which sizes get through.
 #define MAX_UPLOAD_BYTES     16384
 // Body size after three refused larger uploads in a row, for the rest of the boot: 30
-// records. The largest upload proven on the real modem and Worker so far is 31 records.
+// records. The largest upload that went through the real modem and Worker so far is 62
+// records (2,976 bytes, 2026-11-20).
 #define UPLOAD_FALLBACK_BYTES 1440
 // Above this share of the LittleFS partition the oldest closed segments are deleted.
 #define QUEUE_MAX_PCT        80

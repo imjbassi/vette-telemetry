@@ -29,6 +29,7 @@ const REMOTE = ["--remote", "--config", CONFIG];
 // every new file.
 export const REQUIRED_COLUMNS = [
   { table: "trips", columns: ["odo_start", "odo_end", "fw", "nolink_n"], file: "schema-changes/0001-trips-odometer-fw.sql" },
+  { table: "ingests", columns: ["diag"], file: "schema-changes/0002-ingests-diag.sql" },
 ];
 
 // ---- wrangler.local.toml -----------------------------------------------------------

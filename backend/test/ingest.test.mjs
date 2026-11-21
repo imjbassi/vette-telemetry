@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { encodeRecord, F, joinRecords, MAX_UPLOAD_RECORDS } from "../scripts/lib/record-encode.mjs";
-import { getLatest, handleIngest, MAX_BODY_BYTES } from "../src/ingest";
+import { getLatest, handleIngest, MAX_BODY_BYTES, uploadDiag } from "../src/ingest";
 import { makeEnv, one, rows } from "./helpers/d1.mjs";
 import {
   assertRowsNear, drive, encodeAll, near, noLink, post, postChunks, referenceTrip, restoreNow, setNow, sid, snapshot,
@@ -89,7 +89,66 @@ test("a flipped byte and a torn tail are counted as rejected, the rest is stored
   assert.equal(r.status, 200);
   assert.deepEqual(r.json, { ok: true, records: 2, rejected: 2 });
   assert.deepEqual(rows(env, "SELECT ms FROM samples ORDER BY ms").map((x) => x.ms), [fields[0].ms, fields[2].ms]);
-  assert.deepEqual(rows(env, "SELECT * FROM ingests"), [{ received_at: T0 + 100, bytes: 164, records: 2, rejected: 2 }]);
+  assert.deepEqual(rows(env, "SELECT * FROM ingests"), [{ received_at: T0 + 100, bytes: 164, records: 2, rejected: 2, diag: null }]);
+});
+
+// ------------------------------------------------------------ upload diagnostics
+
+// Posts to /ingest with a query string, the way firmware build 3 sends what went wrong.
+const postQuery = async (env, body, query) => {
+  const res = await handleIngest(new Request(`https://logger.test/ingest${query}`, { method: "POST", body: encodeAll(body) }), env);
+  return { status: res.status, json: await res.json() };
+};
+
+test("uploadDiag reads what the logger says went wrong, and leaves out what does not read", () => {
+  // 2026-11-20: 46 minutes without an upload, 40 of them without a data link, then 4 failures.
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("f=4&g=2700&d=2400&e=-4.2,503.1,-7.1&a=720&r=16368"))), {
+    fails: 4, codes: [[-4, 2], [503, 1], [-7, 1]], gap_s: 2700, down_s: 2400, ok_max: 720, bad_min: 16368,
+  });
+  // The first upload after power-up, and codes past the first four.
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("f=8&g=45&d=40&b=1&e=-1.2,-7.1,706.1,-2.1,x.3"))), {
+    fails: 8, codes: [[-1, 2], [-7, 1], [706, 1], [-2, 1]], other: 3, gap_s: 45, down_s: 40, first: true,
+  });
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("p=1"))), { probe: true });
+  // A report that waited: the upload before this one went without it.
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("f=3&g=2703&d=2400&w=1&e=-4.2,-5.1&a=1440&r=16368"))), {
+    fails: 3, codes: [[-4, 2], [-5, 1]], gap_s: 2703, down_s: 2400, without: 1, ok_max: 1440, bad_min: 16368,
+  });
+  // The longest query the logger can send.
+  assert.deepEqual(
+    JSON.parse(uploadDiag(new URLSearchParams(
+      "f=65535&g=4294967&d=4294967&b=1&w=255&e=-32768.65535,-32767.65535,-32766.65535,-32765.65535,x.65535&a=16368&r=16368"))),
+    {
+      fails: 65535, codes: [[-32768, 65535], [-32767, 65535], [-32766, 65535], [-32765, 65535]], other: 65535,
+      gap_s: 4294967, down_s: 4294967, first: true, without: 255, ok_max: 16368, bad_min: 16368,
+    },
+  );
+  // Nothing said, or nothing readable: no diag.
+  assert.equal(uploadDiag(new URLSearchParams("")), null);
+  assert.equal(uploadDiag(new URLSearchParams("f=-1&g=1.5&d=x&a=99999999&r=&b=2&p=0&w=65536&e=,,4,x.,1.70000")), null);
+  // Each field stands on its own.
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("f=2&g=abc&e=-7.1,bad,706.1"))), { fails: 2, codes: [[-7, 1], [706, 1]] });
+  assert.deepEqual(JSON.parse(uploadDiag(new URLSearchParams("a=65536&r=65537"))), { ok_max: 65536 });
+});
+
+test("an upload stores what went wrong before it in ingests.diag, and is never refused over it", async () => {
+  setNow(T0 + 100);
+  const env = makeEnv();
+  const fields = drive({ n: 6 });
+  assert.equal((await postQuery(env, fields.slice(0, 2), "?f=0&g=45&d=40&b=1")).status, 200);
+  assert.equal((await postQuery(env, fields.slice(2, 4), "")).status, 200);
+  // Junk in the query: the records are stored all the same.
+  assert.deepEqual((await postQuery(env, fields.slice(4), "?f=oops&e=%22%3Cb%3E")).json, { ok: true, records: 2, rejected: 0 });
+  assert.deepEqual(rows(env, "SELECT records, diag FROM ingests ORDER BY rowid"), [
+    { records: 2, diag: JSON.stringify({ fails: 0, gap_s: 45, down_s: 40, first: true }) },
+    { records: 2, diag: null },
+    { records: 2, diag: null },
+  ]);
+  assert.equal(count(env, "samples"), 6);
+  // The size test: a zero-filled body, no records, marked as such.
+  const res = await handleIngest(new Request("https://logger.test/ingest?p=1", { method: "POST", body: new Uint8Array(30 * 48) }), env);
+  assert.deepEqual(await res.json(), { ok: true, records: 0, rejected: 1 });
+  assert.deepEqual(rows(env, "SELECT records, rejected, diag FROM ingests ORDER BY rowid").at(-1), { records: 0, rejected: 1, diag: '{"probe":true}' });
 });
 
 test("a torn segment in the middle of a body does not cost the records behind it", async (t) => {
@@ -109,7 +168,7 @@ test("a torn segment in the middle of a body does not cost the records behind it
   assert.deepEqual(rows(env, "SELECT boot, ms FROM samples ORDER BY boot, ms"),
     [...before, ...after].map((x) => ({ boot: x.boot, ms: x.ms })));
   assert.deepEqual(rows(env, "SELECT boot, n FROM trips ORDER BY boot"), [{ boot: 11, n: 3 }, { boot: 12, n: 5 }]);
-  assert.deepEqual(rows(env, "SELECT * FROM ingests"), [{ received_at: T0 + 100, bytes: 404, records: 8, rejected: 1 }]);
+  assert.deepEqual(rows(env, "SELECT * FROM ingests"), [{ received_at: T0 + 100, bytes: 404, records: 8, rejected: 1, diag: null }]);
 
   // A record of an unknown version behind the torn piece still refuses the whole upload.
   t.mock.method(console, "warn", () => {});

@@ -161,6 +161,10 @@ const pragma = (names) => JSON.stringify([{
 const OLD_TRIPS = ["boot", "start_ts", "end_ts", "last_ms", "track_ms", "n", "gps_n", "engine_n", "km", "maf_g",
   "engine_s", "moving_s", "max_kph", "max_rpm", "max_coolant", "rpm_sum", "rpm_n", "est"];
 const NEW_TRIPS = [...OLD_TRIPS, "odo_start", "odo_end", "fw", "nolink_n"];
+const OLD_INGESTS = ["received_at", "bytes", "records", "rejected"];
+const NEW_INGESTS = [...OLD_INGESTS, "diag"];
+// columnsOf for schemaGaps: the columns each table has, none for a table not listed.
+const tables = (t) => (name) => t[name] ?? [];
 
 test("d1Rows reads the real answer shapes", () => {
   assert.deepEqual(dep.d1Rows(pragma(NEW_TRIPS)).map((r) => r.name), NEW_TRIPS);
@@ -177,7 +181,7 @@ test("d1Rows reads the real answer shapes", () => {
 });
 
 test("schema check: database before 0001 stops with the exact command", () => {
-  const gaps = dep.schemaGaps(() => dep.d1Rows(pragma(OLD_TRIPS)).map((r) => r.name));
+  const gaps = dep.schemaGaps(tables({ trips: dep.d1Rows(pragma(OLD_TRIPS)).map((r) => r.name), ingests: NEW_INGESTS }));
   assert.deepEqual(gaps.map((g) => g.missing), [["odo_start", "odo_end", "fw", "nolink_n"]]);
   const msg = dep.schemaMessage(gaps);
   assert.match(msg, /Nothing was deployed/);
@@ -190,17 +194,30 @@ test("schema check: database before 0001 stops with the exact command", () => {
 });
 
 test("schema check: current database passes, other gaps are named", () => {
-  assert.equal(dep.schemaMessage(dep.schemaGaps(() => NEW_TRIPS)), null);
+  assert.equal(dep.schemaMessage(dep.schemaGaps(tables({ trips: NEW_TRIPS, ingests: NEW_INGESTS }))), null);
   // No table at all.
   const none = dep.schemaMessage(dep.schemaGaps(() => []));
   assert.match(none, /table trips does not exist/);
   assert.match(none, /npm run db:init:remote/);
   assert.ok(!none.includes("--file=schema-changes"));
   // Half a schema change: the file cannot be run again.
-  const half = dep.schemaMessage(dep.schemaGaps(() => [...OLD_TRIPS, "odo_start", "odo_end"]));
+  const half = dep.schemaMessage(dep.schemaGaps(tables({ trips: [...OLD_TRIPS, "odo_start", "odo_end"], ingests: NEW_INGESTS })));
   assert.match(half, /missing: trips\.fw, trips\.nolink_n/);
   assert.match(half, /Only part of schema-changes\/0001-trips-odometer-fw\.sql/);
   assert.ok(!half.includes("Run once"));
+});
+
+test("schema check: database before 0002 stops with its command, 0001 first when both are missing", () => {
+  const gaps = dep.schemaGaps(tables({ trips: NEW_TRIPS, ingests: OLD_INGESTS }));
+  assert.deepEqual(gaps.map((g) => [g.table, g.missing]), [["ingests", ["diag"]]]);
+  const msg = dep.schemaMessage(gaps);
+  assert.match(msg, /missing: ingests\.diag/);
+  assert.ok(msg.includes("npx wrangler d1 execute vette --remote --config wrangler.local.toml --file=schema-changes/0002-ingests-diag.sql"));
+  const file = fs.readFileSync(path.join(backend, "schema-changes", "0002-ingests-diag.sql"), "utf8");
+  assert.ok(file.includes("npx wrangler d1 execute vette --remote --config wrangler.local.toml --file=schema-changes/0002-ingests-diag.sql"));
+  // A database from before both names both files, in order.
+  const both = dep.schemaMessage(dep.schemaGaps(tables({ trips: OLD_TRIPS, ingests: OLD_INGESTS })));
+  assert.ok(both.indexOf("0001-trips-odometer-fw.sql") < both.indexOf("0002-ingests-diag.sql"), both);
 });
 
 test("REQUIRED_COLUMNS matches schema.sql and is easy to extend", () => {
@@ -378,7 +395,7 @@ function sampleDb(samples = 23) {
   // Inserted out of key order on purpose.
   for (let i = samples - 1; i >= 0; i--) ins.run(i % 2 ? 12 : 11337740, i * 1000, 1794436923 + i);
   db.exec("INSERT INTO boots VALUES (12, 1794436000); INSERT INTO latest VALUES (1, '{}');");
-  db.exec("INSERT INTO ingests VALUES (1, 48, 1, 0), (2, 96, 2, 0), (3, 0, 0, 0);");
+  db.exec("INSERT INTO ingests (received_at, bytes, records, rejected) VALUES (1, 48, 1, 0), (2, 96, 2, 0), (3, 0, 0, 0);");
   db.exec("INSERT INTO trips (boot, n) VALUES (12, 5); INSERT INTO track VALUES (12, 0, 1, 37.8199, -122.4783, NULL);");
   return db;
 }

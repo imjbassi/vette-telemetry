@@ -194,6 +194,8 @@
   td { padding: 8px 12px; border-bottom: 1px solid var(--line); color: #d5d8de; }
   tr:hover td { background: #1b1d23; }
   td.num, th.num { text-align: right; }
+  /* What went wrong before an upload, on a line of its own under it. */
+  tr.diag td { white-space: normal; color: var(--muted); font-size: 12px; padding-top: 0; }
   .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 6px; }
   .tag.ok { background: rgba(47,191,113,.15); color: #5fe29a; }
   .tag.bad { background: rgba(239,68,68,.15); color: #ff8a8a; }
@@ -1663,6 +1665,40 @@
     if (f & 1) return '<span class="tag ok">engine</span>';
     return '<span class="tag mid">off</span>';
   }
+  // What the logger said went wrong before an upload (ingests.diag, see uploadDiag() in
+  // ingest.ts). Null without it, or when it does not read.
+  function diagOf(raw) {
+    if (!raw) return null;
+    try { const d = JSON.parse(raw); return d && typeof d === "object" ? d : null; } catch { return null; }
+  }
+  // The failure codes of the modem's upload (net::post() in the firmware), in words.
+  const UP_CODES = { "-1": "no data link", "-2": "HTTP start refused", "-3": "request setup refused", "-4": "body not taken",
+    "-5": "body not confirmed", "-6": "send refused", "-7": "no answer" };
+  const upCode = (c) => UP_CODES[c] || (c >= 400 && c <= 599 ? `HTTP ${c}` : c >= 700 ? `modem error ${c}` : `code ${c}`);
+  // The line is the logger's view. An upload whose answer was lost counts as failed there,
+  // though the Worker stored it. bytes is the size of the upload that carried the report.
+  function diagText(d, bytes) {
+    const parts = [];
+    const down = d.down_s ? `, ${dur(d.down_s)} of it without a data link` : "";
+    // Uploads that went through while this report waited for a try that could carry it. The
+    // gap then counts from the accepted upload before them.
+    const w = d.without || 0;
+    if (w) parts.push(`The ${w === 1 ? "upload" : `${w} uploads`} before this one went through without this report`);
+    if (d.first) parts.push(w ? `${dur(d.gap_s)} since power-up${down}` : `First upload after power-up, ${dur(d.gap_s)} after it${down}`);
+    else if (d.gap_s != null) parts.push(`${dur(d.gap_s)} since the last accepted upload${w ? ` before ${w === 1 ? "that one" : "those"}` : ""}${down}`);
+    if (d.fails) {
+      const codes = (Array.isArray(d.codes) ? d.codes : []).map(([c, n]) => `${upCode(c)} ×${n}`);
+      if (d.other) codes.push(`other ×${d.other}`);
+      parts.push(`${d.fails} failed before it${codes.length ? ": " + codes.join(", ") : ""}`);
+    }
+    if (d.ok_max || d.bad_min) {
+      // ok_max counts the bodies accepted before this upload. This one went through too.
+      const okMax = Math.max(d.ok_max || 0, bytes || 0);
+      parts.push([okMax ? `largest body through since power-up ${f0(okMax)} B` : "",
+        d.bad_min ? `smallest refused ${f0(d.bad_min)} B` : ""].filter(Boolean).join(", "));
+    }
+    return parts.join(" · ");
+  }
   // ---------------------------------------------------------------- database storage
   // The same shares as DB_WARN_PCT in queries.ts, which /api/storage sends as warn_pct.
   // check:dash compares the two.
@@ -1752,15 +1788,22 @@
     $("g-health").innerHTML = cards.map(([ic, col, lab, v, sub, cls]) =>
       `<div class="card kpi"><div class="lab"><span class="ico"><svg style="color:${col}"><use href="#${ic}"/></svg></span>${lab}</div><div class="val ${cls}">${v}</div><div class="delta">${esc(sub)}</div></div>`).join("");
 
-    const shown = d.ingests.reduce((a, r) => ({ kb: a.kb + r.bytes / 1024, rej: a.rej + r.rejected }), { kb: 0, rej: 0 });
+    // A size test sends no records on purpose, so its rejected bytes are not counted.
+    const isTest = (r) => { const x = diagOf(r.diag); return !!(x && x.probe); };
+    const shown = d.ingests.reduce((a, r) => ({ kb: a.kb + r.bytes / 1024, rej: a.rej + (isTest(r) ? 0 : r.rejected) }), { kb: 0, rej: 0 });
     $("g-up-chip").textContent = `last ${d.ingests.length} · ${f1(shown.kb)} KB` + (shown.rej ? ` · ${shown.rej} rejected` : "");
     $("g-uploads").innerHTML = `<tr><th>Received</th><th class="num">Readings</th><th class="num">Bytes</th><th>Result</th><th class="num">Gap</th></tr>` +
       d.ingests.map((r, i) => {
         const gap = i + 1 < d.ingests.length ? r.received_at - d.ingests[i + 1].received_at : null;
-        const res = r.rejected ? `<span class="tag bad">${r.rejected} rejected</span>` : r.records ? '<span class="tag ok">ok</span>' : '<span class="tag off">empty</span>';
+        const diag = diagOf(r.diag);
+        // A size test sends no records on purpose, so its "1 rejected" is no fault.
+        const res = diag && diag.probe ? '<span class="tag off">size test</span>'
+          : r.rejected ? `<span class="tag bad">${r.rejected} rejected</span>` : r.records ? '<span class="tag ok">ok</span>' : '<span class="tag off">empty</span>';
         const rd = new Date(r.received_at * 1000);
+        const note = diag && !diag.probe ? diagText(diag, r.bytes) : "";
         // A car parked for days leaves a gap of days.
-        return `<tr><td>${esc(dayFmt.format(rd) + ", " + secFmt.format(rd))}</td><td class="num">${r.records}</td><td class="num">${f0(r.bytes)}</td><td>${res}</td><td class="num">${gap == null ? "" : dur(gap, true)}</td></tr>`;
+        return `<tr><td>${esc(dayFmt.format(rd) + ", " + secFmt.format(rd))}</td><td class="num">${r.records}</td><td class="num">${f0(r.bytes)}</td><td>${res}</td><td class="num">${gap == null ? "" : dur(gap, true)}</td></tr>` +
+          (note ? `<tr class="diag"><td colspan="5">${esc(note)}</td></tr>` : "");
       }).join("");
     if (!d.ingests.length) $("g-uploads").innerHTML += '<tr><td colspan="5" class="empty">No uploads yet</td></tr>';
 

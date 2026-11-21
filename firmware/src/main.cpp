@@ -24,6 +24,12 @@ static uint8_t s_upBuf[MAX_UPLOAD_BYTES];
 static netpol::UploadPolicy s_upPolicy(MAX_UPLOAD_BYTES, UPLOAD_FALLBACK_BYTES, UPLOAD_PERIOD_MS * 2, UPLOAD_MAX_WAIT_MS);
 static_assert(UPLOAD_FALLBACK_BYTES % sizeof(Record) == 0 && UPLOAD_FALLBACK_BYTES <= MAX_UPLOAD_BYTES,
               "the fallback body is whole records and fits the buffer");
+// Why uploads failed, sent with the next upload that can carry it. It also decides when a try
+// goes without it, so the query can never stop uploads. See net_policy.h.
+// Net task only. The console reads two counters for the "s" printout.
+static netpol::UploadDiag s_diag;
+// Set by the "u" console command, run by the net task: the body size test.
+static volatile bool s_probeReq = false;
 
 // One upload pass: at most UPLOAD_MAX_POSTS uploads, so GNSS, signal and clock keep
 // being read during a long backlog. Returns the last HTTP status, or 0 when nothing was
@@ -49,10 +55,15 @@ static int uploadPass(bool& more) {
       continue;
     }
     posts++;
+    char query[netpol::UploadDiag::kQueryMax];
+    s_diag.query(query, millis());
     uint32_t t0 = millis();
-    code = net::post(s_upBuf, n);
-    Serial.printf("[up] %u bytes (%u recs) -> %d in %lums\n", (unsigned)n, (unsigned)(n / sizeof(Record)), code,
-                  (unsigned long)(millis() - t0));
+    code = net::post(s_upBuf, n, query);
+    if (s_diag.onPost(n, code, millis())) {
+      Serial.println("[up] the modem refused the request with the upload diagnostics, sending none until the next boot");
+    }
+    Serial.printf("[up] %u bytes (%u recs) -> %d in %lums%s%s\n", (unsigned)n, (unsigned)(n / sizeof(Record)), code,
+                  (unsigned long)(millis() - t0), query[0] ? ", with " : "", query);
     if (s_upPolicy.onPost(n, code)) {
       Serial.printf("[up] %u large uploads in a row were refused, sending %u records at a time until the next boot\n",
                     (unsigned)netpol::kBodyRefusals, (unsigned)(UPLOAD_FALLBACK_BYTES / sizeof(Record)));
@@ -66,10 +77,54 @@ static int uploadPass(bool& more) {
   return code;
 }
 
+// The "u" console command: which body sizes get through the real modem and Worker. On
+// 2026-11-20 three 341-record uploads failed after an outage, and nothing over 62 records
+// has gone through yet. Zero-filled bodies hold no records, so the Worker stores nothing
+// from them but a line in the upload log (marked by p=1). Uploads wait while it runs.
+static void sizeTest() {
+  static const uint16_t kRecs[] = {30, 62, 100, 170, 250, 341};
+  // The upload diagnostics follow the data link through the test, as the net task would.
+  auto tick = []() { s_diag.onTick(net::ready(), millis()); };
+  // A failed POST drops the data link (net_modem.cpp). Wait up to a minute for it.
+  auto waitReady = [&]() {
+    for (uint32_t w = millis(); !net::ready() && millis() - w < 60000;) {
+      net::service();
+      tick();
+      vTaskDelay(pdMS_TO_TICKS(250));
+    }
+  };
+  Serial.println("[size] upload size test, one zero-filled body per size, nothing is stored");
+  for (uint16_t recs : kRecs) {
+    size_t n = recs * sizeof(Record);
+    if (n > sizeof(s_upBuf)) break;
+    waitReady();
+    memset(s_upBuf, 0, n);
+    uint32_t t0 = millis();
+    int code = net::post(s_upBuf, n, "?p=1");
+    // -3: the request setup was refused, maybe the URL with the query. The size is tested all
+    // the same. When that goes through, Logs shows the body as rejected instead of as a size test.
+    bool bare = code == -3;
+    if (bare) {
+      tick();
+      waitReady();
+      t0 = millis();
+      code = net::post(s_upBuf, n);
+    }
+    s_diag.onProbe(n, code, millis());
+    Serial.printf("[size] %5u bytes (%3u records) -> %d in %lu ms%s\n", (unsigned)n, (unsigned)recs, code,
+                  (unsigned long)(millis() - t0), bare ? ", sent without ?p=1 after -3" : "");
+    tick();          // the POST may have dropped the link
+    net::service();  // GNSS, signal and clock go on being read, as in uploadPass()
+    tick();
+  }
+  Serial.println("[size] done. 200 = went through. -4 or -5 = the modem did not take the body.");
+}
+
 static void netTask(void*) {
   bool up = false, tried = false, checked = false, more = false;
   uint32_t lastBegin = 0, lastUpload = 0;
   for (;;) {
+    s_diag.onTick(up && net::ready(), millis());
     if (!up && (!tried || millis() - lastBegin >= NET_BEGIN_RETRY_MS)) {
       // A modem that was slow to start must not cost the whole drive. Keep trying.
       tried = true;
@@ -78,10 +133,17 @@ static void netTask(void*) {
     }
     if (up) {
       net::service();
+      // service() may have brought the link up. The time up to here was without it, and what
+      // follows in this turn (the health check, uploads) is not.
+      s_diag.onTick(net::ready(), millis());
       if (!checked && net::ready()) {
         checked = true;
         int code = net::checkBackend();
         Serial.printf("[up] backend %s (HTTP %d)\n", code == 200 ? "reachable" : "NOT reachable", code);
+      }
+      if (s_probeReq && net::ready()) {
+        s_probeReq = false;
+        sizeTest();  // the upload wait and the wait after a refusal still count from the last pass
       }
       // Parked, the heartbeat records are in no hurry and every upload costs a TLS handshake.
       uint32_t period = g_activeMode ? UPLOAD_PERIOD_MS : UPLOAD_IDLE_PERIOD_MS;
@@ -246,7 +308,7 @@ static void tick() {
 
 // Serial console. ">010C" sends a raw command to the adapter (handy for Mode 22 research).
 // "q" prints the flash queue, "s" prints identity, engine gate and network state,
-// "unpair" erases the stored pairings.
+// "u" runs the upload size test once the data link is up, "unpair" erases the stored pairings.
 static void console() {
   static String line;
   while (Serial.available()) {
@@ -258,6 +320,9 @@ static void console() {
       Serial.printf("[raw] %s -> %s\n", line.c_str() + 1, rsp.c_str());
     } else if (line == "unpair") {
       obd::forgetBonds();
+    } else if (line == "u") {
+      s_probeReq = true;
+      Serial.println("[size] upload size test queued, it starts once the data link is up");
     } else if (line == "q") {
       storage::Stats st = storage::stats();
       Serial.printf("[fs] %u segments, %u bytes waiting, %u records dropped since boot, flash %u of %u bytes used\n",
@@ -275,6 +340,9 @@ static void console() {
                     net::csq(), f.valid ? "fix" : "no fix", f.sats, (unsigned long)net::epochBase());
       Serial.printf("[up] uploads of up to %u records, %lu s extra wait after a refusal\n",
                     (unsigned)(s_upPolicy.bodyCap() / sizeof(Record)), (unsigned long)(s_upPolicy.waitMs() / 1000));
+      Serial.printf("[up] not reported yet: %u failed, %lu s without a data link%s\n",
+                    (unsigned)s_diag.fails(), (unsigned long)(s_diag.downMs() / 1000),
+                    s_diag.off() ? ", upload diagnostics off until the next boot" : "");
     }
     line = "";
   }
@@ -282,7 +350,14 @@ static void console() {
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT || BENCH
+  // The monitor needs a moment to open the port, or the first lines are lost: after a reset
+  // with USB CDC, and after every flash, which resets the board before the monitor opens. A
+  // bench run needs its first [boot] line. The car build does not wait: every second here is
+  // a second of the drive not logged. After a flash, a press of its reset button with the
+  // monitor open shows its first lines.
   delay(1500);
+#endif
 
   Preferences p;
   p.begin("vette", false);

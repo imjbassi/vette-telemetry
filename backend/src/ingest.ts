@@ -57,6 +57,61 @@ async function readByBoot<T>(env: Env, table: string, cols: string, boots: numbe
   return out;
 }
 
+// What the logger says went wrong before this upload, from the query string firmware build 3
+// adds (UploadDiag in firmware/include/net_policy.h), as JSON for ingests.diag:
+//   fails    uploads that failed since the last accepted one (f)
+//   codes    [code, count] pairs of those (e). Codes of net::post(): an HTTP status, or -1 no
+//            data link, -2 HTTP start refused, -3 request setup refused, -4 body not taken,
+//            -5 body not confirmed, -6 send refused, -7 no answer, 700 and up modem errors.
+//   other    count of failures with further codes (x in e)
+//   gap_s    seconds since the last accepted upload, or since power-up with first (g)
+//   down_s   seconds of that without a data link (d)
+//   first    the gap counts from power-up (b=1)
+//   without  accepted uploads right before this one that went without this report while it
+//            waited (w): a try without the query after one that carried it failed, or a body
+//            of the size test. fails, gap_s and down_s then count from the accepted upload
+//            before them, and first means none was accepted before them.
+//   ok_max   largest body accepted since power-up before this upload, bytes (a)
+//   bad_min  smallest body since power-up that failed with a code the body can cause (r)
+//   probe    an upload size test from the "u" console command, no records in it (p=1)
+// Null when the logger said nothing. An upload is never refused over it: a field that does
+// not read as expected is left out.
+export function uploadDiag(params: URLSearchParams): string | null {
+  const num = (k: string, max: number) => {
+    const v = params.get(k);
+    return v != null && /^\d{1,10}$/.test(v) && Number(v) <= max ? Number(v) : null;
+  };
+  const out: Record<string, unknown> = {};
+  if (params.get("p") === "1") out.probe = true;
+  const f = num("f", 65535);
+  if (f != null) out.fails = f;
+  const e = params.get("e");
+  if (e != null) {
+    const codes: [number, number][] = [];
+    let other = 0;
+    for (const part of e.split(",").slice(0, 8)) {
+      const m = /^(-?\d{1,5}|x)\.(\d{1,5})$/.exec(part);
+      if (!m || Number(m[2]) > 65535) continue;
+      if (m[1] === "x") other += Number(m[2]);
+      else codes.push([Number(m[1]), Number(m[2])]);
+    }
+    if (codes.length) out.codes = codes;
+    if (other) out.other = other;
+  }
+  const g = num("g", 1e8);
+  if (g != null) out.gap_s = g;
+  const d = num("d", 1e8);
+  if (d != null) out.down_s = d;
+  if (params.get("b") === "1") out.first = true;
+  const w = num("w", 65535);
+  if (w != null) out.without = w;
+  const a = num("a", MAX_BODY_BYTES);
+  if (a != null) out.ok_max = a;
+  const r = num("r", MAX_BODY_BYTES);
+  if (r != null) out.bad_min = r;
+  return Object.keys(out).length ? JSON.stringify(out) : null;
+}
+
 // Any answer in the 2xx range makes the logger delete what it sent. So nothing here may
 // answer 2xx unless the whole upload is committed, and a failure must throw (index.ts turns
 // that into a 503) instead of being swallowed.
@@ -243,8 +298,8 @@ export async function handleIngest(req: Request, env: Env): Promise<Response> {
     stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO latest (id, json) VALUES (1, ?)`).bind(JSON.stringify(latest)));
   }
 
-  stmts.push(env.DB.prepare(`INSERT INTO ingests (received_at, bytes, records, rejected) VALUES (?,?,?,?)`)
-    .bind(now, buf.byteLength, samples.length, rejected));
+  stmts.push(env.DB.prepare(`INSERT INTO ingests (received_at, bytes, records, rejected, diag) VALUES (?,?,?,?,?)`)
+    .bind(now, buf.byteLength, samples.length, rejected, uploadDiag(new URL(req.url).searchParams)));
   stmts.push(env.DB.prepare(`DELETE FROM ingests WHERE received_at < ?`).bind(now - 30 * 86400));
 
   // One batch, never sliced: a slice that fails after an earlier one committed would leave

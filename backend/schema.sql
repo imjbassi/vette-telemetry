@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS ingests (
   received_at INTEGER NOT NULL,
   bytes       INTEGER NOT NULL,
   records     INTEGER NOT NULL,
-  rejected    INTEGER NOT NULL
+  rejected    INTEGER NOT NULL,
+  -- Added by schema-changes/0002-ingests-diag.sql. What went wrong before this upload, as
+  -- JSON (uploadDiag() in src/ingest.ts). NULL when the logger had nothing to say.
+  diag        TEXT
 );
 CREATE INDEX IF NOT EXISTS ingests_at ON ingests(received_at);
 
